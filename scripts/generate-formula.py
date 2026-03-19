@@ -39,6 +39,7 @@ def generate_formula(version: str) -> str:
   license "MIT"
 
   depends_on "python@3.12"
+  depends_on "jdtls" => :recommended
 
   def install
     python3 = "python3.12"
