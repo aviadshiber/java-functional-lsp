@@ -5,9 +5,16 @@
 [![Python](https://img.shields.io/pypi/pyversions/java-functional-lsp?v=1)](https://pypi.org/project/java-functional-lsp/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-A Java Language Server that enforces functional programming best practices. Designed for teams using **Vavr**, **Lombok**, and **Spring** with a functional-first approach.
+A Java Language Server that wraps [Eclipse JDT.LS](https://github.com/eclipse-jdtls/eclipse.jdt.ls) and adds **functional programming best practices enforcement**. Get full Java language support (completions, hover, go-to-definition, compile errors) **plus** 12 custom rules for teams using **Vavr**, **Lombok**, and **Spring**.
 
-## What it checks
+## Features
+
+**Full Java language support** (via jdtls proxy):
+- Code completions, hover documentation, go-to-definition
+- Find references, document symbols
+- Compile errors and warnings — **before you even build**
+
+**12 custom functional programming rules** (via tree-sitter):
 
 | Rule | Detects | Suggests |
 |------|---------|----------|
@@ -37,6 +44,13 @@ pip install java-functional-lsp
 pip install git+https://github.com/aviadshiber/java-functional-lsp.git
 ```
 
+**For full Java support**, also install jdtls:
+```bash
+brew install jdtls
+```
+
+Without jdtls, the server runs in **standalone mode** — custom rules still work, but you won't get completions, hover, or compile errors.
+
 ## Usage with Claude Code
 
 Install the `deeperdive-java-linter` plugin from the DeeperDive marketplace, which registers this server as a Java LSP.
@@ -48,11 +62,23 @@ Or manually add to your Claude Code config:
   "lspServers": {
     "java-functional": {
       "command": "java-functional-lsp",
-      "extensionToLanguage": { ".java": "java" }
+      "extensionToLanguage": { ".java": "java" },
+      "startupTimeout": 120000
     }
   }
 }
 ```
+
+## CLI Check Mode
+
+Run as a standalone linter without an LSP client:
+
+```bash
+java-functional-lsp check File.java
+java-functional-lsp check --dir src/
+```
+
+Exits 1 if diagnostics found, 0 if clean. Useful for CI pipelines and pre-commit hooks.
 
 ## Configuration
 
@@ -74,9 +100,23 @@ All rules default to `warning` when not configured.
 
 ## How it works
 
-Uses [tree-sitter](https://tree-sitter.github.io/) with the Java grammar for fast, incremental AST parsing. No Java compiler or classpath needed — analysis runs on raw source files.
+```
+Client (editor/Claude Code)
+    ↕ LSP over stdio
+java-functional-lsp
+    |                  \
+    | proxy             tree-sitter
+    ↓                   analyzers
+  jdtls                   ↓
+    ↓                 12 custom rules
+  completions,        (null, exceptions,
+  hover, go-to-def,   mutations, Spring)
+  compile errors
+```
 
-The server speaks the Language Server Protocol (LSP) via stdio, making it compatible with any LSP client.
+The server proxies standard Java LSP requests to **jdtls** (Eclipse JDT Language Server) and runs **tree-sitter** analysis in parallel for custom rule enforcement. Diagnostics from both sources are merged before being sent to the client.
+
+If jdtls is not installed, the server automatically falls back to **standalone mode** with custom rules only.
 
 ## Development
 
