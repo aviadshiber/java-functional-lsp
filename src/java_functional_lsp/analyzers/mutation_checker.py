@@ -1,13 +1,16 @@
 """Mutation and imperative pattern rules: detect mutable variables, loops, and imperative unwrapping."""
 
+from __future__ import annotations
+
+from typing import Any
+
 from .base import Diagnostic, find_nodes, find_nodes_multi, has_ancestor, severity_from_config
 
-
 _MESSAGES = {
-    "mutable-variable": "Avoid reassigning variables. Use final variables with functional transforms (map, flatMap, fold).",
-    "imperative-loop": "Consider replacing imperative loop with functional operations: .map(), .filter(), .flatMap(), .foldLeft().",
+    "mutable-variable": "Avoid reassigning variables. Use final + functional transforms (map, flatMap, fold).",
+    "imperative-loop": "Replace imperative loop with .map(), .filter(), .flatMap(), or .foldLeft().",
     "mutable-dto": "Use @Value instead of @Data/@Setter for immutable DTOs.",
-    "imperative-option-unwrap": "Avoid imperative Option unwrapping (isDefined/get). Use map(), flatMap(), or fold() instead.",
+    "imperative-option-unwrap": "Avoid imperative unwrapping (isDefined/get). Use map(), flatMap(), or fold().",
 }
 
 _LOOP_TYPES = {"enhanced_for_statement", "for_statement", "while_statement"}
@@ -18,8 +21,8 @@ _CHECK_METHODS = {b"isDefined", b"isEmpty", b"isPresent", b"isNone"}
 class MutationChecker:
     """Detects mutable variables, imperative loops, and imperative unwrapping patterns."""
 
-    def analyze(self, tree, source: bytes, config: dict) -> list[Diagnostic]:
-        diagnostics = []
+    def analyze(self, tree: Any, source: bytes, config: dict[str, Any]) -> list[Diagnostic]:
+        diagnostics: list[Diagnostic] = []
 
         self._check_mutable_dto(tree, diagnostics, config)
         self._check_imperative_loops(tree, diagnostics, config)
@@ -28,7 +31,7 @@ class MutationChecker:
 
         return diagnostics
 
-    def _check_mutable_dto(self, tree, diagnostics: list, config: dict):
+    def _check_mutable_dto(self, tree: Any, diagnostics: list[Diagnostic], config: dict[str, Any]) -> None:
         """Detect @Data or @Setter annotations on classes."""
         severity = severity_from_config(config, "mutable-dto")
         if severity is None:
@@ -44,17 +47,19 @@ class MutationChecker:
                 if node.parent and node.parent.type == "modifiers":
                     grandparent = node.parent.parent
                     if grandparent and grandparent.type == "class_declaration":
-                        diagnostics.append(Diagnostic(
-                            line=name_node.start_point[0],
-                            col=name_node.start_point[1],
-                            end_line=name_node.end_point[0],
-                            end_col=name_node.end_point[1],
-                            severity=severity,
-                            code="mutable-dto",
-                            message=_MESSAGES["mutable-dto"],
-                        ))
+                        diagnostics.append(
+                            Diagnostic(
+                                line=name_node.start_point[0],
+                                col=name_node.start_point[1],
+                                end_line=name_node.end_point[0],
+                                end_col=name_node.end_point[1],
+                                severity=severity,
+                                code="mutable-dto",
+                                message=_MESSAGES["mutable-dto"],
+                            )
+                        )
 
-    def _check_imperative_loops(self, tree, diagnostics: list, config: dict):
+    def _check_imperative_loops(self, tree: Any, diagnostics: list[Diagnostic], config: dict[str, Any]) -> None:
         """Detect for/while loops that could be functional operations."""
         severity = severity_from_config(config, "imperative-loop")
         if severity is None:
@@ -74,17 +79,19 @@ class MutationChecker:
                 keyword = node.type.split("_")[0]  # "for" or "while" or "enhanced"
                 if keyword == "enhanced":
                     keyword = "for"
-                diagnostics.append(Diagnostic(
-                    line=node.start_point[0],
-                    col=node.start_point[1],
-                    end_line=node.start_point[0],
-                    end_col=node.start_point[1] + len(keyword),
-                    severity=severity,
-                    code="imperative-loop",
-                    message=_MESSAGES["imperative-loop"],
-                ))
+                diagnostics.append(
+                    Diagnostic(
+                        line=node.start_point[0],
+                        col=node.start_point[1],
+                        end_line=node.start_point[0],
+                        end_col=node.start_point[1] + len(keyword),
+                        severity=severity,
+                        code="imperative-loop",
+                        message=_MESSAGES["imperative-loop"],
+                    )
+                )
 
-    def _check_imperative_option_unwrap(self, tree, diagnostics: list, config: dict):
+    def _check_imperative_option_unwrap(self, tree: Any, diagnostics: list[Diagnostic], config: dict[str, Any]) -> None:
         """Detect if(opt.isDefined()) { opt.get() } patterns."""
         severity = severity_from_config(config, "imperative-option-unwrap")
         if severity is None:
@@ -107,19 +114,21 @@ class MutationChecker:
                 # Check if the body contains .get() on the same object
                 obj_name = obj_node.text
                 body_text = if_node.text
-                if obj_name + b".get()" in body_text:
-                    diagnostics.append(Diagnostic(
-                        line=if_node.start_point[0],
-                        col=if_node.start_point[1],
-                        end_line=if_node.end_point[0],
-                        end_col=if_node.end_point[1],
-                        severity=severity,
-                        code="imperative-option-unwrap",
-                        message=_MESSAGES["imperative-option-unwrap"],
-                    ))
+                if obj_name is not None and body_text is not None and obj_name + b".get()" in body_text:
+                    diagnostics.append(
+                        Diagnostic(
+                            line=if_node.start_point[0],
+                            col=if_node.start_point[1],
+                            end_line=if_node.end_point[0],
+                            end_col=if_node.end_point[1],
+                            severity=severity,
+                            code="imperative-option-unwrap",
+                            message=_MESSAGES["imperative-option-unwrap"],
+                        )
+                    )
                 break  # Only check first invocation in condition
 
-    def _check_mutable_variables(self, tree, diagnostics: list, config: dict):
+    def _check_mutable_variables(self, tree: Any, diagnostics: list[Diagnostic], config: dict[str, Any]) -> None:
         """Detect local variables that are reassigned (non-final, mutated)."""
         severity = severity_from_config(config, "mutable-variable")
         if severity is None:
@@ -130,12 +139,14 @@ class MutationChecker:
             if not has_ancestor(node, _METHOD_TYPES):
                 continue
 
-            diagnostics.append(Diagnostic(
-                line=node.start_point[0],
-                col=node.start_point[1],
-                end_line=node.end_point[0],
-                end_col=node.end_point[1],
-                severity=severity,
-                code="mutable-variable",
-                message=_MESSAGES["mutable-variable"],
-            ))
+            diagnostics.append(
+                Diagnostic(
+                    line=node.start_point[0],
+                    col=node.start_point[1],
+                    end_line=node.end_point[0],
+                    end_col=node.end_point[1],
+                    severity=severity,
+                    code="mutable-variable",
+                    message=_MESSAGES["mutable-variable"],
+                )
+            )

@@ -3,18 +3,22 @@
 Provides custom Java diagnostics via tree-sitter analysis.
 """
 
+from __future__ import annotations
+
 import json
 import logging
 from pathlib import Path
-from urllib.parse import urlparse, unquote
+from typing import Any
+from urllib.parse import unquote, urlparse
 
 from lsprotocol import types as lsp
 from pygls.lsp.server import LanguageServer
 
-from .analyzers.base import Diagnostic as LintDiagnostic, Severity, get_parser
-from .analyzers.null_checker import NullChecker
+from .analyzers.base import Analyzer, Severity, get_parser
+from .analyzers.base import Diagnostic as LintDiagnostic
 from .analyzers.exception_checker import ExceptionChecker
 from .analyzers.mutation_checker import MutationChecker
+from .analyzers.null_checker import NullChecker
 from .analyzers.spring_checker import SpringChecker
 
 logger = logging.getLogger(__name__)
@@ -26,14 +30,14 @@ _SEVERITY_MAP = {
     Severity.HINT: lsp.DiagnosticSeverity.Hint,
 }
 
-_ANALYZERS = [NullChecker(), ExceptionChecker(), MutationChecker(), SpringChecker()]
+_ANALYZERS: list[Analyzer] = [NullChecker(), ExceptionChecker(), MutationChecker(), SpringChecker()]
 
 
 class JavaFunctionalLspServer(LanguageServer):
-    def __init__(self):
+    def __init__(self) -> None:
         super().__init__("java-functional-lsp", "0.1.0")
         self._parser = get_parser()
-        self._config: dict = {}
+        self._config: dict[str, Any] = {}
 
 
 server = JavaFunctionalLspServer()
@@ -45,14 +49,15 @@ def _uri_to_path(uri: str) -> str:
     return unquote(parsed.path)
 
 
-def _load_config(workspace_root: str | None) -> dict:
+def _load_config(workspace_root: str | None) -> dict[str, Any]:
     """Load .deeperdive-linter.json from workspace root if it exists."""
     if not workspace_root:
         return {}
     config_path = Path(workspace_root) / ".deeperdive-linter.json"
     if config_path.exists():
         try:
-            return json.loads(config_path.read_text())
+            result: dict[str, Any] = json.loads(config_path.read_text())
+            return result
         except (json.JSONDecodeError, OSError) as e:
             logger.warning("Failed to load config from %s: %s", config_path, e)
     return {}
@@ -89,15 +94,15 @@ def _analyze_document(source_text: str) -> list[lsp.Diagnostic]:
     return [_to_lsp_diagnostic(d) for d in all_diagnostics]
 
 
-def _publish_diagnostics(uri: str):
+def _publish_diagnostics(uri: str) -> None:
     """Analyze a document and publish diagnostics."""
     doc = server.workspace.get_text_document(uri)
     diagnostics = _analyze_document(doc.source)
-    server.publish_diagnostics(uri, diagnostics)
+    server.text_document_publish_diagnostics(lsp.PublishDiagnosticsParams(uri=uri, diagnostics=diagnostics))
 
 
 @server.feature(lsp.INITIALIZED)
-def on_initialized(params: lsp.InitializedParams):
+def on_initialized(params: lsp.InitializedParams) -> None:
     """Load config after initialization."""
     root = None
     if server.workspace.root_uri:
@@ -105,29 +110,32 @@ def on_initialized(params: lsp.InitializedParams):
     elif server.workspace.root_path:
         root = server.workspace.root_path
     server._config = _load_config(root)
-    logger.info("java-functional-lsp initialized (workspace: %s, rules: %s)",
-                root, list(server._config.get("rules", {}).keys()) or "all defaults")
+    logger.info(
+        "java-functional-lsp initialized (workspace: %s, rules: %s)",
+        root,
+        list(server._config.get("rules", {}).keys()) or "all defaults",
+    )
 
 
 @server.feature(lsp.TEXT_DOCUMENT_DID_OPEN)
-def on_did_open(params: lsp.DidOpenTextDocumentParams):
+def on_did_open(params: lsp.DidOpenTextDocumentParams) -> None:
     """Analyze document when opened."""
     _publish_diagnostics(params.text_document.uri)
 
 
 @server.feature(lsp.TEXT_DOCUMENT_DID_CHANGE)
-def on_did_change(params: lsp.DidChangeTextDocumentParams):
+def on_did_change(params: lsp.DidChangeTextDocumentParams) -> None:
     """Re-analyze document on change."""
     _publish_diagnostics(params.text_document.uri)
 
 
 @server.feature(lsp.TEXT_DOCUMENT_DID_SAVE)
-def on_did_save(params: lsp.DidSaveTextDocumentParams):
+def on_did_save(params: lsp.DidSaveTextDocumentParams) -> None:
     """Re-analyze document on save."""
     _publish_diagnostics(params.text_document.uri)
 
 
-def main():
+def main() -> None:
     """Entry point for the LSP server."""
     logging.basicConfig(level=logging.INFO, format="%(name)s %(levelname)s: %(message)s")
     server.start_io()

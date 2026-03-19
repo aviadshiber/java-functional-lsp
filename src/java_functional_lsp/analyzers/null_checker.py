@@ -1,7 +1,10 @@
 """Null safety rules: detect null literals in arguments, returns, and assignments."""
 
-from .base import Diagnostic, find_nodes, severity_from_config
+from __future__ import annotations
 
+from typing import Any
+
+from .base import Diagnostic, find_nodes, severity_from_config
 
 _MESSAGES = {
     "null-literal-arg": "Avoid passing null as argument. Use Option.none(), a default value, or overload the method.",
@@ -14,8 +17,8 @@ _MESSAGES = {
 class NullChecker:
     """Detects null literal usage in arguments, returns, and assignments."""
 
-    def analyze(self, tree, source: bytes, config: dict) -> list[Diagnostic]:
-        diagnostics = []
+    def analyze(self, tree: Any, source: bytes, config: dict[str, Any]) -> list[Diagnostic]:
+        diagnostics: list[Diagnostic] = []
 
         for node in find_nodes(tree.root_node, "null_literal"):
             parent = node.parent
@@ -30,19 +33,21 @@ class NullChecker:
             if severity is None:
                 continue
 
-            diagnostics.append(Diagnostic(
-                line=node.start_point[0],
-                col=node.start_point[1],
-                end_line=node.end_point[0],
-                end_col=node.end_point[1],
-                severity=severity,
-                code=rule_id,
-                message=_MESSAGES[rule_id],
-            ))
+            diagnostics.append(
+                Diagnostic(
+                    line=node.start_point[0],
+                    col=node.start_point[1],
+                    end_line=node.end_point[0],
+                    end_col=node.end_point[1],
+                    severity=severity,
+                    code=rule_id,
+                    message=_MESSAGES[rule_id],
+                )
+            )
 
         return diagnostics
 
-    def _classify_null(self, node, parent) -> str | None:
+    def _classify_null(self, node: Any, parent: Any) -> str | None:
         """Classify a null_literal by its context."""
         # null in argument list -> null-literal-arg
         if parent.type == "argument_list":

@@ -1,8 +1,11 @@
 """Base analyzer class and diagnostic types."""
 
+from __future__ import annotations
+
+from collections.abc import Generator
 from dataclasses import dataclass
 from enum import IntEnum
-from typing import Generator, Protocol
+from typing import Any, Protocol
 
 import tree_sitter_java as tsjava
 from tree_sitter import Language, Node, Parser
@@ -30,7 +33,7 @@ class Diagnostic:
 class Analyzer(Protocol):
     """Protocol for all analyzers."""
 
-    def analyze(self, tree, source: bytes, config: dict) -> list[Diagnostic]:
+    def analyze(self, tree: Any, source: bytes, config: dict[str, Any]) -> list[Diagnostic]:
         """Analyze a parsed tree and return diagnostics."""
         ...
 
@@ -53,6 +56,7 @@ def get_language() -> Language:
     global _language
     if _language is None:
         get_parser()
+    assert _language is not None
     return _language
 
 
@@ -92,9 +96,9 @@ def has_ancestor(node: Node, type_names: set[str]) -> bool:
     return False
 
 
-def severity_from_config(config: dict, rule_id: str, default: Severity = Severity.WARNING) -> Severity | None:
+def severity_from_config(config: dict[str, Any], rule_id: str, default: Severity = Severity.WARNING) -> Severity | None:
     """Get severity for a rule from config. Returns None if rule is disabled."""
-    rules = config.get("rules", {})
+    rules: dict[str, str] = config.get("rules", {})
     level = rules.get(rule_id)
     if level is None:
         return default

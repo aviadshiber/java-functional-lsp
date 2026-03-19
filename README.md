@@ -1,5 +1,10 @@
 # java-functional-lsp
 
+[![CI](https://github.com/aviadshiber/java-functional-lsp/actions/workflows/test.yml/badge.svg)](https://github.com/aviadshiber/java-functional-lsp/actions/workflows/test.yml)
+[![PyPI version](https://img.shields.io/pypi/v/java-functional-lsp)](https://pypi.org/project/java-functional-lsp/)
+[![Python](https://img.shields.io/pypi/pyversions/java-functional-lsp)](https://pypi.org/project/java-functional-lsp/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+
 A Java Language Server that enforces functional programming best practices. Designed for teams using **Vavr**, **Lombok**, and **Spring** with a functional-first approach.
 
 ## What it checks
@@ -28,7 +33,7 @@ pip install java-functional-lsp
 Or from source:
 
 ```bash
-pip install git+https://github.com/<user>/java-functional-lsp.git
+pip install git+https://github.com/aviadshiber/java-functional-lsp.git
 ```
 
 ## Usage with Claude Code
@@ -71,6 +76,23 @@ All rules default to `warning` when not configured.
 Uses [tree-sitter](https://tree-sitter.github.io/) with the Java grammar for fast, incremental AST parsing. No Java compiler or classpath needed — analysis runs on raw source files.
 
 The server speaks the Language Server Protocol (LSP) via stdio, making it compatible with any LSP client.
+
+## Development
+
+```bash
+# Clone and setup
+git clone https://github.com/aviadshiber/java-functional-lsp.git
+cd java-functional-lsp
+uv sync
+
+# Run checks
+uv run ruff check src/ tests/
+uv run ruff format --check src/ tests/
+uv run mypy src/
+uv run pytest
+```
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for full guidelines.
 
 ## License
 
