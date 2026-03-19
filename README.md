@@ -27,12 +27,13 @@ A Java Language Server that enforces functional programming best practices. Desi
 ## Install
 
 ```bash
+# Homebrew
+brew install aviadshiber/tap/java-functional-lsp
+
+# pip
 pip install java-functional-lsp
-```
 
-Or from source:
-
-```bash
+# From source
 pip install git+https://github.com/aviadshiber/java-functional-lsp.git
 ```
 
