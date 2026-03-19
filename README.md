@@ -1,0 +1,77 @@
+# java-functional-lsp
+
+A Java Language Server that enforces functional programming best practices. Designed for teams using **Vavr**, **Lombok**, and **Spring** with a functional-first approach.
+
+## What it checks
+
+| Rule | Detects | Suggests |
+|------|---------|----------|
+| `null-literal-arg` | `null` passed as method argument | `Option.none()` or default value |
+| `null-return` | `return null` | `Option.of()`, `Option.none()`, or `Either` |
+| `null-assignment` | `Type x = null` | `Option<Type>` |
+| `null-field-assignment` | Field initialized to `null` | `Option<T>` with `Option.none()` |
+| `throw-statement` | `throw new XxxException(...)` | `Either.left()` or `Try.of()` |
+| `catch-rethrow` | catch block that wraps + rethrows | `Try.of().toEither()` |
+| `mutable-variable` | Local variable reassignment | Final variables + functional transforms |
+| `imperative-loop` | `for`/`while` loops | `.map()`/`.filter()`/`.flatMap()`/`.foldLeft()` |
+| `mutable-dto` | `@Data` or `@Setter` on class | `@Value` (immutable) |
+| `imperative-option-unwrap` | `if (opt.isDefined()) { opt.get() }` | `map()`/`flatMap()`/`fold()` |
+| `field-injection` | `@Autowired` on field | Constructor injection |
+| `component-annotation` | `@Component`/`@Service`/`@Repository` | `@Configuration` + `@Bean` |
+
+## Install
+
+```bash
+pip install java-functional-lsp
+```
+
+Or from source:
+
+```bash
+pip install git+https://github.com/<user>/java-functional-lsp.git
+```
+
+## Usage with Claude Code
+
+Install the `deeperdive-java-linter` plugin from the DeeperDive marketplace, which registers this server as a Java LSP.
+
+Or manually add to your Claude Code config:
+
+```json
+{
+  "lspServers": {
+    "java-functional": {
+      "command": "java-functional-lsp",
+      "extensionToLanguage": { ".java": "java" }
+    }
+  }
+}
+```
+
+## Configuration
+
+Create `.deeperdive-linter.json` in your project root to customize rules:
+
+```json
+{
+  "rules": {
+    "null-literal-arg": "warning",
+    "throw-statement": "info",
+    "imperative-loop": "hint",
+    "mutable-dto": "off"
+  }
+}
+```
+
+Severity levels: `error`, `warning`, `info`, `hint`, `off`.
+All rules default to `warning` when not configured.
+
+## How it works
+
+Uses [tree-sitter](https://tree-sitter.github.io/) with the Java grammar for fast, incremental AST parsing. No Java compiler or classpath needed — analysis runs on raw source files.
+
+The server speaks the Language Server Protocol (LSP) via stdio, making it compatible with any LSP client.
+
+## License
+
+MIT
