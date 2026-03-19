@@ -1,8 +1,18 @@
 __pycache__/
-*.pyc
+*.py[cod]
+*$py.class
 *.egg-info/
 dist/
 build/
+.eggs/
 .venv/
-*.egg
+.uv/
+.mypy_cache/
+.ruff_cache/
 .pytest_cache/
+htmlcov/
+.coverage
+*.egg
+*.zip
+# Claude Code
+.claude/
