@@ -40,7 +40,9 @@ _converter = cattrs.Converter()
 
 class JavaFunctionalLspServer(LanguageServer):
     def __init__(self) -> None:
-        super().__init__("java-functional-lsp", "0.1.0")
+        from . import __version__
+
+        super().__init__("java-functional-lsp", __version__)
         self._parser = get_parser()
         self._config: dict[str, Any] = {}
         self._init_params: dict[str, Any] = {}
