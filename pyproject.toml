@@ -38,7 +38,7 @@ Repository = "https://github.com/aviadshiber/java-functional-lsp"
 Changelog = "https://github.com/aviadshiber/java-functional-lsp/releases"
 
 [project.scripts]
-java-functional-lsp = "java_functional_lsp.server:main"
+java-functional-lsp = "java_functional_lsp.cli:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/java_functional_lsp"]
@@ -75,6 +75,7 @@ ignore = ["PLR0913", "PLC0415", "PLW0603", "PLW0602"]
 [tool.ruff.lint.per-file-ignores]
 "__init__.py" = ["E402"]
 "**/test_*.py" = ["PLR2004"]
+"**/cli.py" = ["T20", "PLR0912", "PLR2004"]
 
 [tool.ruff.format]
 quote-style = "double"
