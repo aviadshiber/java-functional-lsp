@@ -1,0 +1,61 @@
+name: Update Homebrew Formula
+
+on:
+  workflow_run:
+    workflows: ["Publish to PyPI"]
+    types: [completed]
+  workflow_dispatch:
+
+jobs:
+  update-formula:
+    runs-on: ubuntu-latest
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    steps:
+      - uses: actions/checkout@v6
+      - name: Get release version
+        id: version
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION=$(gh api "repos/${{ github.repository }}/releases/latest" --jq .tag_name)
+          echo "version=${VERSION#v}" >> "$GITHUB_OUTPUT"
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Wait for PyPI availability
+        env:
+          PKG_VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          for i in $(seq 1 30); do
+            if pip index versions java-functional-lsp 2>/dev/null | grep -q "$PKG_VERSION"; then
+              echo "java-functional-lsp==$PKG_VERSION available on PyPI"
+              break
+            fi
+            echo "Waiting for PyPI... attempt $i/30"
+            sleep 20
+          done
+      - name: Generate formula
+        env:
+          PKG_VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          python3 scripts/generate-formula.py "$PKG_VERSION" > java-functional-lsp.rb
+          echo "Generated formula:"
+          cat java-functional-lsp.rb
+      - name: Checkout tap repo
+        uses: actions/checkout@v6
+        with:
+          repository: aviadshiber/homebrew-tap
+          token: ${{ secrets.TAP_GITHUB_TOKEN }}
+          path: homebrew-tap
+      - name: Update formula
+        env:
+          PKG_VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          cp java-functional-lsp.rb homebrew-tap/Formula/java-functional-lsp.rb
+          cd homebrew-tap
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Formula/java-functional-lsp.rb
+          git diff --cached --quiet || git commit -m "Update java-functional-lsp to $PKG_VERSION"
+          git push
