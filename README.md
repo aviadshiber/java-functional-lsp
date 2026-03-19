@@ -1,8 +1,8 @@
 # java-functional-lsp
 
 [![CI](https://github.com/aviadshiber/java-functional-lsp/actions/workflows/test.yml/badge.svg)](https://github.com/aviadshiber/java-functional-lsp/actions/workflows/test.yml)
-[![PyPI version](https://img.shields.io/pypi/v/java-functional-lsp)](https://pypi.org/project/java-functional-lsp/)
-[![Python](https://img.shields.io/pypi/pyversions/java-functional-lsp)](https://pypi.org/project/java-functional-lsp/)
+[![PyPI version](https://img.shields.io/pypi/v/java-functional-lsp?v=1)](https://pypi.org/project/java-functional-lsp/)
+[![Python](https://img.shields.io/pypi/pyversions/java-functional-lsp?v=1)](https://pypi.org/project/java-functional-lsp/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
 A Java Language Server that enforces functional programming best practices. Designed for teams using **Vavr**, **Lombok**, and **Spring** with a functional-first approach.
