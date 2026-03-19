@@ -14,7 +14,8 @@ from urllib.parse import unquote, urlparse
 from lsprotocol import types as lsp
 from pygls.lsp.server import LanguageServer
 
-from .analyzers.base import Analyzer, Diagnostic as LintDiagnostic, Severity, get_parser
+from .analyzers.base import Analyzer, Severity, get_parser
+from .analyzers.base import Diagnostic as LintDiagnostic
 from .analyzers.exception_checker import ExceptionChecker
 from .analyzers.mutation_checker import MutationChecker
 from .analyzers.null_checker import NullChecker
@@ -97,9 +98,7 @@ def _publish_diagnostics(uri: str) -> None:
     """Analyze a document and publish diagnostics."""
     doc = server.workspace.get_text_document(uri)
     diagnostics = _analyze_document(doc.source)
-    server.text_document_publish_diagnostics(
-        lsp.PublishDiagnosticsParams(uri=uri, diagnostics=diagnostics)
-    )
+    server.text_document_publish_diagnostics(lsp.PublishDiagnosticsParams(uri=uri, diagnostics=diagnostics))
 
 
 @server.feature(lsp.INITIALIZED)

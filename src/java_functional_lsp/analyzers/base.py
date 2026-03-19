@@ -96,9 +96,7 @@ def has_ancestor(node: Node, type_names: set[str]) -> bool:
     return False
 
 
-def severity_from_config(
-    config: dict[str, Any], rule_id: str, default: Severity = Severity.WARNING
-) -> Severity | None:
+def severity_from_config(config: dict[str, Any], rule_id: str, default: Severity = Severity.WARNING) -> Severity | None:
     """Get severity for a rule from config. Returns None if rule is disabled."""
     rules: dict[str, str] = config.get("rules", {})
     level = rules.get(rule_id)
