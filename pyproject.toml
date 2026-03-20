@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "java-functional-lsp"
-version = "0.2.0"
+version = "0.3.0"
 description = "Java LSP server enforcing functional programming best practices — null safety, immutability, no exceptions"
 readme = "README.md"
 license = { text = "MIT" }

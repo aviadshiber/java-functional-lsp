@@ -42,7 +42,7 @@ class TestFormatDiagnostic:
 
 class TestLoadConfig:
     def test_finds_config(self, tmp_path: Path) -> None:
-        config_file = tmp_path / ".deeperdive-linter.json"
+        config_file = tmp_path / ".java-functional-lsp.json"
         config_file.write_text('{"rules": {"null-return": "off"}}')
         java_file = tmp_path / "src" / "Test.java"
         java_file.parent.mkdir()

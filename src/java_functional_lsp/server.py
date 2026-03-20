@@ -66,10 +66,10 @@ def _uri_to_path(uri: str) -> str:
 
 
 def _load_config(workspace_root: str | None) -> dict[str, Any]:
-    """Load .deeperdive-linter.json from workspace root if it exists."""
+    """Load .java-functional-lsp.json from workspace root if it exists."""
     if not workspace_root:
         return {}
-    config_path = Path(workspace_root) / ".deeperdive-linter.json"
+    config_path = Path(workspace_root) / ".java-functional-lsp.json"
     if config_path.exists():
         try:
             result: dict[str, Any] = json.loads(config_path.read_text())

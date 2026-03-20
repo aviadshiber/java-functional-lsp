@@ -64,7 +64,13 @@ See [editors/intellij/README.md](editors/intellij/README.md) for detailed instru
 
 ### Claude Code
 
-Install the `deeperdive-java-linter` plugin from the DeeperDive marketplace, which registers this server as a Java LSP.
+Install as a plugin directly from GitHub:
+
+```bash
+claude plugin add https://github.com/aviadshiber/java-functional-lsp.git
+```
+
+This registers the LSP server, adds auto-install hooks, and provides the `/lint-java` command.
 
 Or manually add to your Claude Code config:
 
@@ -91,7 +97,7 @@ Any LSP client that supports stdio transport can use this server. Point it to th
 
 ## Configuration
 
-Create `.deeperdive-linter.json` in your project root to customize rules:
+Create `.java-functional-lsp.json` in your project root to customize rules:
 
 ```json
 {

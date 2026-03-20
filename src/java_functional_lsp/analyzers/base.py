@@ -27,7 +27,7 @@ class Diagnostic:
     severity: Severity
     code: str  # rule ID
     message: str
-    source: str = "deeperdive-java-linter"
+    source: str = "java-functional-lsp"
 
 
 class Analyzer(Protocol):

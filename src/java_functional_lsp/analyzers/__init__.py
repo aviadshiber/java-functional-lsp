@@ -1,1 +1,1 @@
-"""DeeperDive Java code quality analyzers using tree-sitter."""
+"""Java code quality analyzers using tree-sitter."""

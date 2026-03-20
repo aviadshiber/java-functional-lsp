@@ -238,7 +238,7 @@ class TestServerHelpers:
         result = _to_lsp_diagnostic(diag)
         assert result.message == "msg"
         assert result.code == "test"
-        assert result.source == "deeperdive-java-linter"
+        assert result.source == "java-functional-lsp"
 
     def test_analyze_document(self) -> None:
         from java_functional_lsp.server import _analyze_document
