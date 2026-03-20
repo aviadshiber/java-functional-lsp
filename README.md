@@ -41,7 +41,15 @@ pip install git+https://github.com/aviadshiber/java-functional-lsp.git
 
 ### VS Code
 
-Install the extension from a `.vsix` file ([download from releases](https://github.com/aviadshiber/java-functional-lsp/releases)) or build it:
+Install the extension from a `.vsix` file ([download from releases](https://github.com/aviadshiber/java-functional-lsp/releases)):
+
+```bash
+# Download and install
+gh release download --repo aviadshiber/java-functional-lsp --pattern "*.vsix" --dir /tmp
+code --install-extension /tmp/java-functional-lsp-*.vsix
+```
+
+Or build from source:
 
 ```bash
 cd editors/vscode
@@ -50,7 +58,9 @@ npx vsce package
 code --install-extension java-functional-lsp-*.vsix
 ```
 
-The extension launches the LSP server automatically for `.java` files. Configure the binary path in settings if needed (`javaFunctionalLsp.serverPath`). See [editors/vscode/README.md](editors/vscode/README.md) for details.
+The extension is a thin launcher — it just starts the `java-functional-lsp` binary for `.java` files. **Updating rules only requires upgrading the LSP binary** (`brew upgrade java-functional-lsp` or `pip install --upgrade java-functional-lsp`). The VSIX itself rarely needs updating.
+
+Configure the binary path in settings if needed (`javaFunctionalLsp.serverPath`). See [editors/vscode/README.md](editors/vscode/README.md) for details.
 
 ### IntelliJ IDEA
 
