@@ -14,5 +14,9 @@ htmlcov/
 .coverage
 *.egg
 *.zip
+# VS Code extension
+editors/vscode/node_modules/
+editors/vscode/out/
+*.vsix
 # Claude Code
 .claude/
