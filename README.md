@@ -64,9 +64,7 @@ See [editors/intellij/README.md](editors/intellij/README.md) for detailed instru
 
 ### Claude Code
 
-Install the `deeperdive-java-linter` plugin from the DeeperDive marketplace, which registers this server as a Java LSP.
-
-Or manually add to your Claude Code config:
+Add to your Claude Code config (`.claude/settings.json` or project settings):
 
 ```json
 {
