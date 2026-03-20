@@ -39,17 +39,6 @@ Without jdtls, the server runs in standalone mode — custom rules still work, b
 | `field-injection` | `@Autowired` on field | Constructor injection |
 | `component-annotation` | `@Component`/`@Service`/`@Repository` | `@Configuration` + `@Bean` |
 
-## Reference Guides
-
-For detailed patterns on how to fix each diagnostic, see:
-
-| Reference | Covers |
-|-----------|--------|
-| [references/lombok.md](references/lombok.md) | `@Value`, `@With`, `@Builder`, `@Jacksonized`, inheritance bugs |
-| [references/vavr.md](references/vavr.md) | `Either` (Railway), `Option`, `Try`, `Validation`, side effects |
-| [references/functional-design.md](references/functional-design.md) | ADTs, phantom types, error ADTs, stage context |
-| [references/spring.md](references/spring.md) | `@Configuration` only, constructor injection, boundary validation |
-
 ## Configuration
 
 Create `.deeperdive-linter.json` in your project root:
