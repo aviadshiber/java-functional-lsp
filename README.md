@@ -64,7 +64,15 @@ See [editors/intellij/README.md](editors/intellij/README.md) for detailed instru
 
 ### Claude Code
 
-Add to your Claude Code config (`.claude/settings.json` or project settings):
+Install as a plugin directly from GitHub:
+
+```bash
+claude plugin add https://github.com/aviadshiber/java-functional-lsp.git
+```
+
+This registers the LSP server, adds auto-install hooks, and provides the `/lint-java` command.
+
+Or manually add to your Claude Code config:
 
 ```json
 {

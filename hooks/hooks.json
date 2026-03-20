@@ -1,0 +1,28 @@
+{
+  "description": "Auto-install/update LSP server and enforce diagnostics on Java files",
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_ROOT}/scripts/ensure-lsp.sh",
+            "timeout": 60,
+            "statusMessage": "Checking java-functional-lsp..."
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Read|Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 ${CLAUDE_PLUGIN_ROOT}/hooks/java_linter_reminder.py"
+          }
+        ]
+      }
+    ]
+  }
+}
