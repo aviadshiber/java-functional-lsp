@@ -1,0 +1,66 @@
+{
+  "name": "java-functional-lsp",
+  "displayName": "Java Functional LSP",
+  "description": "Java LSP server enforcing functional programming best practices — null safety, immutability, no exceptions",
+  "version": "0.2.0",
+  "publisher": "aviadshiber",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.75.0"
+  },
+  "categories": [
+    "Programming Languages",
+    "Linters"
+  ],
+  "keywords": [
+    "java",
+    "functional programming",
+    "linter",
+    "vavr",
+    "lombok",
+    "immutability"
+  ],
+  "activationEvents": [
+    "onLanguage:java"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "configuration": {
+      "title": "Java Functional LSP",
+      "properties": {
+        "javaFunctionalLsp.serverPath": {
+          "type": "string",
+          "default": "java-functional-lsp",
+          "description": "Path to the java-functional-lsp binary. Defaults to finding it on PATH."
+        },
+        "javaFunctionalLsp.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable or disable the Java Functional LSP server."
+        }
+      }
+    }
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/aviadshiber/java-functional-lsp"
+  },
+  "homepage": "https://github.com/aviadshiber/java-functional-lsp",
+  "bugs": {
+    "url": "https://github.com/aviadshiber/java-functional-lsp/issues"
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "package": "vsce package"
+  },
+  "dependencies": {
+    "vscode-languageclient": "^9.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^18.19.130",
+    "@types/vscode": "^1.75.0",
+    "@vscode/vsce": "^3.0.0",
+    "typescript": "^5.0.0"
+  }
+}

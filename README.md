@@ -37,7 +37,32 @@ pip install java-functional-lsp
 pip install git+https://github.com/aviadshiber/java-functional-lsp.git
 ```
 
-## Usage with Claude Code
+## IDE Setup
+
+### VS Code
+
+Install the extension from a `.vsix` file ([download from releases](https://github.com/aviadshiber/java-functional-lsp/releases)) or build it:
+
+```bash
+cd editors/vscode
+npm install && npm run compile
+npx vsce package
+code --install-extension java-functional-lsp-*.vsix
+```
+
+The extension launches the LSP server automatically for `.java` files. Configure the binary path in settings if needed (`javaFunctionalLsp.serverPath`). See [editors/vscode/README.md](editors/vscode/README.md) for details.
+
+### IntelliJ IDEA
+
+Use the [LSP4IJ](https://github.com/redhat-developer/lsp4ij) plugin (works on Community & Ultimate):
+
+1. Install **LSP4IJ** from the JetBrains Marketplace
+2. **Settings** → **Languages & Frameworks** → **Language Servers** → **`+`**
+3. Set **Command**: `java-functional-lsp`, **Language**: `Java`, **Language ID**: `java`
+
+See [editors/intellij/README.md](editors/intellij/README.md) for detailed instructions.
+
+### Claude Code
 
 Install the `deeperdive-java-linter` plugin from the DeeperDive marketplace, which registers this server as a Java LSP.
 
@@ -53,6 +78,16 @@ Or manually add to your Claude Code config:
   }
 }
 ```
+
+### Other Editors
+
+Any LSP client that supports stdio transport can use this server. Point it to the `java-functional-lsp` command for `java` files.
+
+| Editor | Config |
+|--------|--------|
+| **Neovim** | `vim.lsp.start({ cmd = {"java-functional-lsp"}, filetypes = {"java"} })` |
+| **Emacs (eglot)** | `(add-to-list 'eglot-server-programs '(java-mode "java-functional-lsp"))` |
+| **Sublime Text** | LSP package → add server with `"command": ["java-functional-lsp"]` |
 
 ## Configuration
 

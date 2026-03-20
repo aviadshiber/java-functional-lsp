@@ -1,0 +1,10 @@
+{
+  "name": "Java Functional LSP",
+  "command": "java-functional-lsp",
+  "mappings": [
+    {
+      "language": "Java",
+      "languageId": "java"
+    }
+  ]
+}
