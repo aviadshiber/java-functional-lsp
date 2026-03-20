@@ -50,8 +50,9 @@
     "url": "https://github.com/aviadshiber/java-functional-lsp/issues"
   },
   "scripts": {
-    "compile": "tsc -p ./",
-    "watch": "tsc -watch -p ./",
+    "compile": "npm run esbuild",
+    "esbuild": "esbuild src/extension.ts --bundle --outfile=out/extension.js --external:vscode --format=cjs --platform=node",
+    "watch": "npm run esbuild -- --watch",
     "package": "vsce package"
   },
   "dependencies": {
@@ -61,6 +62,7 @@
     "@types/node": "^18.19.130",
     "@types/vscode": "^1.75.0",
     "@vscode/vsce": "^3.0.0",
+    "esbuild": "^0.27.4",
     "typescript": "^5.0.0"
   }
 }
