@@ -97,7 +97,7 @@ Any LSP client that supports stdio transport can use this server. Point it to th
 
 ## Configuration
 
-Create `.deeperdive-linter.json` in your project root to customize rules:
+Create `.java-functional-lsp.json` in your project root to customize rules:
 
 ```json
 {

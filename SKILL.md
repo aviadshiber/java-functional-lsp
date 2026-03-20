@@ -41,7 +41,7 @@ Without jdtls, the server runs in standalone mode — custom rules still work, b
 
 ## Configuration
 
-Create `.deeperdive-linter.json` in your project root:
+Create `.java-functional-lsp.json` in your project root:
 
 ```json
 {
@@ -74,4 +74,4 @@ To release a new version:
 
 - **"java-functional-lsp not found"**: Run `brew install aviadshiber/tap/java-functional-lsp`
 - **No completions/hover**: Install jdtls: `brew install jdtls`
-- **Too many warnings**: Create `.deeperdive-linter.json` to tune severity or disable noisy rules
+- **Too many warnings**: Create `.java-functional-lsp.json` to tune severity or disable noisy rules

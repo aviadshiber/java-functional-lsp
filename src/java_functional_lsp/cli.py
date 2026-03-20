@@ -24,10 +24,10 @@ _SEVERITY_SYMBOLS = {
 
 
 def load_config(start_path: Path) -> dict[str, Any]:
-    """Walk up from start_path to find .deeperdive-linter.json."""
+    """Walk up from start_path to find .java-functional-lsp.json."""
     current = start_path if start_path.is_dir() else start_path.parent
     while current != current.parent:
-        config_path = current / ".deeperdive-linter.json"
+        config_path = current / ".java-functional-lsp.json"
         if config_path.exists():
             try:
                 result: dict[str, Any] = json.loads(config_path.read_text())

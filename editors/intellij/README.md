@@ -62,7 +62,7 @@ In the **Mappings** tab of the server configuration:
 
 ## Configuration
 
-Project-level rules are configured via `.deeperdive-linter.json` in your project root. See the [main README](../../README.md) for details.
+Project-level rules are configured via `.java-functional-lsp.json` in your project root. See the [main README](../../README.md) for details.
 
 ## Coexistence with IntelliJ's Java Support
 
@@ -76,7 +76,7 @@ LSP4IJ is designed to **supplement** IntelliJ's native Java support, not replace
 
 ### No diagnostics appear
 - Ensure the file mapping is set to Language: `Java`, Language ID: `java`
-- Check that `.deeperdive-linter.json` doesn't have rules set to `"off"`
+- Check that `.java-functional-lsp.json` doesn't have rules set to `"off"`
 - Try restarting the language server: **Tools** → **Language Servers** → **Restart**
 
 ### PATH not found

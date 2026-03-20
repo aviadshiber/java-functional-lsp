@@ -57,4 +57,4 @@ This extension **coexists** with the Red Hat Java extension (`redhat.java`) and 
 
 ## Rules
 
-See the [main README](../../README.md) for the full list of 12 rules and configuration options via `.deeperdive-linter.json`.
+See the [main README](../../README.md) for the full list of 12 rules and configuration options via `.java-functional-lsp.json`.
