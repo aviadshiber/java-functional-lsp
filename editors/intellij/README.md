@@ -48,11 +48,18 @@ Use [LSP4IJ](https://github.com/redhat-developer/lsp4ij) (by Red Hat) to connect
 
 ## Step 3: Configure File Mappings
 
-In the **Mappings** tab of the server configuration:
+In the **Mappings** tab of the server configuration, add mappings so the LSP server activates for Java files. Set up **all three** sub-tabs:
 
-1. Click **`+`** to add a mapping
-2. Set **Language**: `Java`
-3. Set **Language ID**: `java`
+**Language** tab:
+1. Click **`+`** → select **Java**
+
+**File type** tab:
+1. Click **`+`** → select **Java**
+
+**File name patterns** tab:
+1. Click **`+`** to add a pattern
+2. Set **File name patterns**: `*.java`
+3. Set **Language Id**: `java`
 
 ## Step 4: Verify
 

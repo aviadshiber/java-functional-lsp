@@ -58,7 +58,7 @@ Use the [LSP4IJ](https://github.com/redhat-developer/lsp4ij) plugin (works on Co
 
 1. Install **LSP4IJ** from the JetBrains Marketplace
 2. **Settings** → **Languages & Frameworks** → **Language Servers** → **`+`**
-3. Set **Command**: `java-functional-lsp`, **Language**: `Java`, **Language ID**: `java`
+3. Set **Command**: `java-functional-lsp`, then in **Mappings** → **File name patterns** add `*.java` with Language Id `java`
 
 See [editors/intellij/README.md](editors/intellij/README.md) for detailed instructions.
 

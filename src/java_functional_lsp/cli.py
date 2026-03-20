@@ -63,14 +63,14 @@ def main() -> None:
     """CLI entry point: java-functional-lsp check <files...>"""
     args = sys.argv[1:]
 
-    if not args or args[0] in ("-h", "--help"):
+    if args and args[0] in ("-h", "--help"):
         print("Usage: java-functional-lsp check <file.java> [file2.java ...]")
         print("       java-functional-lsp check --dir <directory>")
         print("       java-functional-lsp          (start LSP server on stdio)")
         sys.exit(0)
 
-    if args[0] != "check":
-        # Not check mode — fall through to LSP server
+    if not args or args[0] != "check":
+        # No args or unknown command — start LSP server on stdio
         from .server import main as lsp_main
 
         lsp_main()
