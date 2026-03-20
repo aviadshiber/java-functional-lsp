@@ -139,6 +139,13 @@ class MutationChecker:
             if not has_ancestor(node, _METHOD_TYPES):
                 continue
 
+            # Skip this.field = ... in constructors (field initialization, not reassignment)
+            left = node.child_by_field_name("left")
+            if left and left.type == "field_access" and has_ancestor(node, {"constructor_declaration"}):
+                receiver = left.child_by_field_name("object")
+                if receiver and receiver.type == "this":
+                    continue
+
             diagnostics.append(
                 Diagnostic(
                     line=node.start_point[0],
