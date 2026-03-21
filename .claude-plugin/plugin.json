@@ -1,5 +1,5 @@
 {
   "name": "java-functional-lsp",
   "description": "Java LSP with functional programming rules enforcement — null safety, immutability, no exceptions, Spring best practices. Wraps jdtls for full Java language support.",
-  "version": "0.3.2"
+  "version": "0.4.0"
 }
