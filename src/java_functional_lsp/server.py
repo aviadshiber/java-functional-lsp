@@ -254,7 +254,7 @@ async def on_did_change(params: lsp.DidChangeTextDocumentParams) -> None:
     # Cancel pending validation, schedule new one (150ms debounce for IDE typing)
     if uri in _pending:
         _pending[uri].cancel()
-    _pending[uri] = asyncio.ensure_future(_deferred_validate(uri))
+    _pending[uri] = asyncio.create_task(_deferred_validate(uri))
 
 
 @server.feature(lsp.TEXT_DOCUMENT_DID_SAVE)
