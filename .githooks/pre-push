@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# Prevent direct pushes to main/master — all changes must go through PRs.
+
+protected_branches=("main" "master")
+current_branch=$(git symbolic-ref --short HEAD 2>/dev/null)
+
+for branch in "${protected_branches[@]}"; do
+    if [ "$current_branch" = "$branch" ]; then
+        echo "ERROR: Direct push to '$branch' is not allowed."
+        echo "Create a feature branch and open a pull request instead."
+        echo ""
+        echo "  git checkout -b feat/my-change"
+        echo "  git push -u origin feat/my-change"
+        echo "  gh pr create"
+        echo ""
+        echo "To bypass (emergency only): git push --no-verify"
+        exit 1
+    fi
+done
