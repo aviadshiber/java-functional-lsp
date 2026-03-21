@@ -45,6 +45,7 @@ Create `.java-functional-lsp.json` in your project root:
 
 ```json
 {
+  "excludes": ["**/generated/**", "**/vendor/**"],
   "rules": {
     "imperative-loop": "hint",
     "mutable-variable": "info",
@@ -53,7 +54,10 @@ Create `.java-functional-lsp.json` in your project root:
 }
 ```
 
-Severity levels: `error`, `warning` (default), `info`, `hint`, `off`.
+- `excludes` — glob patterns to skip files/directories entirely
+- `rules` — per-rule severity: `error`, `warning` (default), `info`, `hint`, `off`
+- `throw-statement`/`catch-rethrow` auto-suppressed in `@Bean` methods
+- `mutable-dto` suggests `@ConstructorBinding` for `@ConfigurationProperties` classes
 
 ## On-Demand Linting
 
