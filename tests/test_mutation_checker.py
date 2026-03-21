@@ -58,6 +58,20 @@ class TestMutableDto:
         diags = parse_and_analyze(MutationChecker(), source)
         assert not any(d.code == "mutable-dto" for d in diags)
 
+    def test_config_properties_suggests_constructor_binding(self) -> None:
+        source = b"@ConfigurationProperties @Setter class Props { String name; }"
+        diags = parse_and_analyze(MutationChecker(), source)
+        dto_diags = [d for d in diags if d.code == "mutable-dto"]
+        assert len(dto_diags) == 1
+        assert "@ConstructorBinding" in dto_diags[0].message
+
+    def test_regular_setter_suggests_value(self) -> None:
+        source = b"@Setter class Foo { String name; }"
+        diags = parse_and_analyze(MutationChecker(), source)
+        dto_diags = [d for d in diags if d.code == "mutable-dto"]
+        assert len(dto_diags) == 1
+        assert "@Value" in dto_diags[0].message
+
 
 class TestImperativeOptionUnwrap:
     def test_detects_is_defined_get(self) -> None:

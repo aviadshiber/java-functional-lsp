@@ -7,7 +7,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from .analyzers.base import Analyzer, Diagnostic, Severity, get_parser
+from .analyzers.base import Analyzer, Diagnostic, Severity, get_parser, is_excluded
 from .analyzers.exception_checker import ExceptionChecker
 from .analyzers.mutation_checker import MutationChecker
 from .analyzers.null_checker import NullChecker
@@ -107,7 +107,10 @@ def main() -> None:
     config = load_config(files[0])
 
     total_diags = 0
+    excludes: list[str] = config.get("excludes", [])
     for path in files:
+        if excludes and is_excluded(path.as_posix(), excludes):
+            continue
         diags = check_file(path, config)
         for d in diags:
             print(format_diagnostic(path, d))
