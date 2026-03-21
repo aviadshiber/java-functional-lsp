@@ -113,6 +113,19 @@ Or manually add to your Claude Code config:
 }
 ```
 
+**Alternative: project-level `.lsp.json`** — instead of installing the plugin or editing global config, add a `.lsp.json` file at your project root:
+
+```json
+{
+  "java-functional": {
+    "command": "java-functional-lsp",
+    "extensionToLanguage": { ".java": "java" }
+  }
+}
+```
+
+This is useful for CI environments, containers, or ensuring all team members get the LSP server without individual setup. The `java-functional-lsp` binary must still be installed (`pip install java-functional-lsp` or `brew install aviadshiber/tap/java-functional-lsp`).
+
 **Step 3: Nudge Claude to prefer LSP** (recommended):
 
 Add to `~/.claude/rules/code-intelligence.md`:
