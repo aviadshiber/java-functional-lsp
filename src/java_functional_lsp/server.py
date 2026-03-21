@@ -6,15 +6,17 @@ Proxies to jdtls for full Java language features (completions, hover, go-to-def)
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
+import sys
 from pathlib import Path
 from typing import Any
-from urllib.parse import unquote, urlparse
 
 import cattrs
 from lsprotocol import types as lsp
 from pygls.lsp.server import LanguageServer
+from pygls.uris import to_fs_path
 
 from .analyzers.base import Analyzer, Severity, get_parser, is_excluded
 from .analyzers.base import Diagnostic as LintDiagnostic
@@ -59,11 +61,17 @@ class JavaFunctionalLspServer(LanguageServer):
 
 server = JavaFunctionalLspServer()
 
+# Debounce state for didChange events (only affects human typing in IDEs, not agents)
+_pending: dict[str, asyncio.Task[None]] = {}
+_DEBOUNCE_SECONDS = 0.15
 
-def _uri_to_path(uri: str) -> str:
-    """Convert a file:// URI to a filesystem path."""
-    parsed = urlparse(uri)
-    return unquote(parsed.path)
+
+def _handle_exception(exc_type: type[BaseException], exc_value: BaseException, exc_tb: Any) -> None:
+    """Log uncaught exceptions for crash debugging."""
+    logger.error("Uncaught exception", exc_info=(exc_type, exc_value, exc_tb))
+
+
+sys.excepthook = _handle_exception
 
 
 def _load_config(workspace_root: str | None) -> dict[str, Any]:
@@ -100,7 +108,7 @@ def _analyze_document(source_text: str, uri: str = "") -> list[lsp.Diagnostic]:
     if uri:
         excludes: list[str] = server._config.get("excludes", [])
         if excludes:
-            path_str = _uri_to_path(uri)
+            path_str = to_fs_path(uri) or uri
             if is_excluded(path_str, excludes):
                 return []
     source_bytes = source_text.encode("utf-8")
@@ -184,7 +192,7 @@ def on_initialize(params: lsp.InitializeParams) -> lsp.InitializeResult:
 
     root = None
     if params.root_uri:
-        root = _uri_to_path(params.root_uri)
+        root = to_fs_path(params.root_uri)
     elif params.root_path:
         root = params.root_path
 
@@ -223,28 +231,50 @@ async def on_initialized(params: lsp.InitializedParams) -> None:
 # --- Document sync (forward to jdtls + run custom analyzers) ---
 
 
+async def _deferred_validate(uri: str) -> None:
+    """Debounced validation — waits before analyzing to batch rapid edits."""
+    await asyncio.sleep(_DEBOUNCE_SECONDS)
+    await asyncio.to_thread(_publish_diagnostics, uri)
+
+
 @server.feature(lsp.TEXT_DOCUMENT_DID_OPEN)
 async def on_did_open(params: lsp.DidOpenTextDocumentParams) -> None:
-    """Forward to jdtls and analyze."""
+    """Forward to jdtls and analyze immediately."""
     if server._proxy.is_available:
         await server._proxy.send_notification("textDocument/didOpen", _serialize_params(params))
-    _publish_diagnostics(params.text_document.uri)
+    await asyncio.to_thread(_publish_diagnostics, params.text_document.uri)
 
 
 @server.feature(lsp.TEXT_DOCUMENT_DID_CHANGE)
 async def on_did_change(params: lsp.DidChangeTextDocumentParams) -> None:
-    """Forward to jdtls and re-analyze."""
+    """Forward to jdtls and schedule debounced re-analysis."""
+    uri = params.text_document.uri
     if server._proxy.is_available:
         await server._proxy.send_notification("textDocument/didChange", _serialize_params(params))
-    _publish_diagnostics(params.text_document.uri)
+    # Cancel pending validation, schedule new one (150ms debounce for IDE typing)
+    if uri in _pending:
+        _pending[uri].cancel()
+    _pending[uri] = asyncio.create_task(_deferred_validate(uri))
 
 
 @server.feature(lsp.TEXT_DOCUMENT_DID_SAVE)
 async def on_did_save(params: lsp.DidSaveTextDocumentParams) -> None:
-    """Forward to jdtls and re-analyze."""
+    """Forward to jdtls and re-analyze immediately (no debounce on save)."""
     if server._proxy.is_available:
         await server._proxy.send_notification("textDocument/didSave", _serialize_params(params))
-    _publish_diagnostics(params.text_document.uri)
+    await asyncio.to_thread(_publish_diagnostics, params.text_document.uri)
+
+
+@server.feature(lsp.TEXT_DOCUMENT_DID_CLOSE)
+async def on_did_close(params: lsp.DidCloseTextDocumentParams) -> None:
+    """Clean up cached state and forward to jdtls."""
+    uri = params.text_document.uri
+    server._trees.pop(uri, None)
+    if uri in _pending:
+        _pending[uri].cancel()
+        del _pending[uri]
+    if server._proxy.is_available:
+        await server._proxy.send_notification("textDocument/didClose", _serialize_params(params))
 
 
 # --- Forwarded features (jdtls passthrough) ---
