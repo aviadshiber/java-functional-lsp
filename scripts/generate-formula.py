@@ -10,31 +10,31 @@ import sys
 import urllib.request
 
 
-def get_pypi_sha256(package: str, version: str) -> str:
-    """Get the sdist sha256 for a package from PyPI."""
+def get_pypi_sdist_info(package: str, version: str) -> tuple[str, str]:
+    """Get the sdist URL and sha256 for a package from PyPI."""
     url = f"https://pypi.org/pypi/{package}/{version}/json"
     with urllib.request.urlopen(url) as resp:
         data = json.loads(resp.read())
 
     for file_info in data.get("urls", []):
         if file_info["filename"].endswith(".tar.gz"):
-            return file_info["digests"]["sha256"]
+            return file_info["url"], file_info["digests"]["sha256"]
 
     for file_info in data.get("urls", []):
         if file_info["packagetype"] == "sdist":
-            return file_info["digests"]["sha256"]
+            return file_info["url"], file_info["digests"]["sha256"]
 
     raise ValueError(f"No sdist found for {package}=={version}")
 
 
 def generate_formula(version: str) -> str:
     """Generate the Homebrew formula."""
-    sha256 = get_pypi_sha256("java-functional-lsp", version)
+    sdist_url, sha256 = get_pypi_sdist_info("java-functional-lsp", version)
 
     return f'''class JavaFunctionalLsp < Formula
   desc "Java LSP server enforcing functional programming best practices"
   homepage "https://github.com/aviadshiber/java-functional-lsp"
-  url "https://files.pythonhosted.org/packages/source/j/java-functional-lsp/java_functional_lsp-{version}.tar.gz"
+  url "{sdist_url}"
   sha256 "{sha256}"
   license "MIT"
 
