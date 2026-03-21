@@ -44,7 +44,7 @@ class ExceptionChecker:
                 if body is None:
                     continue
                 # Check if the block has exactly one named statement and it's a throw
-                statements = [c for c in body.named_children if c.type != "comment"]
+                statements = [c for c in body.named_children if c.type not in ("line_comment", "block_comment")]
                 if len(statements) == 1 and statements[0].type == "throw_statement":
                     diagnostics.append(
                         Diagnostic(

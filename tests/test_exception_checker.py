@@ -33,8 +33,8 @@ class TestCatchRethrow:
         codes = [d.code for d in diags]
         assert "catch-rethrow" in codes
 
-    def test_catch_with_comment_and_throw_not_flagged(self) -> None:
-        """A catch with a comment + throw has 2 named children, so it's not a simple rethrow."""
+    def test_catch_with_comment_and_throw_still_flagged(self) -> None:
+        """A catch with only a comment + throw is still a rethrow — comments are ignored."""
         source = b"""
         class T {
             void f() {
@@ -47,7 +47,7 @@ class TestCatchRethrow:
         }
         """
         diags = parse_and_analyze(ExceptionChecker(), source)
-        assert not any(d.code == "catch-rethrow" for d in diags)
+        assert any(d.code == "catch-rethrow" for d in diags)
 
     def test_ignores_catch_with_logic(self) -> None:
         source = b"""
