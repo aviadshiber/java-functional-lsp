@@ -22,11 +22,7 @@ def main() -> None:
             "hookEventName": "PostToolUse",
             "additionalContext": (
                 "CHECK for <new-diagnostics> from java-functional-lsp above. "
-                "If any appear, you MUST acknowledge them and suggest fixes: "
-                "null → Option/Either, throw → Either.left()/Try.of() (suppressed in @Bean methods), "
-                "mutable → final + functional transforms, loops → .map()/.filter()/.flatMap(), "
-                "@Data/@Setter → @Value (or @ConstructorBinding for @ConfigurationProperties), "
-                "@Autowired → constructor injection, @Component → @Configuration+@Bean."
+                "If any appear, you MUST acknowledge each diagnostic and apply the suggested fix."
             ),
         }
     }
