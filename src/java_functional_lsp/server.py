@@ -100,7 +100,7 @@ def _analyze_document(source_text: str, uri: str = "") -> list[lsp.Diagnostic]:
     if uri:
         excludes: list[str] = server._config.get("excludes", [])
         if excludes:
-            path_str = uri.replace("file://", "")
+            path_str = _uri_to_path(uri)
             if is_excluded(path_str, excludes):
                 return []
     source_bytes = source_text.encode("utf-8")
