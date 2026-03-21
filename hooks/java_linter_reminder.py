@@ -21,8 +21,9 @@ def main() -> None:
         "hookSpecificOutput": {
             "hookEventName": "PostToolUse",
             "additionalContext": (
-                "CHECK for <new-diagnostics> from java-functional-lsp above. "
-                "If any appear, you MUST acknowledge each diagnostic and apply the suggested fix."
+                "If <new-diagnostics> from java-functional-lsp appear above, "
+                "fix each violation immediately. Do not explain or list them — "
+                "just apply the fix in your next Edit."
             ),
         }
     }
