@@ -23,9 +23,10 @@ def main() -> None:
             "additionalContext": (
                 "CHECK for <new-diagnostics> from java-functional-lsp above. "
                 "If any appear, you MUST acknowledge them and suggest fixes: "
-                "null → Option/Either, throw → Either.left()/Try.of(), "
+                "null → Option/Either, throw → Either.left()/Try.of() (suppressed in @Bean methods), "
                 "mutable → final + functional transforms, loops → .map()/.filter()/.flatMap(), "
-                "@Data → @Value, @Autowired → constructor injection, @Component → @Configuration+@Bean."
+                "@Data/@Setter → @Value (or @ConstructorBinding for @ConfigurationProperties), "
+                "@Autowired → constructor injection, @Component → @Configuration+@Bean."
             ),
         }
     }
