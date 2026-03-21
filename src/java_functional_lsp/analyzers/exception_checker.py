@@ -43,10 +43,8 @@ class ExceptionChecker:
                 body = node.child_by_field_name("body")
                 if body is None:
                     continue
-                # Check if the block has exactly one statement and it's a throw
-                statements = [
-                    c for c in body.children if c.type not in ("{", "}", "comment", "line_comment", "block_comment")
-                ]
+                # Check if the block has exactly one named statement and it's a throw
+                statements = [c for c in body.named_children if c.type not in ("line_comment", "block_comment")]
                 if len(statements) == 1 and statements[0].type == "throw_statement":
                     diagnostics.append(
                         Diagnostic(

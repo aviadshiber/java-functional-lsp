@@ -94,3 +94,41 @@ class TestImperativeOptionUnwrap:
         """
         diags = parse_and_analyze(MutationChecker(), source)
         assert not any(d.code == "imperative-option-unwrap" for d in diags)
+
+    def test_ignores_unrelated_get(self) -> None:
+        """Different object's .get() should not trigger the rule."""
+        source = b"""
+        class T {
+            void f() {
+                if (opt.isDefined()) { other.get(); }
+            }
+        }
+        """
+        diags = parse_and_analyze(MutationChecker(), source)
+        assert not any(d.code == "imperative-option-unwrap" for d in diags)
+
+
+class TestConstructorAssignment:
+    def test_ignores_this_field_in_constructor(self) -> None:
+        source = b"class T { final int x; T(int x) { this.x = x; } }"
+        diags = parse_and_analyze(MutationChecker(), source)
+        assert not any(d.code == "mutable-variable" for d in diags)
+
+    def test_ignores_computed_field_in_constructor(self) -> None:
+        """this.x = computeValue() in constructor should not be flagged."""
+        source = b"class T { final int x; T() { this.x = compute(); } }"
+        diags = parse_and_analyze(MutationChecker(), source)
+        assert not any(d.code == "mutable-variable" for d in diags)
+
+    def test_detects_other_object_field_in_constructor(self) -> None:
+        """other.field = x in a constructor IS a mutation and should be flagged."""
+        source = b"class T { T() { other.field = 42; } }"
+        diags = parse_and_analyze(MutationChecker(), source)
+        assert any(d.code == "mutable-variable" for d in diags)
+
+    def test_detects_reassignment_in_method(self) -> None:
+        """this.x = ... in a regular method IS a mutation."""
+        source = b"class T { int x; void f() { this.x = 42; } }"
+        diags = parse_and_analyze(MutationChecker(), source)
+        codes = [d.code for d in diags]
+        assert "mutable-variable" in codes
