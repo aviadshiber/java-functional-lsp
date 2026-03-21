@@ -35,7 +35,14 @@ pip install java-functional-lsp
 
 # From source
 pip install git+https://github.com/aviadshiber/java-functional-lsp.git
+
+# Optional: install jdtls for full Java language support (completions, hover, go-to-def)
+brew install jdtls
 ```
+
+**Requirements:**
+- Python 3.10+ (for the LSP server)
+- JDK 17+ (only if using jdtls — it requires JDK 17+ as its runtime, but can analyze Java 8+ source code)
 
 ## IDE Setup
 
