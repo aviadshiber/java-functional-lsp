@@ -48,13 +48,12 @@ class JavaFunctionalLspServer(LanguageServer):
         self._parser = get_parser()
         self._config: dict[str, Any] = {}
         self._init_params: dict[str, Any] = {}
-        self._trees: dict[str, Any] = {}  # URI -> last parsed tree for incremental parsing
         self._proxy = JdtlsProxy(on_diagnostics=self._on_jdtls_diagnostics)
 
     def _on_jdtls_diagnostics(self, uri: str, diagnostics: list[Any]) -> None:
         """Called when jdtls publishes diagnostics — merge with custom and re-publish."""
         try:
-            _publish_diagnostics(uri)
+            _analyze_and_publish(uri)
         except Exception as e:
             logger.error("Error re-publishing diagnostics for %s: %s", uri, e)
 
@@ -103,7 +102,7 @@ def _to_lsp_diagnostic(diag: LintDiagnostic) -> lsp.Diagnostic:
 
 
 def _analyze_document(source_text: str, uri: str = "") -> list[lsp.Diagnostic]:
-    """Run all custom analyzers on the given source text. Uses incremental parsing when possible."""
+    """Run all custom analyzers on the given source text."""
     # Check excludes before parsing
     if uri:
         excludes: list[str] = server._config.get("excludes", [])
@@ -112,10 +111,9 @@ def _analyze_document(source_text: str, uri: str = "") -> list[lsp.Diagnostic]:
             if is_excluded(path_str, excludes):
                 return []
     source_bytes = source_text.encode("utf-8")
-    old_tree = server._trees.get(uri) if uri else None
-    tree = server._parser.parse(source_bytes, old_tree) if old_tree else server._parser.parse(source_bytes)
-    if uri:
-        server._trees[uri] = tree
+    # Always do a fresh parse — incremental parsing requires tree.edit() with
+    # exact byte offsets, which we don't track under Full document sync.
+    tree = server._parser.parse(source_bytes)
     config = server._config
 
     all_diagnostics: list[LintDiagnostic] = []
@@ -159,19 +157,16 @@ def _jdtls_raw_to_lsp_diagnostics(raw_diagnostics: list[Any]) -> list[lsp.Diagno
     return result
 
 
-def _publish_diagnostics(uri: str) -> None:
-    """Merge custom + jdtls diagnostics and publish to client."""
-    doc = server.workspace.get_text_document(uri)
-    custom_diags = _analyze_document(doc.source, uri)
+def _run_analysis(source: str, uri: str) -> list[lsp.Diagnostic]:
+    """Run custom analyzers on source text and merge with jdtls diagnostics."""
+    custom_diags = _analyze_document(source, uri)
 
-    # Get cached jdtls diagnostics
     jdtls_diags: list[lsp.Diagnostic] = []
     if server._proxy.is_available:
         raw = server._proxy.get_cached_diagnostics(uri)
         jdtls_diags = _jdtls_raw_to_lsp_diagnostics(raw)
 
-    merged = jdtls_diags + custom_diags
-    server.text_document_publish_diagnostics(lsp.PublishDiagnosticsParams(uri=uri, diagnostics=merged))
+    return jdtls_diags + custom_diags
 
 
 def _serialize_params(params: Any) -> Any:
@@ -231,10 +226,17 @@ async def on_initialized(params: lsp.InitializedParams) -> None:
 # --- Document sync (forward to jdtls + run custom analyzers) ---
 
 
+def _analyze_and_publish(uri: str) -> None:
+    """Read document source, run analysis, publish results."""
+    doc = server.workspace.get_text_document(uri)
+    diagnostics = _run_analysis(doc.source, uri)
+    server.text_document_publish_diagnostics(lsp.PublishDiagnosticsParams(uri=uri, diagnostics=diagnostics))
+
+
 async def _deferred_validate(uri: str) -> None:
     """Debounced validation — waits before analyzing to batch rapid edits."""
     await asyncio.sleep(_DEBOUNCE_SECONDS)
-    await asyncio.to_thread(_publish_diagnostics, uri)
+    _analyze_and_publish(uri)
 
 
 @server.feature(lsp.TEXT_DOCUMENT_DID_OPEN)
@@ -242,7 +244,7 @@ async def on_did_open(params: lsp.DidOpenTextDocumentParams) -> None:
     """Forward to jdtls and analyze immediately."""
     if server._proxy.is_available:
         await server._proxy.send_notification("textDocument/didOpen", _serialize_params(params))
-    await asyncio.to_thread(_publish_diagnostics, params.text_document.uri)
+    _analyze_and_publish(params.text_document.uri)
 
 
 @server.feature(lsp.TEXT_DOCUMENT_DID_CHANGE)
@@ -262,14 +264,13 @@ async def on_did_save(params: lsp.DidSaveTextDocumentParams) -> None:
     """Forward to jdtls and re-analyze immediately (no debounce on save)."""
     if server._proxy.is_available:
         await server._proxy.send_notification("textDocument/didSave", _serialize_params(params))
-    await asyncio.to_thread(_publish_diagnostics, params.text_document.uri)
+    _analyze_and_publish(params.text_document.uri)
 
 
 @server.feature(lsp.TEXT_DOCUMENT_DID_CLOSE)
 async def on_did_close(params: lsp.DidCloseTextDocumentParams) -> None:
     """Clean up cached state and forward to jdtls."""
     uri = params.text_document.uri
-    server._trees.pop(uri, None)
     if uri in _pending:
         _pending[uri].cancel()
         del _pending[uri]
