@@ -59,6 +59,10 @@ Create `.java-functional-lsp.json` in your project root:
 - `throw-statement`/`catch-rethrow` auto-suppressed in `@Bean` methods
 - `mutable-dto` suggests `@ConstructorBinding` for `@ConfigurationProperties` classes
 
+## Automatic Enforcement
+
+The plugin includes a PostToolUse hook that fires on every Read/Edit/Write of `.java` files. If diagnostics appear, Claude is prompted to fix them immediately without explanation.
+
 ## On-Demand Linting
 
 Use `/lint-java <path>` to force-run the linter on specific files or directories.

@@ -98,7 +98,7 @@ Add to `~/.claude/settings.json`:
 claude plugin add https://github.com/aviadshiber/java-functional-lsp.git
 ```
 
-This registers the LSP server, adds auto-install hooks, and provides the `/lint-java` command.
+This registers the LSP server, adds auto-install hooks, a PostToolUse hook that reminds Claude to fix violations on every `.java` file edit, and the `/lint-java` command.
 
 Or manually add to your Claude Code config:
 
@@ -113,12 +113,19 @@ Or manually add to your Claude Code config:
 }
 ```
 
-**Step 3: Nudge Claude to use diagnostics** (recommended):
+**Step 3: Nudge Claude to prefer LSP** (recommended):
 
-Add to your project's `CLAUDE.md`:
+Add to `~/.claude/rules/code-intelligence.md`:
 ```markdown
-After writing or editing Java code, check LSP diagnostics before moving on.
-Fix any violations immediately — do not explain, just apply the fix.
+# Code Intelligence
+
+Prefer LSP over Grep/Glob/Read for code navigation:
+- goToDefinition / goToImplementation to jump to source
+- findReferences to see all usages across the codebase
+- hover for type info without reading the file
+
+After writing or editing code, check LSP diagnostics before
+moving on. Fix any type errors or missing imports immediately.
 ```
 
 **Troubleshooting:**
