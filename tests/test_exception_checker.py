@@ -60,3 +60,45 @@ class TestCatchRethrow:
         """
         diags = parse_and_analyze(ExceptionChecker(), source)
         assert not any(d.code == "catch-rethrow" for d in diags)
+
+
+class TestBeanSuppression:
+    def test_ignores_throw_in_bean_method(self) -> None:
+        source = b"""
+        class Config {
+            @Bean
+            DataSource dataSource() {
+                if (url == null) {
+                    throw new IllegalStateException("url required");
+                }
+                return new DataSource(url);
+            }
+        }
+        """
+        diags = parse_and_analyze(ExceptionChecker(), source)
+        assert not any(d.code == "throw-statement" for d in diags)
+
+    def test_flags_throw_in_regular_method(self) -> None:
+        source = b"""
+        class Service {
+            void process() {
+                throw new RuntimeException("error");
+            }
+        }
+        """
+        diags = parse_and_analyze(ExceptionChecker(), source)
+        assert any(d.code == "throw-statement" for d in diags)
+
+    def test_ignores_catch_rethrow_in_bean_method(self) -> None:
+        source = b"""
+        class Config {
+            @Bean
+            DataSource dataSource() {
+                try { return connect(); }
+                catch (Exception e) { throw new RuntimeException(e); }
+            }
+        }
+        """
+        diags = parse_and_analyze(ExceptionChecker(), source)
+        assert not any(d.code == "catch-rethrow" for d in diags)
+        assert not any(d.code == "throw-statement" for d in diags)

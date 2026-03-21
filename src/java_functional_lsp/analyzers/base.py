@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import fnmatch
 from collections.abc import Generator
 from dataclasses import dataclass
 from enum import IntEnum
@@ -147,3 +148,26 @@ def severity_from_config(config: dict[str, Any], rule_id: str, default: Severity
         "info": Severity.INFO,
         "hint": Severity.HINT,
     }.get(level, default)
+
+
+def is_excluded(path_str: str, patterns: list[str]) -> bool:
+    """Return True if path matches any exclude glob pattern.
+
+    Patterns support ** for multi-segment wildcards (e.g. **/generated/**).
+    Uses fnmatch which handles ** correctly across Python 3.10+.
+    """
+    normalized = path_str.replace("\\", "/")
+    return any(fnmatch.fnmatch(normalized, pattern) for pattern in patterns)
+
+
+def has_sibling_annotation(modifiers_node: Node, annotation_name: bytes) -> bool:
+    """Check if a modifiers node contains an annotation with the given name.
+
+    Checks both marker_annotation (@Foo) and annotation (@Foo(...)) forms.
+    """
+    for child in modifiers_node.named_children:
+        if child.type in ("marker_annotation", "annotation"):
+            name_node = child.child_by_field_name("name")
+            if name_node is not None and name_node.text == annotation_name:
+                return True
+    return False

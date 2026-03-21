@@ -7,6 +7,8 @@ from java_functional_lsp.analyzers.base import (
     find_nodes_multi,
     get_parser,
     has_ancestor,
+    has_sibling_annotation,
+    is_excluded,
 )
 
 
@@ -120,3 +122,36 @@ class TestCollectNodesByType:
         buckets = collect_nodes_by_type(tree.root_node, {"null_literal", "throw_statement"})
         assert len(buckets["null_literal"]) == 0
         assert len(buckets["throw_statement"]) == 0
+
+
+class TestIsExcluded:
+    def test_matches_double_star_pattern(self):
+        assert is_excluded("/home/user/project/nlu-trs-client-shaded/Foo.java", ["**/nlu-trs-client-shaded/**"])
+
+    def test_no_match(self):
+        assert not is_excluded("/home/user/project/src/Foo.java", ["**/nlu-trs-client-shaded/**"])
+
+    def test_empty_patterns(self):
+        assert not is_excluded("/any/path/Foo.java", [])
+
+    def test_multiple_patterns(self):
+        assert is_excluded("/project/generated/Model.java", ["**/shaded/**", "**/generated/**"])
+
+    def test_windows_backslashes_normalized(self):
+        assert is_excluded("C:\\project\\generated\\Model.java", ["**/generated/**"])
+
+
+class TestHasSiblingAnnotation:
+    def test_finds_sibling_annotation(self):
+        tree = _parse("@ConfigurationProperties @Setter class Props { String name; }")
+        for node in find_nodes(tree.root_node, "marker_annotation"):
+            name = node.child_by_field_name("name")
+            if name and name.text == b"Setter" and node.parent:
+                assert has_sibling_annotation(node.parent, b"ConfigurationProperties")
+
+    def test_no_sibling(self):
+        tree = _parse("@Setter class Props { String name; }")
+        for node in find_nodes(tree.root_node, "marker_annotation"):
+            name = node.child_by_field_name("name")
+            if name and name.text == b"Setter" and node.parent:
+                assert not has_sibling_annotation(node.parent, b"ConfigurationProperties")

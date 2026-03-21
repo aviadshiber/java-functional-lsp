@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from .base import Diagnostic, find_nodes, find_nodes_multi, has_ancestor, severity_from_config
+from .base import Diagnostic, find_nodes, find_nodes_multi, has_ancestor, has_sibling_annotation, severity_from_config
 
 _MESSAGES = {
     "mutable-variable": "Avoid reassigning variables. Use final + functional transforms (map, flatMap, fold).",
@@ -45,8 +45,15 @@ class MutationChecker:
             if ann_text in (b"Data", b"Setter"):
                 # Verify it's on a class declaration
                 if node.parent and node.parent.type == "modifiers":
-                    grandparent = node.parent.parent
+                    modifiers = node.parent
+                    grandparent = modifiers.parent
                     if grandparent and grandparent.type == "class_declaration":
+                        if has_sibling_annotation(modifiers, b"ConfigurationProperties"):
+                            message = (
+                                "Use @ConstructorBinding instead of @Data/@Setter for @ConfigurationProperties classes."
+                            )
+                        else:
+                            message = _MESSAGES["mutable-dto"]
                         diagnostics.append(
                             Diagnostic(
                                 line=name_node.start_point[0],
@@ -55,7 +62,7 @@ class MutationChecker:
                                 end_col=name_node.end_point[1],
                                 severity=severity,
                                 code="mutable-dto",
-                                message=_MESSAGES["mutable-dto"],
+                                message=message,
                             )
                         )
 

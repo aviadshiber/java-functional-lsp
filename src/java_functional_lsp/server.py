@@ -16,7 +16,7 @@ import cattrs
 from lsprotocol import types as lsp
 from pygls.lsp.server import LanguageServer
 
-from .analyzers.base import Analyzer, Severity, get_parser
+from .analyzers.base import Analyzer, Severity, get_parser, is_excluded
 from .analyzers.base import Diagnostic as LintDiagnostic
 from .analyzers.exception_checker import ExceptionChecker
 from .analyzers.mutation_checker import MutationChecker
@@ -96,6 +96,13 @@ def _to_lsp_diagnostic(diag: LintDiagnostic) -> lsp.Diagnostic:
 
 def _analyze_document(source_text: str, uri: str = "") -> list[lsp.Diagnostic]:
     """Run all custom analyzers on the given source text. Uses incremental parsing when possible."""
+    # Check excludes before parsing
+    if uri:
+        excludes: list[str] = server._config.get("excludes", [])
+        if excludes:
+            path_str = _uri_to_path(uri)
+            if is_excluded(path_str, excludes):
+                return []
     source_bytes = source_text.encode("utf-8")
     old_tree = server._trees.get(uri) if uri else None
     tree = server._parser.parse(source_bytes, old_tree) if old_tree else server._parser.parse(source_bytes)
