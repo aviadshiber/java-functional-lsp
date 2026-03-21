@@ -2,7 +2,7 @@
   "name": "java-functional-lsp",
   "displayName": "Java Functional LSP",
   "description": "Java LSP server enforcing functional programming best practices — null safety, immutability, no exceptions",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "publisher": "aviadshiber",
   "license": "MIT",
   "engines": {
