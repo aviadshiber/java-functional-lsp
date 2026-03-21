@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+# Pre-commit: run lint, format check, type check, and tests.
+# Bypass with: git commit --no-verify
+
+set -e
+
+echo "Running pre-commit checks..."
+
+echo "  Lint..."
+uv run ruff check src/ tests/
+
+echo "  Format..."
+uv run ruff format --check src/ tests/
+
+echo "  Type check..."
+uv run mypy src/
+
+echo "  Tests..."
+uv run pytest -q
+
+echo "All checks passed."
