@@ -81,7 +81,18 @@ See [editors/intellij/README.md](editors/intellij/README.md) for detailed instru
 
 ### Claude Code
 
-Install as a plugin directly from GitHub:
+**Step 1: Enable LSP support** (required, one-time):
+
+Add to `~/.claude/settings.json`:
+```json
+{
+  "env": {
+    "ENABLE_LSP_TOOL": "1"
+  }
+}
+```
+
+**Step 2: Install the plugin:**
 
 ```bash
 claude plugin add https://github.com/aviadshiber/java-functional-lsp.git
@@ -101,6 +112,23 @@ Or manually add to your Claude Code config:
   }
 }
 ```
+
+**Step 3: Nudge Claude to use diagnostics** (recommended):
+
+Add to your project's `CLAUDE.md`:
+```markdown
+After writing or editing Java code, check LSP diagnostics before moving on.
+Fix any violations immediately — do not explain, just apply the fix.
+```
+
+**Troubleshooting:**
+
+| Issue | Fix |
+|-------|-----|
+| No diagnostics appear | Ensure `ENABLE_LSP_TOOL=1` is set, restart Claude Code |
+| "java-functional-lsp not found" | Run `brew install aviadshiber/tap/java-functional-lsp` |
+| Plugin not active | Run `claude plugin list` to verify, then `/reload-plugins` |
+| Diagnostics slow on first open | Normal — tree-sitter parses on first load, then incremental |
 
 ### Other Editors
 

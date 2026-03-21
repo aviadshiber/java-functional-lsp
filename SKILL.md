@@ -74,8 +74,23 @@ To release a new version:
 5. CI automatically publishes to PyPI and builds the VS Code extension `.vsix`
 6. Run `python3 scripts/generate-formula.py <version>` and update the Homebrew tap
 
+## Enabling LSP in Claude Code
+
+LSP support requires `ENABLE_LSP_TOOL=1` in `~/.claude/settings.json`:
+```json
+{ "env": { "ENABLE_LSP_TOOL": "1" } }
+```
+
+To nudge Claude to act on diagnostics, add to your project's `CLAUDE.md`:
+```
+After writing or editing Java code, check LSP diagnostics before moving on.
+Fix any violations immediately — do not explain, just apply the fix.
+```
+
 ## Troubleshooting
 
+- **No diagnostics in Claude Code**: Ensure `ENABLE_LSP_TOOL=1` is set, restart Claude Code
 - **"java-functional-lsp not found"**: Run `brew install aviadshiber/tap/java-functional-lsp`
-- **No completions/hover**: Install jdtls: `brew install jdtls`
-- **Too many warnings**: Create `.java-functional-lsp.json` to tune severity or disable noisy rules
+- **No completions/hover**: Install jdtls: `brew install jdtls` (requires JDK 21+)
+- **Too many warnings**: Create `.java-functional-lsp.json` with `excludes` or per-rule severity
+- **Plugin not active**: Run `claude plugin list` to verify, then `/reload-plugins`
