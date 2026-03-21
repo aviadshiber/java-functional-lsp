@@ -118,6 +118,7 @@ Create `.java-functional-lsp.json` in your project root to customize rules:
 
 ```json
 {
+  "excludes": ["**/generated/**", "**/vendor/**"],
   "rules": {
     "null-literal-arg": "warning",
     "throw-statement": "info",
@@ -127,8 +128,13 @@ Create `.java-functional-lsp.json` in your project root to customize rules:
 }
 ```
 
-Severity levels: `error`, `warning`, `info`, `hint`, `off`.
-All rules default to `warning` when not configured.
+**Options:**
+- `excludes` — glob patterns for files/directories to skip entirely (supports `**` for multi-segment wildcards)
+- `rules` — per-rule severity: `error`, `warning` (default), `info`, `hint`, `off`
+
+**Spring-aware behavior:**
+- `throw-statement` and `catch-rethrow` are automatically suppressed inside `@Bean` methods
+- `mutable-dto` suggests `@ConstructorBinding` instead of `@Value` when the class has `@ConfigurationProperties`
 
 ## How it works
 
