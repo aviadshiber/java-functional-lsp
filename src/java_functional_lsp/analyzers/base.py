@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Generator
 from dataclasses import dataclass
 from enum import IntEnum
-from typing import Any, Protocol
+from typing import Any, Protocol, cast
 
 import tree_sitter_java as tsjava
 from tree_sitter import Language, Node, Parser
@@ -60,20 +60,57 @@ def get_language() -> Language:
     return _language
 
 
-def find_nodes(node: Node, type_name: str) -> Generator[Node, None, None]:
-    """Recursively find all descendant nodes of a given type."""
-    if node.type == type_name:
-        yield node
-    for child in node.children:
-        yield from find_nodes(child, type_name)
+def find_nodes(root: Node, type_name: str) -> Generator[Node, None, None]:
+    """Find all descendant nodes of a given type using TreeCursor for performance."""
+    cursor = root.walk()
+    visited_children = False
+    while True:
+        if not visited_children:
+            current = cast(Node, cursor.node)
+            if current.type == type_name:
+                yield current
+            if not cursor.goto_first_child():
+                visited_children = True
+        elif cursor.goto_next_sibling():
+            visited_children = False
+        elif not cursor.goto_parent():
+            break
 
 
-def find_nodes_multi(node: Node, type_names: set[str]) -> Generator[Node, None, None]:
-    """Recursively find all descendant nodes matching any of the given types."""
-    if node.type in type_names:
-        yield node
-    for child in node.children:
-        yield from find_nodes_multi(child, type_names)
+def find_nodes_multi(root: Node, type_names: set[str]) -> Generator[Node, None, None]:
+    """Find all descendant nodes matching any of the given types using TreeCursor."""
+    cursor = root.walk()
+    visited_children = False
+    while True:
+        if not visited_children:
+            current = cast(Node, cursor.node)
+            if current.type in type_names:
+                yield current
+            if not cursor.goto_first_child():
+                visited_children = True
+        elif cursor.goto_next_sibling():
+            visited_children = False
+        elif not cursor.goto_parent():
+            break
+
+
+def collect_nodes_by_type(root: Node, type_names: set[str]) -> dict[str, list[Node]]:
+    """Walk tree once, bucket nodes by type. Avoids multiple full traversals."""
+    buckets: dict[str, list[Node]] = {t: [] for t in type_names}
+    cursor = root.walk()
+    visited_children = False
+    while True:
+        if not visited_children:
+            current = cast(Node, cursor.node)
+            if current.type in buckets:
+                buckets[current.type].append(current)
+            if not cursor.goto_first_child():
+                visited_children = True
+        elif cursor.goto_next_sibling():
+            visited_children = False
+        elif not cursor.goto_parent():
+            break
+    return buckets
 
 
 def find_ancestor(node: Node, type_name: str) -> Node | None:

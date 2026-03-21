@@ -46,6 +46,7 @@ class JavaFunctionalLspServer(LanguageServer):
         self._parser = get_parser()
         self._config: dict[str, Any] = {}
         self._init_params: dict[str, Any] = {}
+        self._trees: dict[str, Any] = {}  # URI -> last parsed tree for incremental parsing
         self._proxy = JdtlsProxy(on_diagnostics=self._on_jdtls_diagnostics)
 
     def _on_jdtls_diagnostics(self, uri: str, diagnostics: list[Any]) -> None:
@@ -93,10 +94,13 @@ def _to_lsp_diagnostic(diag: LintDiagnostic) -> lsp.Diagnostic:
     )
 
 
-def _analyze_document(source_text: str) -> list[lsp.Diagnostic]:
-    """Run all custom analyzers on the given source text."""
+def _analyze_document(source_text: str, uri: str = "") -> list[lsp.Diagnostic]:
+    """Run all custom analyzers on the given source text. Uses incremental parsing when possible."""
     source_bytes = source_text.encode("utf-8")
-    tree = server._parser.parse(source_bytes)
+    old_tree = server._trees.get(uri) if uri else None
+    tree = server._parser.parse(source_bytes, old_tree) if old_tree else server._parser.parse(source_bytes)
+    if uri:
+        server._trees[uri] = tree
     config = server._config
 
     all_diagnostics: list[LintDiagnostic] = []
@@ -143,7 +147,7 @@ def _jdtls_raw_to_lsp_diagnostics(raw_diagnostics: list[Any]) -> list[lsp.Diagno
 def _publish_diagnostics(uri: str) -> None:
     """Merge custom + jdtls diagnostics and publish to client."""
     doc = server.workspace.get_text_document(uri)
-    custom_diags = _analyze_document(doc.source)
+    custom_diags = _analyze_document(doc.source, uri)
 
     # Get cached jdtls diagnostics
     jdtls_diags: list[lsp.Diagnostic] = []

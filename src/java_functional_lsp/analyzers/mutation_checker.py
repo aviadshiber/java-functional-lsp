@@ -111,10 +111,19 @@ class MutationChecker:
                 if name_node.text not in _CHECK_METHODS:
                     continue
 
-                # Check if the body contains .get() on the same object
+                # Check if the if-body contains .get() on the same object (AST-based)
                 obj_name = obj_node.text
-                body_text = if_node.text
-                if obj_name is not None and body_text is not None and obj_name + b".get()" in body_text:
+                consequence = if_node.child_by_field_name("consequence")
+                if consequence is None or obj_name is None:
+                    continue
+                found_get = False
+                for call in find_nodes(consequence, "method_invocation"):
+                    call_name = call.child_by_field_name("name")
+                    call_obj = call.child_by_field_name("object")
+                    if call_name and call_name.text == b"get" and call_obj and call_obj.text == obj_name:
+                        found_get = True
+                        break
+                if found_get:
                     diagnostics.append(
                         Diagnostic(
                             line=if_node.start_point[0],
@@ -139,12 +148,10 @@ class MutationChecker:
             if not has_ancestor(node, _METHOD_TYPES):
                 continue
 
-            # Skip this.field = ... in constructors (field initialization, not reassignment)
+            # Skip field_access assignments in constructors (field initialization, not reassignment)
             left = node.child_by_field_name("left")
             if left and left.type == "field_access" and has_ancestor(node, {"constructor_declaration"}):
-                receiver = left.child_by_field_name("object")
-                if receiver and receiver.type == "this":
-                    continue
+                continue
 
             diagnostics.append(
                 Diagnostic(
