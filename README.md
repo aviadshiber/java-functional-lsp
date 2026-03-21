@@ -197,6 +197,7 @@ The server speaks the Language Server Protocol (LSP) via stdio, making it compat
 git clone https://github.com/aviadshiber/java-functional-lsp.git
 cd java-functional-lsp
 uv sync
+git config core.hooksPath .githooks
 
 # Run checks
 uv run ruff check src/ tests/
@@ -204,6 +205,10 @@ uv run ruff format --check src/ tests/
 uv run mypy src/
 uv run pytest
 ```
+
+Git hooks in `.githooks/` enforce quality automatically:
+- **pre-commit** — runs lint, format, type check, and tests before each commit
+- **pre-push** — blocks direct pushes to main (use feature branches + PRs)
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for full guidelines.
 
