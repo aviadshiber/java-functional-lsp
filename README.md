@@ -42,7 +42,7 @@ brew install jdtls
 
 **Requirements:**
 - Python 3.10+ (for the LSP server)
-- JDK 17+ (only if using jdtls — it requires JDK 17+ as its runtime, but can analyze Java 8+ source code)
+- JDK 21+ (only if using jdtls — jdtls 1.57+ requires JDK 21 as its runtime, but can analyze Java 8+ source code)
 
 ## IDE Setup
 
