@@ -110,9 +110,7 @@ class TestCollectNodesByType:
                 }
             }
         """)
-        buckets = collect_nodes_by_type(
-            tree.root_node, {"null_literal", "throw_statement", "method_declaration"}
-        )
+        buckets = collect_nodes_by_type(tree.root_node, {"null_literal", "throw_statement", "method_declaration"})
         assert len(buckets["null_literal"]) == 1
         assert len(buckets["throw_statement"]) == 1
         assert len(buckets["method_declaration"]) == 1
