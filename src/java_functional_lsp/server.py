@@ -48,13 +48,12 @@ class JavaFunctionalLspServer(LanguageServer):
         self._parser = get_parser()
         self._config: dict[str, Any] = {}
         self._init_params: dict[str, Any] = {}
-        self._trees: dict[str, Any] = {}  # URI -> state for didClose cleanup
         self._proxy = JdtlsProxy(on_diagnostics=self._on_jdtls_diagnostics)
 
     def _on_jdtls_diagnostics(self, uri: str, diagnostics: list[Any]) -> None:
         """Called when jdtls publishes diagnostics — merge with custom and re-publish."""
         try:
-            _publish_diagnostics(uri)
+            _analyze_and_publish(uri)
         except Exception as e:
             logger.error("Error re-publishing diagnostics for %s: %s", uri, e)
 
@@ -159,7 +158,7 @@ def _jdtls_raw_to_lsp_diagnostics(raw_diagnostics: list[Any]) -> list[lsp.Diagno
 
 
 def _run_analysis(source: str, uri: str) -> list[lsp.Diagnostic]:
-    """Run custom analyzers on source text (thread-safe, no workspace access)."""
+    """Run custom analyzers on source text and merge with jdtls diagnostics."""
     custom_diags = _analyze_document(source, uri)
 
     jdtls_diags: list[lsp.Diagnostic] = []
@@ -168,13 +167,6 @@ def _run_analysis(source: str, uri: str) -> list[lsp.Diagnostic]:
         jdtls_diags = _jdtls_raw_to_lsp_diagnostics(raw)
 
     return jdtls_diags + custom_diags
-
-
-def _publish_diagnostics(uri: str) -> None:
-    """Read document source and publish diagnostics (call from event loop only)."""
-    doc = server.workspace.get_text_document(uri)
-    merged = _run_analysis(doc.source, uri)
-    server.text_document_publish_diagnostics(lsp.PublishDiagnosticsParams(uri=uri, diagnostics=merged))
 
 
 def _serialize_params(params: Any) -> Any:
@@ -279,7 +271,6 @@ async def on_did_save(params: lsp.DidSaveTextDocumentParams) -> None:
 async def on_did_close(params: lsp.DidCloseTextDocumentParams) -> None:
     """Clean up cached state and forward to jdtls."""
     uri = params.text_document.uri
-    server._trees.pop(uri, None)
     if uri in _pending:
         _pending[uri].cancel()
         del _pending[uri]

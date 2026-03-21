@@ -73,7 +73,10 @@ def server():
         proc.wait(timeout=5)
     except (BrokenPipeError, OSError, subprocess.TimeoutExpired):
         proc.kill()
-        proc.wait(timeout=2)
+        try:
+            proc.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            pass
 
 
 def _initialize(proc: subprocess.Popen[bytes], root_uri: str = "file:///tmp") -> dict[str, Any] | None:
@@ -159,6 +162,10 @@ def _wait_diagnostics(proc: subprocess.Popen[bytes]) -> dict[str, Any] | None:
     return _read_until_method(proc, "textDocument/publishDiagnostics")
 
 
+# Per-test timeout prevents CI from hanging if the server crashes mid-test
+pytestmark = pytest.mark.timeout(15)
+
+
 class TestE2EInitialize:
     def test_server_capabilities(self, server: subprocess.Popen[bytes]) -> None:
         """Server should advertise text document sync capability."""
@@ -221,14 +228,17 @@ class TestE2EDiagnostics:
 
         _did_change(server, uri, "class T { String f() { return null; } }")
         _did_save(server, uri)
-        # May receive multiple notifications (debounce + save) — find one with violations
+        # May receive multiple notifications (debounce + save) — collect all codes seen
+        all_codes: set[str] = set()
         for _ in range(5):
             msg = _wait_diagnostics(server)
-            assert msg is not None
-            codes = [d["code"] for d in msg["params"]["diagnostics"]]
-            if "null-return" in codes:
+            if msg is None:
                 break
-        assert "null-return" in codes
+            for d in msg["params"]["diagnostics"]:
+                all_codes.add(d["code"])
+            if "null-return" in all_codes:
+                break
+        assert "null-return" in all_codes, f"Expected null-return, got {all_codes}"
 
     def test_diagnostics_on_save(self, server: subprocess.Popen[bytes], tmp_path: Path) -> None:
         """Save should trigger immediate diagnostics."""
