@@ -202,6 +202,24 @@ Create `.java-functional-lsp.json` in your project root to customize rules:
 - `throw-statement` and `catch-rethrow` are automatically suppressed inside `@Bean` methods
 - `mutable-dto` suggests `@ConstructorBinding` instead of `@Value` when the class has `@ConfigurationProperties`
 
+**Inline suppression** with `@SuppressWarnings`:
+
+```java
+// Suppress a specific rule on a method
+@SuppressWarnings("java-functional-lsp:null-return")
+public String findUser() { return null; }  // no diagnostic
+
+// Suppress multiple rules
+@SuppressWarnings({"java-functional-lsp:null-return", "java-functional-lsp:throw-statement"})
+public String findUser() { ... }
+
+// Suppress all java-functional-lsp rules
+@SuppressWarnings("java-functional-lsp")
+public String legacyMethod() { ... }
+```
+
+Works on classes, methods, constructors, fields, and local variables. Suppression applies to the annotated scope — a class-level annotation suppresses all methods within it.
+
 ## How it works
 
 The server has two layers:

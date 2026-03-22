@@ -18,7 +18,7 @@ from lsprotocol import types as lsp
 from pygls.lsp.server import LanguageServer
 from pygls.uris import to_fs_path
 
-from .analyzers.base import Analyzer, Severity, get_parser, is_excluded
+from .analyzers.base import Analyzer, Severity, get_parser, is_excluded, is_suppressed
 from .analyzers.base import Diagnostic as LintDiagnostic
 from .analyzers.exception_checker import ExceptionChecker
 from .analyzers.mutation_checker import MutationChecker
@@ -123,6 +123,11 @@ def _analyze_document(source_text: str, uri: str = "") -> list[lsp.Diagnostic]:
             all_diagnostics.extend(diags)
         except Exception as e:
             logger.error("Analyzer %s failed: %s", type(analyzer).__name__, e)
+
+    # Filter out diagnostics suppressed by @SuppressWarnings
+    if all_diagnostics:
+        root = tree.root_node
+        all_diagnostics = [d for d in all_diagnostics if not is_suppressed(root, d.line, d.col, d.code)]
 
     return [_to_lsp_diagnostic(d) for d in all_diagnostics]
 

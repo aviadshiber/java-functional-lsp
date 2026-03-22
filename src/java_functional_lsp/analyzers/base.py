@@ -160,6 +160,61 @@ def is_excluded(path_str: str, patterns: list[str]) -> bool:
     return any(fnmatch.fnmatch(normalized, pattern) for pattern in patterns)
 
 
+_SUPPRESS_PREFIX = "java-functional-lsp"
+_DECLARATION_TYPES = frozenset(
+    {
+        "method_declaration",
+        "class_declaration",
+        "interface_declaration",
+        "enum_declaration",
+        "record_declaration",
+        "field_declaration",
+        "local_variable_declaration",
+        "constructor_declaration",
+    }
+)
+
+
+def is_suppressed(root: Node, line: int, col: int, rule_id: str) -> bool:
+    """Check if a diagnostic at (line, col) is suppressed by @SuppressWarnings."""
+    node = root.descendant_for_point_range((line, col), (line, col))
+    if node is None:
+        return False
+    current: Node | None = node
+    while current is not None:
+        if current.type in _DECLARATION_TYPES:
+            modifiers = next((c for c in current.children if c.type == "modifiers"), None)
+            if modifiers and _modifiers_suppress(modifiers, rule_id):
+                return True
+        current = current.parent
+    return False
+
+
+def _modifiers_suppress(modifiers: Node, rule_id: str) -> bool:
+    """Check if modifiers contain @SuppressWarnings suppressing the given rule."""
+    for child in modifiers.named_children:
+        if child.type == "annotation":
+            name_node = child.child_by_field_name("name")
+            if name_node and name_node.text == b"SuppressWarnings":
+                args = child.child_by_field_name("arguments")
+                if args and _annotation_args_suppress(args, rule_id):
+                    return True
+    return False
+
+
+def _annotation_args_suppress(args: Node, rule_id: str) -> bool:
+    """Parse @SuppressWarnings value(s) and check for rule match."""
+    for string_node in find_nodes(args, "string_literal"):
+        if string_node.text is None or len(string_node.text) < len('""'):
+            continue
+        value = string_node.text[1:-1].decode("utf-8")
+        if value == _SUPPRESS_PREFIX:
+            return True
+        if value == f"{_SUPPRESS_PREFIX}:{rule_id}":
+            return True
+    return False
+
+
 def has_sibling_annotation(modifiers_node: Node, annotation_name: bytes) -> bool:
     """Check if a modifiers node contains an annotation with the given name.
 

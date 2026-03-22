@@ -58,6 +58,7 @@ Create `.java-functional-lsp.json` in your project root:
 - `rules` — per-rule severity: `error`, `warning` (default), `info`, `hint`, `off`
 - `throw-statement`/`catch-rethrow` auto-suppressed in `@Bean` methods
 - `mutable-dto` suggests `@ConstructorBinding` for `@ConfigurationProperties` classes
+- Inline suppression: `@SuppressWarnings("java-functional-lsp:rule-id")` on any declaration
 
 ## Automatic Enforcement
 
