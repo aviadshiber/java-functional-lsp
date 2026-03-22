@@ -165,6 +165,9 @@ _DECLARATION_TYPES = frozenset(
     {
         "method_declaration",
         "class_declaration",
+        "interface_declaration",
+        "enum_declaration",
+        "record_declaration",
         "field_declaration",
         "local_variable_declaration",
         "constructor_declaration",
@@ -202,9 +205,9 @@ def _modifiers_suppress(modifiers: Node, rule_id: str) -> bool:
 def _annotation_args_suppress(args: Node, rule_id: str) -> bool:
     """Parse @SuppressWarnings value(s) and check for rule match."""
     for string_node in find_nodes(args, "string_literal"):
-        if string_node.text is None:
+        if string_node.text is None or len(string_node.text) < len('""'):
             continue
-        value = string_node.text.strip(b'"').decode("utf-8")
+        value = string_node.text[1:-1].decode("utf-8")
         if value == _SUPPRESS_PREFIX:
             return True
         if value == f"{_SUPPRESS_PREFIX}:{rule_id}":

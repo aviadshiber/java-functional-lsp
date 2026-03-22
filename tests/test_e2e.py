@@ -371,5 +371,6 @@ class TestE2ESuppressWarnings:
         msg = _wait_diagnostics(server)
         assert msg is not None
         null_diags = [d for d in msg["params"]["diagnostics"] if d["code"] == "null-return"]
-        # f() suppressed, g() not — should have exactly 1 null-return diagnostic
+        # f() suppressed, g() not — should have exactly 1 null-return diagnostic on line 4 (g)
         assert len(null_diags) == 1
+        assert null_diags[0]["range"]["start"]["line"] == 4

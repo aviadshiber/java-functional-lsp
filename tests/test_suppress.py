@@ -149,6 +149,77 @@ class T {
         assert "null-return" in _codes(diags)
 
 
+class TestSuppressOnInterface:
+    def test_interface_level_suppression(self) -> None:
+        source = """
+@SuppressWarnings("java-functional-lsp:null-return")
+interface Foo {
+    default String bar() { return null; }
+}
+"""
+        diags = _analyze_all(source)
+        assert "null-return" not in _codes(diags)
+
+
+class TestSuppressOnEnum:
+    def test_enum_level_suppression(self) -> None:
+        source = """
+@SuppressWarnings("java-functional-lsp:null-return")
+enum Status {
+    ACTIVE;
+    public String label() { return null; }
+}
+"""
+        diags = _analyze_all(source)
+        assert "null-return" not in _codes(diags)
+
+
+class TestSuppressSiblingClasses:
+    def test_does_not_leak_across_top_level_classes(self) -> None:
+        source = """
+@SuppressWarnings("java-functional-lsp:null-return")
+class A { String f() { return null; } }
+class B { String g() { return null; } }
+"""
+        diags = _analyze_all(source)
+        null_diags = [d for d in diags if d.code == "null-return"]
+        assert len(null_diags) == 1
+
+
+class TestSuppressNamedElement:
+    def test_value_equals_form(self) -> None:
+        source = """
+class T {
+    @SuppressWarnings(value = "java-functional-lsp:null-return")
+    String f() { return null; }
+}
+"""
+        diags = _analyze_all(source)
+        assert "null-return" not in _codes(diags)
+
+
+class TestSuppressOtherRules:
+    def test_suppress_imperative_loop(self) -> None:
+        source = """
+class T {
+    @SuppressWarnings("java-functional-lsp:imperative-loop")
+    void f() { for (int i = 0; i < 10; i++) {} }
+}
+"""
+        diags = _analyze_all(source)
+        assert "imperative-loop" not in _codes(diags)
+
+    def test_suppress_mutable_variable(self) -> None:
+        source = """
+class T {
+    @SuppressWarnings("java-functional-lsp:mutable-variable")
+    void f() { int x = 0; x = 1; }
+}
+"""
+        diags = _analyze_all(source)
+        assert "mutable-variable" not in _codes(diags)
+
+
 class TestNoSuppress:
     def test_baseline_no_annotation(self) -> None:
         source = "class T { String f() { return null; } }"
