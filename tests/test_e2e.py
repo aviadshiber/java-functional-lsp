@@ -349,3 +349,27 @@ class TestE2EConfig:
         msg = _wait_diagnostics(server)
         assert msg is not None
         assert len(msg["params"]["diagnostics"]) == 0
+
+
+class TestE2ESuppressWarnings:
+    def test_suppress_warnings_annotation(self, server: subprocess.Popen[bytes], tmp_path: Path) -> None:
+        """@SuppressWarnings should suppress diagnostics for the annotated scope."""
+        java_file = tmp_path / "Suppress.java"
+        java_file.write_text(
+            "class T {\n"
+            '    @SuppressWarnings("java-functional-lsp:null-return")\n'
+            "    String f() { return null; }\n"
+            "\n"
+            "    String g() { return null; }\n"
+            "}"
+        )
+        uri = java_file.as_uri()
+
+        _initialize(server, root_uri=tmp_path.as_uri())
+        _did_open(server, uri, java_file.read_text())
+
+        msg = _wait_diagnostics(server)
+        assert msg is not None
+        null_diags = [d for d in msg["params"]["diagnostics"] if d["code"] == "null-return"]
+        # f() suppressed, g() not — should have exactly 1 null-return diagnostic
+        assert len(null_diags) == 1
