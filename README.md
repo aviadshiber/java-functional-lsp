@@ -5,9 +5,27 @@
 [![Python](https://img.shields.io/pypi/pyversions/java-functional-lsp?v=1)](https://pypi.org/project/java-functional-lsp/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-A Java Language Server that enforces functional programming best practices. Designed for teams using **Vavr**, **Lombok**, and **Spring** with a functional-first approach.
+A Java Language Server that provides two things in one:
+
+1. **Full Java language support** — completions, hover, go-to-definition, compile errors, missing imports — by proxying [Eclipse jdtls](https://github.com/eclipse-jdtls/eclipse.jdt.ls) under the hood
+2. **12 functional programming rules** — catches anti-patterns and suggests Vavr/Lombok/Spring alternatives, all before compilation
+
+Designed for teams using **Vavr**, **Lombok**, and **Spring** with a functional-first approach.
 
 ## What it checks
+
+### Java language (via jdtls)
+
+When [jdtls](https://github.com/eclipse-jdtls/eclipse.jdt.ls) is installed, the server proxies all standard Java language features:
+
+- Compile errors and warnings
+- Missing imports and unresolved symbols
+- Type mismatches
+- Completions, hover, go-to-definition, find references
+
+Install jdtls separately: `brew install jdtls` (requires JDK 21+). Without jdtls, the server runs in standalone mode — the 12 custom rules still work, but you won't get compile errors or completions.
+
+### Functional programming rules
 
 | Rule | Detects | Suggests |
 |------|---------|----------|
@@ -36,7 +54,7 @@ pip install java-functional-lsp
 # From source
 pip install git+https://github.com/aviadshiber/java-functional-lsp.git
 
-# Optional: install jdtls for full Java language support (completions, hover, go-to-def)
+# Optional: install jdtls for full Java language support (see above)
 brew install jdtls
 ```
 
@@ -186,7 +204,10 @@ Create `.java-functional-lsp.json` in your project root to customize rules:
 
 ## How it works
 
-Uses [tree-sitter](https://tree-sitter.github.io/) with the Java grammar for fast, incremental AST parsing. No Java compiler or classpath needed — analysis runs on raw source files.
+The server has two layers:
+
+- **Custom rules** — uses [tree-sitter](https://tree-sitter.github.io/) with the Java grammar for sub-millisecond AST analysis (~0.4ms per file). No compiler or classpath needed — runs on raw source files.
+- **Java language features** — proxies [Eclipse jdtls](https://github.com/eclipse-jdtls/eclipse.jdt.ls) for compile errors, completions, hover, go-to-definition, and references. Diagnostics from both layers are merged and published together.
 
 The server speaks the Language Server Protocol (LSP) via stdio, making it compatible with any LSP client.
 
