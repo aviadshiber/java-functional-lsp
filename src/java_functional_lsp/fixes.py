@@ -9,7 +9,7 @@ from typing import Any
 
 from lsprotocol import types as lsp
 
-from .analyzers.base import find_nodes, get_parser
+from .analyzers.base import extract_null_check_var, find_ancestor, find_nodes, get_parser
 
 # --- Import management ---
 
@@ -60,8 +60,25 @@ def ensure_import(lines: list[str], import_path: str) -> lsp.TextEdit | None:
 # --- Fix generators ---
 
 
+def _find_method_invocation(tree: Any, diag_range: lsp.Range) -> Any | None:
+    """Find the method_invocation node at or near the diagnostic range."""
+    target = tree.root_node.descendant_for_point_range(
+        (diag_range.start.line, diag_range.start.character),
+        (diag_range.end.line, diag_range.end.character),
+    )
+    if target is None:
+        return None
+    if target.type == "method_invocation":
+        return target
+    # Search children first (diagnostic range may cover the expression_statement)
+    for child in find_nodes(target, "method_invocation"):
+        return child
+    # Then walk up
+    return find_ancestor(target, "method_invocation")
+
+
 def fix_frozen_mutation(
-    uri: str, source: str, diag_range: lsp.Range, config: dict[str, Any]
+    uri: str, source: str, diag_range: lsp.Range, config: dict[str, Any], *, tree: Any = None
 ) -> lsp.WorkspaceEdit | None:
     """Generate a fix for frozen-mutation: rewrite to Vavr persistent collection.
 
@@ -69,43 +86,17 @@ def fix_frozen_mutation(
     and the mutation call (e.g. .add(x)) to the persistent equivalent (e.g. = var.append(x)).
     """
     lines = source.split("\n")
-    parser = get_parser()
-    tree = parser.parse(source.encode("utf-8"))
+    if tree is None:
+        tree = get_parser().parse(source.encode("utf-8"))
 
     edits: list[lsp.TextEdit] = []
 
-    # Add Vavr import
-    auto_import = config.get("autoImportVavr", True)
-    if auto_import:
+    if config.get("autoImportVavr", True):
         import_edit = ensure_import(lines, "io.vavr.collection.List")
         if import_edit is not None:
             edits.append(import_edit)
 
-    # Find the mutation call at the diagnostic range
-    diag_line = diag_range.start.line
-    diag_col = diag_range.start.character
-
-    target_node = tree.root_node.descendant_for_point_range(
-        (diag_line, diag_col), (diag_range.end.line, diag_range.end.character)
-    )
-    if target_node is None:
-        return None
-
-    # Find the method_invocation at or near the diagnostic position
-    invocation = None
-    if target_node.type == "method_invocation":
-        invocation = target_node
-    else:
-        # Search children first (diagnostic range may cover the expression_statement)
-        for child in find_nodes(target_node, "method_invocation"):
-            invocation = child
-            break
-        # Then try walking up
-        if invocation is None:
-            node = target_node.parent
-            while node is not None and node.type != "method_invocation":
-                node = node.parent
-            invocation = node
+    invocation = _find_method_invocation(tree, diag_range)
     if invocation is None:
         return None
 
@@ -188,40 +179,22 @@ def _find_if_node(tree: Any, diag_range: lsp.Range) -> Any | None:
         (diag_range.start.line, diag_range.start.character),
         (diag_range.end.line, diag_range.end.character),
     )
-    node = target
-    while node is not None and node.type != "if_statement":
-        node = node.parent
-    return node
+    if target is None:
+        return None
+    if target.type == "if_statement":
+        return target
+    return find_ancestor(target, "if_statement")
 
 
-def _extract_null_check_var(if_node: Any) -> str | None:
-    """Extract the variable name from an if(x != null) condition."""
+def _extract_null_check_var_str(if_node: Any) -> str | None:
+    """Extract the variable name from an if(x != null) condition as a string."""
     condition = if_node.child_by_field_name("condition")
     if condition is None:
         return None
-
-    inner = condition
-    if inner.type == "parenthesized_expression" and inner.named_child_count == 1:
-        inner = inner.named_children[0]
-
-    if inner.type != "binary_expression":
+    var_bytes = extract_null_check_var(condition)
+    if var_bytes is None:
         return None
-
-    # Must have != operator
-    if not any(c.type == "!=" for c in inner.children):
-        return None
-
-    left = inner.child_by_field_name("left")
-    right = inner.child_by_field_name("right")
-    if left is None or right is None:
-        return None
-
-    # Determine which side is the variable and which is null
-    var_node = left if right.type == "null_literal" else (right if left.type == "null_literal" else None)
-    if var_node is not None and var_node.type == "identifier" and var_node.text:
-        result: str = var_node.text.decode("utf-8")
-        return result
-    return None
+    return var_bytes.decode("utf-8")
 
 
 def _build_monadic_rewrite(if_node: Any, var_name: str) -> lsp.TextEdit | None:
@@ -256,12 +229,12 @@ def _build_monadic_rewrite(if_node: Any, var_name: str) -> lsp.TextEdit | None:
 
 
 def fix_null_check_to_monadic(
-    uri: str, source: str, diag_range: lsp.Range, config: dict[str, Any]
+    uri: str, source: str, diag_range: lsp.Range, config: dict[str, Any], *, tree: Any = None
 ) -> lsp.WorkspaceEdit | None:
     """Generate a fix for null-check-to-monadic: rewrite if(x != null) to Option.of(x).map(...)."""
     lines = source.split("\n")
-    parser = get_parser()
-    tree = parser.parse(source.encode("utf-8"))
+    if tree is None:
+        tree = get_parser().parse(source.encode("utf-8"))
 
     edits: list[lsp.TextEdit] = []
 
@@ -275,7 +248,7 @@ def fix_null_check_to_monadic(
     if if_node is None:
         return None
 
-    var_name = _extract_null_check_var(if_node)
+    var_name = _extract_null_check_var_str(if_node)
     if var_name is None:
         return None
 
@@ -305,7 +278,9 @@ def _to_map_expression(return_text: str, var_name: str) -> str:
     return f".map({var_name} -> {return_text})"
 
 
-def fix_null_return(uri: str, source: str, diag_range: lsp.Range, config: dict[str, Any]) -> lsp.WorkspaceEdit | None:
+def fix_null_return(
+    uri: str, source: str, diag_range: lsp.Range, config: dict[str, Any], *, tree: Any = None
+) -> lsp.WorkspaceEdit | None:
     """Generate a fix for null-return: replace 'return null;' with 'return Option.none();'."""
     lines = source.split("\n")
     edits: list[lsp.TextEdit] = []

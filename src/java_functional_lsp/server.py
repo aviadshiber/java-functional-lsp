@@ -397,6 +397,9 @@ def on_code_action(params: lsp.CodeActionParams) -> list[lsp.CodeAction] | None:
     uri = params.text_document.uri
     actions: list[lsp.CodeAction] = []
 
+    # Parse the tree once for all fix generators (avoid re-parsing per diagnostic)
+    tree = server._parser.parse(doc.source.encode("utf-8"))
+
     for diag in params.context.diagnostics:
         if diag.source != "java-functional-lsp":
             continue
@@ -409,7 +412,7 @@ def on_code_action(params: lsp.CodeActionParams) -> list[lsp.CodeAction] | None:
             continue
 
         try:
-            workspace_edit = fix_fn(uri, doc.source, diag.range, server._config)
+            workspace_edit = fix_fn(uri, doc.source, diag.range, server._config, tree=tree)
         except Exception as e:
             logger.error("Fix generator for %s failed: %s", rule_id, e)
             continue

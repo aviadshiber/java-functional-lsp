@@ -225,6 +225,34 @@ def _annotation_args_suppress(args: Node, rule_id: str) -> bool:
     return False
 
 
+def extract_null_check_var(condition: Node) -> bytes | None:
+    """Extract the variable from a `x != null` or `null != x` binary condition.
+
+    Handles parenthesized expressions. Returns the variable name as bytes, or None.
+    """
+    node = condition
+    if node.type == "parenthesized_expression" and node.named_child_count == 1:
+        node = node.named_children[0]
+
+    if node.type != "binary_expression":
+        return None
+
+    # Must have != operator (tree-sitter stores operators as unnamed children)
+    if not any(c.type == "!=" for c in node.children):
+        return None
+
+    left = node.child_by_field_name("left")
+    right = node.child_by_field_name("right")
+    if left is None or right is None:
+        return None
+
+    var_node = left if right.type == "null_literal" else (right if left.type == "null_literal" else None)
+    if var_node is not None and var_node.type == "identifier":
+        val: bytes | None = var_node.text
+        return val
+    return None
+
+
 def has_sibling_annotation(modifiers_node: Node, annotation_name: bytes) -> bool:
     """Check if a modifiers node contains an annotation with the given name.
 

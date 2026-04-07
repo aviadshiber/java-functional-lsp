@@ -7,6 +7,8 @@ from typing import Any
 from .base import (
     Diagnostic,
     DiagnosticData,
+    Severity,
+    extract_null_check_var,
     find_nodes,
     find_nodes_multi,
     severity_from_config,
@@ -201,7 +203,7 @@ class FunctionalChecker:
                 continue
 
             # Look for binary expression: x != null or null != x
-            checked_var = self._extract_null_check_var(condition)
+            checked_var = extract_null_check_var(condition)
             if checked_var is None:
                 continue
 
@@ -236,47 +238,6 @@ class FunctionalChecker:
                 )
             )
 
-    def _extract_null_check_var(self, condition: Any) -> bytes | None:
-        """Extract the variable name from a `x != null` or `null != x` condition."""
-        # The condition might be wrapped in parenthesized_expression
-        node = condition
-        if node.type == "parenthesized_expression" and node.named_child_count == 1:
-            node = node.named_children[0]
-
-        if node.type != "binary_expression":
-            return None
-
-        # Determine the operator — tree-sitter may store it as named field or unnamed child
-        op_text = self._get_binary_operator(node)
-        if op_text != b"!=":
-            return None
-
-        left = node.child_by_field_name("left")
-        right = node.child_by_field_name("right")
-        if left is None or right is None:
-            return None
-
-        # x != null or null != x
-        var_node = left if right.type == "null_literal" else (right if left.type == "null_literal" else None)
-        if var_node is not None and var_node.type == "identifier":
-            val: bytes | None = var_node.text
-            return val
-        return None
-
-    @staticmethod
-    def _get_binary_operator(node: Any) -> bytes | None:
-        """Extract the operator text from a binary_expression node."""
-        operator = node.child_by_field_name("operator")
-        if operator is not None and hasattr(operator, "text") and operator.text:
-            result: bytes = operator.text
-            return result
-        # Fallback: check unnamed children
-        for child in node.children:
-            if child.type in ("!=", "=="):
-                op: bytes = child.type.encode() if isinstance(child.type, str) else child.type
-                return op
-        return None
-
     def _references_var(self, node: Any, var_name: bytes) -> bool:
         """Check if a node (or descendants) references a given variable name."""
         if node.type == "identifier" and node.text == var_name:
@@ -293,15 +254,10 @@ class FunctionalChecker:
 
     def _check_impure_method(self, tree: Any, diagnostics: list[Diagnostic], config: dict[str, Any]) -> None:
         """Detect methods mixing pure logic with side-effects."""
-        severity = severity_from_config(config, "impure-method")
+        default = Severity.WARNING if config.get("strictPurity", False) else Severity.HINT
+        severity = severity_from_config(config, "impure-method", default=default)
         if severity is None:
             return
-
-        strict = config.get("strictPurity", False)
-        if strict:
-            severity_to_use = severity_from_config(config, "impure-method", default=severity) or severity
-        else:
-            severity_to_use = severity
 
         for method in find_nodes(tree.root_node, "method_declaration"):
             body = method.child_by_field_name("body")
@@ -331,7 +287,7 @@ class FunctionalChecker:
                         col=name_node.start_point[1],
                         end_line=name_node.end_point[0],
                         end_col=name_node.end_point[1],
-                        severity=severity_to_use,
+                        severity=severity,
                         code="impure-method",
                         message=_MESSAGES["impure-method"],
                         data=_DATA["impure-method"],

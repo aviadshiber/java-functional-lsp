@@ -69,7 +69,7 @@ class NullChecker:
                     severity=severity,
                     code=rule_id,
                     message=_MESSAGES[rule_id],
-                    data=_DATA.get(rule_id),
+                    data=_DATA[rule_id],
                 )
             )
 
