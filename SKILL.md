@@ -1,13 +1,13 @@
 ---
 name: java-functional-lsp
-description: Java LSP with full language support (completions, hover, go-to-def, compile errors) plus 12 functional programming rules enforcement. Auto-invoke when setting up Java language support or discussing Java linting configuration.
+description: Java LSP with full language support (completions, hover, go-to-def, compile errors) plus 15 functional programming rules with automated quick fixes. Auto-invoke when setting up Java language support or discussing Java linting configuration.
 allowed-tools: Bash
 disable-model-invocation: true
 ---
 
 # Java Functional LSP
 
-A Java LSP server that wraps jdtls and adds 12 functional programming rules. Gives you **full Java language support** (completions, hover, go-to-def, compile errors) **plus** custom diagnostics — all before compilation.
+A Java LSP server that wraps jdtls and adds 15 functional programming rules with code actions (quick fixes). Gives you **full Java language support** (completions, hover, go-to-def, compile errors) **plus** custom diagnostics with machine-readable metadata for AI agents — all before compilation.
 
 ## Prerequisites
 
@@ -22,22 +22,47 @@ brew install jdtls
 
 Without jdtls, the server runs in standalone mode — custom rules still work, but no completions/hover/compile errors.
 
-## Rules (12 checks)
+## Rules (15 checks)
 
-| Rule | Detects | Suggests |
-|------|---------|----------|
-| `null-literal-arg` | `null` passed as argument | `Option.none()` or default |
-| `null-return` | `return null` | `Option.of()`, `Option.none()`, or `Either` |
-| `null-assignment` | `Type x = null` | `Option<Type>` |
-| `null-field-assignment` | Field initialized to `null` | `Option<T>` with `Option.none()` |
-| `throw-statement` | `throw new XxxException(...)` | `Either.left()` or `Try.of()` |
-| `catch-rethrow` | catch wraps + rethrows | `Try.of().toEither()` |
-| `mutable-variable` | Variable reassignment | Final + functional transforms |
-| `imperative-loop` | `for`/`while` loops | `.map()`/`.filter()`/`.flatMap()` |
-| `mutable-dto` | `@Data` or `@Setter` | `@Value` (immutable) |
-| `imperative-option-unwrap` | `if (opt.isDefined()) { opt.get() }` | `map()`/`flatMap()`/`fold()` |
-| `field-injection` | `@Autowired` on field | Constructor injection |
-| `component-annotation` | `@Component`/`@Service`/`@Repository` | `@Configuration` + `@Bean` |
+| Rule | Detects | Suggests | Quick Fix |
+|------|---------|----------|-----------|
+| `null-literal-arg` | `null` passed as argument | `Option.none()` or default | — |
+| `null-return` | `return null` | `Option.of()`, `Option.none()`, or `Either` | ✅ |
+| `null-assignment` | `Type x = null` | `Option<Type>` | — |
+| `null-field-assignment` | Field initialized to `null` | `Option<T>` with `Option.none()` | — |
+| `throw-statement` | `throw new XxxException(...)` | `Either.left()` or `Try.of()` | — |
+| `catch-rethrow` | catch wraps + rethrows | `Try.of().toEither()` | — |
+| `mutable-variable` | Variable reassignment | Final + functional transforms | — |
+| `imperative-loop` | `for`/`while` loops | `.map()`/`.filter()`/`.flatMap()` | — |
+| `mutable-dto` | `@Data` or `@Setter` | `@Value` (immutable) | — |
+| `imperative-option-unwrap` | `if (opt.isDefined()) { opt.get() }` | `map()`/`flatMap()`/`fold()` | — |
+| `field-injection` | `@Autowired` on field | Constructor injection | — |
+| `component-annotation` | `@Component`/`@Service`/`@Repository` | `@Configuration` + `@Bean` | — |
+| `frozen-mutation` | Mutation on `List.of()`/`Collections.unmodifiable*` | `io.vavr.collection.List` | ✅ |
+| `null-check-to-monadic` | `if (x != null) { return x.foo(); }` | `Option.of(x).map(...)` | ✅ |
+| `impure-method` | Method mixing pure logic with side-effects | Extract pure logic; wrap IO in `Try` | — |
+
+## Code Actions (Quick Fixes)
+
+Rules marked ✅ provide automated `textDocument/codeAction` fixes:
+
+- **frozen-mutation** → "Switch to Vavr Immutable Collection" — rewrites type, init, and mutation call to Vavr persistent API, adds import
+- **null-check-to-monadic** → "Convert to Option monadic flow" — rewrites `if (x != null)` to `Option.of(x).map(...)`, adds import
+- **null-return** → "Replace with Option.none()" — replaces `null` with `Option.none()`, adds import
+
+## Agent-Ready Diagnostics
+
+Every diagnostic includes a machine-readable `data` payload:
+
+```json
+{
+  "fixType": "REPLACE_WITH_VAVR_LIST",
+  "targetLibrary": "io.vavr.collection.List",
+  "rationale": "Runtime mutation of List.of() causes UnsupportedOperationException."
+}
+```
+
+This lets AI agents apply fixes with confidence — `fixType` says what to do, `targetLibrary` says which dependency, `rationale` says why.
 
 ## Configuration
 
@@ -50,12 +75,18 @@ Create `.java-functional-lsp.json` in your project root:
     "imperative-loop": "hint",
     "mutable-variable": "info",
     "throw-statement": "off"
-  }
+  },
+  "agentMode": true,
+  "autoImportVavr": true,
+  "strictPurity": false
 }
 ```
 
 - `excludes` — glob patterns to skip files/directories entirely
 - `rules` — per-rule severity: `error`, `warning` (default), `info`, `hint`, `off`
+- `agentMode` — include machine-readable `data` payload in diagnostics (default: `true`)
+- `autoImportVavr` — quick fixes auto-add Vavr imports (default: `true`)
+- `strictPurity` — `impure-method` uses WARNING instead of HINT (default: `false`)
 - `throw-statement`/`catch-rethrow` auto-suppressed in `@Bean` methods
 - `mutable-dto` suggests `@ConstructorBinding` for `@ConfigurationProperties` classes
 - Inline suppression: `@SuppressWarnings("java-functional-lsp:rule-id")` on any declaration
