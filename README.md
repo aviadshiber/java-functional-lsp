@@ -8,7 +8,8 @@
 A Java Language Server that provides two things in one:
 
 1. **Full Java language support** — completions, hover, go-to-definition, compile errors, missing imports — by proxying [Eclipse jdtls](https://github.com/eclipse-jdtls/eclipse.jdt.ls) under the hood
-2. **12 functional programming rules** — catches anti-patterns and suggests Vavr/Lombok/Spring alternatives, all before compilation
+2. **15 functional programming rules** — catches anti-patterns and suggests Vavr/Lombok/Spring alternatives, all before compilation
+3. **Code actions (quick fixes)** — automated refactoring via LSP `textDocument/codeAction`, with machine-readable diagnostic metadata for AI agents
 
 Designed for teams using **Vavr**, **Lombok**, and **Spring** with a functional-first approach.
 
@@ -27,20 +28,23 @@ Install jdtls separately: `brew install jdtls` (requires JDK 21+). Without jdtls
 
 ### Functional programming rules
 
-| Rule | Detects | Suggests |
-|------|---------|----------|
-| `null-literal-arg` | `null` passed as method argument | `Option.none()` or default value |
-| `null-return` | `return null` | `Option.of()`, `Option.none()`, or `Either` |
-| `null-assignment` | `Type x = null` | `Option<Type>` |
-| `null-field-assignment` | Field initialized to `null` | `Option<T>` with `Option.none()` |
-| `throw-statement` | `throw new XxxException(...)` | `Either.left()` or `Try.of()` |
-| `catch-rethrow` | catch block that wraps + rethrows | `Try.of().toEither()` |
-| `mutable-variable` | Local variable reassignment | Final variables + functional transforms |
-| `imperative-loop` | `for`/`while` loops | `.map()`/`.filter()`/`.flatMap()`/`.foldLeft()` |
-| `mutable-dto` | `@Data` or `@Setter` on class | `@Value` (immutable) |
-| `imperative-option-unwrap` | `if (opt.isDefined()) { opt.get() }` | `map()`/`flatMap()`/`fold()` |
-| `field-injection` | `@Autowired` on field | Constructor injection |
-| `component-annotation` | `@Component`/`@Service`/`@Repository` | `@Configuration` + `@Bean` |
+| Rule | Detects | Suggests | Quick Fix |
+|------|---------|----------|-----------|
+| `null-literal-arg` | `null` passed as method argument | `Option.none()` or default value | — |
+| `null-return` | `return null` | `Option.of()`, `Option.none()`, or `Either` | ✅ |
+| `null-assignment` | `Type x = null` | `Option<Type>` | — |
+| `null-field-assignment` | Field initialized to `null` | `Option<T>` with `Option.none()` | — |
+| `throw-statement` | `throw new XxxException(...)` | `Either.left()` or `Try.of()` | — |
+| `catch-rethrow` | catch block that wraps + rethrows | `Try.of().toEither()` | — |
+| `mutable-variable` | Local variable reassignment | Final variables + functional transforms | — |
+| `imperative-loop` | `for`/`while` loops | `.map()`/`.filter()`/`.flatMap()`/`.foldLeft()` | — |
+| `mutable-dto` | `@Data` or `@Setter` on class | `@Value` (immutable) | — |
+| `imperative-option-unwrap` | `if (opt.isDefined()) { opt.get() }` | `map()`/`flatMap()`/`fold()` | — |
+| `field-injection` | `@Autowired` on field | Constructor injection | — |
+| `component-annotation` | `@Component`/`@Service`/`@Repository` | `@Configuration` + `@Bean` | — |
+| `frozen-mutation` | Mutation on `List.of()`/`Collections.unmodifiable*` | `io.vavr.collection.List` | ✅ |
+| `null-check-to-monadic` | `if (x != null) { return x.foo(); }` | `Option.of(x).map(...)` | ✅ |
+| `impure-method` | Method mixing pure logic with side-effects | Extract pure logic; wrap IO in `Try` | — |
 
 ## Install
 
@@ -219,6 +223,52 @@ public String legacyMethod() { ... }
 ```
 
 Works on classes, methods, constructors, fields, and local variables. Suppression applies to the annotated scope — a class-level annotation suppresses all methods within it.
+
+## Code actions (quick fixes)
+
+The server provides LSP code actions (`textDocument/codeAction`) that automatically refactor code. When your editor shows a diagnostic with a lightbulb icon, clicking it applies the fix:
+
+| Rule | Code Action | What it does |
+|------|-------------|--------------|
+| `frozen-mutation` | Switch to Vavr Immutable Collection | Rewrites `List.of()` → `io.vavr.collection.List.of()`, `.add(x)` → `= list.append(x)`, adds import |
+| `null-check-to-monadic` | Convert to Option monadic flow | Rewrites `if (x != null) { return x.foo(); }` → `Option.of(x).map(...).getOrNull()`, adds import |
+| `null-return` | Replace with Option.none() | Rewrites `return null` → `return Option.none()`, adds import |
+
+Quick fixes automatically add the required Vavr import if it's not already present. Disable auto-import with `"autoImportVavr": false` in config.
+
+## Agent mode (AI integration)
+
+Every diagnostic includes a machine-readable `data` payload designed for AI agents like Claude Code:
+
+```json
+{
+  "code": "frozen-mutation",
+  "message": "Runtime Exception Risk: Mutating a frozen structure...",
+  "data": {
+    "fixType": "REPLACE_WITH_VAVR_LIST",
+    "targetLibrary": "io.vavr.collection.List",
+    "rationale": "Runtime mutation of List.of() causes UnsupportedOperationException. Use Vavr for safe, persistent immutability."
+  }
+}
+```
+
+This lets agents confidently apply fixes without guessing libraries or patterns — the `fixType` tells them *what* to do, `targetLibrary` tells them *which dependency*, and `rationale` tells them *why*.
+
+**Agent mode configuration** in `.java-functional-lsp.json`:
+
+```json
+{
+  "agentMode": true,
+  "autoImportVavr": true,
+  "strictPurity": true
+}
+```
+
+| Key | Default | Effect |
+|-----|---------|--------|
+| `agentMode` | `true` | Include `data` payload in all diagnostics |
+| `autoImportVavr` | `true` | Quick fixes auto-add Vavr/Option imports |
+| `strictPurity` | `false` | When `true`, `impure-method` uses WARNING severity instead of HINT |
 
 ## How it works
 
