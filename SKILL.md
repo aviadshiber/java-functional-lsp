@@ -76,7 +76,6 @@ Create `.java-functional-lsp.json` in your project root:
     "mutable-variable": "info",
     "throw-statement": "off"
   },
-  "agentMode": true,
   "autoImportVavr": true,
   "strictPurity": false
 }
@@ -84,7 +83,6 @@ Create `.java-functional-lsp.json` in your project root:
 
 - `excludes` — glob patterns to skip files/directories entirely
 - `rules` — per-rule severity: `error`, `warning` (default), `info`, `hint`, `off`
-- `agentMode` — include machine-readable `data` payload in diagnostics (default: `true`)
 - `autoImportVavr` — quick fixes auto-add Vavr imports (default: `true`)
 - `strictPurity` — `impure-method` uses WARNING instead of HINT (default: `false`)
 - `throw-statement`/`catch-rethrow` auto-suppressed in `@Bean` methods

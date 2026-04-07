@@ -258,7 +258,6 @@ This lets agents confidently apply fixes without guessing libraries or patterns 
 
 ```json
 {
-  "agentMode": true,
   "autoImportVavr": true,
   "strictPurity": true
 }
@@ -266,9 +265,10 @@ This lets agents confidently apply fixes without guessing libraries or patterns 
 
 | Key | Default | Effect |
 |-----|---------|--------|
-| `agentMode` | `true` | Include `data` payload in all diagnostics |
 | `autoImportVavr` | `true` | Quick fixes auto-add Vavr/Option imports |
 | `strictPurity` | `false` | When `true`, `impure-method` uses WARNING severity instead of HINT |
+
+> **Note:** The machine-readable `data` payload is always included in diagnostics when available — no configuration needed.
 
 ## How it works
 

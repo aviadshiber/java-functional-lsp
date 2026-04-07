@@ -379,9 +379,6 @@ async def on_document_symbol(params: lsp.DocumentSymbolParams) -> list[lsp.Docum
 
 # --- Code actions (quick fixes) ---
 
-# Rule IDs that have fix generators
-_FIXABLE_RULES = {"frozen-mutation", "null-check-to-monadic", "null-return"}
-
 # Human-readable titles for code actions
 _FIX_TITLES: dict[str, str] = {
     "frozen-mutation": "Switch to Vavr Immutable Collection",
@@ -404,9 +401,6 @@ def on_code_action(params: lsp.CodeActionParams) -> list[lsp.CodeAction] | None:
         if diag.source != "java-functional-lsp":
             continue
         rule_id = diag.code if isinstance(diag.code, str) else str(diag.code) if diag.code is not None else ""
-        if rule_id not in _FIXABLE_RULES:
-            continue
-
         fix_fn = get_fix(rule_id)
         if fix_fn is None:
             continue

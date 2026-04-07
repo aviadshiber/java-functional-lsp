@@ -93,6 +93,49 @@ class TestFixFrozenMutation:
             assert len(import_edits) == 0
 
 
+    def test_no_import_when_disabled(self) -> None:
+        source = (
+            "import java.util.List;\n"
+            "\n"
+            "class T {\n"
+            "    void f() {\n"
+            '        List<String> list = List.of("a", "b");\n'
+            '        list.add("c");\n'
+            "    }\n"
+            "}\n"
+        )
+        diag_range = lsp.Range(
+            start=lsp.Position(line=5, character=8),
+            end=lsp.Position(line=5, character=22),
+        )
+        result = fix_frozen_mutation("file:///test.java", source, diag_range, {"autoImportVavr": False})
+        if result is not None and result.changes:
+            edits = result.changes.get("file:///test.java", [])
+            import_edits = [e for e in edits if "import" in e.new_text]
+            assert len(import_edits) == 0
+
+    def test_imports_vavr_set_for_set_collection(self) -> None:
+        source = (
+            "import java.util.Set;\n"
+            "\n"
+            "class T {\n"
+            "    void f() {\n"
+            '        Set<String> s = Set.of("a");\n'
+            '        s.add("b");\n'
+            "    }\n"
+            "}\n"
+        )
+        diag_range = lsp.Range(
+            start=lsp.Position(line=5, character=8),
+            end=lsp.Position(line=5, character=18),
+        )
+        result = fix_frozen_mutation("file:///test.java", source, diag_range, {})
+        assert result is not None
+        edits = result.changes["file:///test.java"]
+        import_edits = [e for e in edits if "import" in e.new_text]
+        assert any("io.vavr.collection.Set" in e.new_text for e in import_edits)
+
+
 class TestFixNullCheckToMonadic:
     def test_generates_option_rewrite(self) -> None:
         source = (

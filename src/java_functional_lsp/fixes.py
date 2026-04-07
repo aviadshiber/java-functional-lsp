@@ -77,6 +77,26 @@ def _find_method_invocation(tree: Any, diag_range: lsp.Range) -> Any | None:
     return find_ancestor(target, "method_invocation")
 
 
+def _detect_frozen_collection_type(tree: Any, var_name: str) -> str:
+    """Detect the collection type (List, Set, or Map) for a frozen variable declaration."""
+    var_bytes = var_name.encode("utf-8")
+    for decl in find_nodes(tree.root_node, "local_variable_declaration"):
+        for declarator in find_nodes(decl, "variable_declarator"):
+            name_node = declarator.child_by_field_name("name")
+            if name_node is None or name_node.text != var_bytes:
+                continue
+            # Check the type annotation
+            type_node = decl.child_by_field_name("type")
+            if type_node is not None and type_node.text:
+                type_text = type_node.text.decode("utf-8")
+                if type_text.startswith("Set"):
+                    return "Set"
+                if type_text.startswith("Map"):
+                    return "Map"
+            return "List"
+    return "List"
+
+
 def fix_frozen_mutation(
     uri: str, source: str, diag_range: lsp.Range, config: dict[str, Any], *, tree: Any = None
 ) -> lsp.WorkspaceEdit | None:
@@ -91,11 +111,6 @@ def fix_frozen_mutation(
 
     edits: list[lsp.TextEdit] = []
 
-    if config.get("autoImportVavr", True):
-        import_edit = ensure_import(lines, "io.vavr.collection.List")
-        if import_edit is not None:
-            edits.append(import_edit)
-
     invocation = _find_method_invocation(tree, diag_range)
     if invocation is None:
         return None
@@ -106,6 +121,14 @@ def fix_frozen_mutation(
         return None
 
     var_name = obj_node.text.decode("utf-8") if obj_node.text else ""
+
+    # Detect collection type and add correct Vavr import
+    collection_type = _detect_frozen_collection_type(tree, var_name)
+    if config.get("autoImportVavr", True):
+        import_edit = ensure_import(lines, f"io.vavr.collection.{collection_type}")
+        if import_edit is not None:
+            edits.append(import_edit)
+
     args_node = invocation.child_by_field_name("arguments")
     args_text = args_node.text.decode("utf-8") if args_node and args_node.text else "()"
 
@@ -128,7 +151,7 @@ def fix_frozen_mutation(
         edits.append(lsp.TextEdit(range=lsp.Range(start=stmt_start, end=stmt_end), new_text=new_text))
 
     # Try to find and rewrite the variable declaration to use Vavr type
-    _add_vavr_decl_rewrite(tree, var_name, edits)
+    _add_vavr_decl_rewrite(tree, var_name, edits, collection_type)
 
     if not edits:
         return None
@@ -136,7 +159,9 @@ def fix_frozen_mutation(
     return lsp.WorkspaceEdit(changes={uri: edits})
 
 
-def _add_vavr_decl_rewrite(tree: Any, var_name: str, edits: list[lsp.TextEdit]) -> None:
+def _add_vavr_decl_rewrite(
+    tree: Any, var_name: str, edits: list[lsp.TextEdit], collection_type: str = "List"
+) -> None:
     """Find the variable declaration for var_name and rewrite its type + init to Vavr."""
     var_bytes = var_name.encode("utf-8")
     for decl in find_nodes(tree.root_node, "local_variable_declaration"):
@@ -168,7 +193,8 @@ def _add_vavr_decl_rewrite(tree: Any, var_name: str, edits: list[lsp.TextEdit]) 
                         generic = child.text.decode("utf-8")
                         break
 
-            new_decl = f"io.vavr.collection.List{generic} {var_name} = io.vavr.collection.List.of{init_args};"
+            vavr_type = f"io.vavr.collection.{collection_type}"
+            new_decl = f"{vavr_type}{generic} {var_name} = {vavr_type}.of{init_args};"
             edits.append(lsp.TextEdit(range=lsp.Range(start=decl_start, end=decl_end), new_text=new_decl))
             return
 
@@ -261,20 +287,11 @@ def fix_null_check_to_monadic(
 
 
 def _to_map_expression(return_text: str, var_name: str) -> str:
-    """Convert a return expression into a .map() call.
+    """Convert a return expression into a .map() lambda call.
 
-    E.g. 'user.getName()' with var='user' -> '.map(User::getName)'
-    Falls back to lambda if the expression is complex.
+    E.g. 'user.getName()' with var='user' -> '.map(user -> user.getName())'
+    Always uses lambda form since the variable type is not reliably available.
     """
-    # Simple case: var.method()
-    if return_text.startswith(f"{var_name}.") and return_text.endswith("()"):
-        method = return_text[len(var_name) + 1 : -2]
-        if method.isidentifier():
-            # Use method reference style — capitalize var name as type guess
-            type_name = var_name[0].upper() + var_name[1:] if var_name else var_name
-            return f".map({type_name}::{method})"
-
-    # Fallback: lambda expression
     return f".map({var_name} -> {return_text})"
 
 

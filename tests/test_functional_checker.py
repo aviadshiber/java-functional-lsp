@@ -116,6 +116,22 @@ class TestFrozenMutation:
 
 
 class TestNullCheckToMonadic:
+    def test_detects_reversed_null_check(self) -> None:
+        """null != x (reversed operand order) should also trigger."""
+        source = b"""
+        class T {
+            String f(User user) {
+                if (null != user) {
+                    return user.getName();
+                }
+                return null;
+            }
+        }
+        """
+        diags = parse_and_analyze(FunctionalChecker(), source)
+        codes = [d.code for d in diags]
+        assert "null-check-to-monadic" in codes
+
     def test_detects_simple_null_check(self) -> None:
         source = b"""
         class T {
@@ -287,6 +303,43 @@ class TestImpureMethod:
         assert len(impure_diags) == 1
         assert impure_diags[0].data is not None
         assert impure_diags[0].data.fix_type == "EXTRACT_PURE_LOGIC"
+
+    def test_strict_purity_uses_warning_severity(self) -> None:
+        """strictPurity: true should elevate impure-method to WARNING."""
+        source = b"""
+        class T {
+            String f(String input) {
+                String result = input.trim();
+                System.out.println(result);
+                return result;
+            }
+        }
+        """
+        from java_functional_lsp.analyzers.base import Severity
+
+        config = {"strictPurity": True}
+        diags = parse_and_analyze(FunctionalChecker(), source, config)
+        impure_diags = [d for d in diags if d.code == "impure-method"]
+        assert len(impure_diags) == 1
+        assert impure_diags[0].severity == Severity.WARNING
+
+    def test_default_uses_hint_severity(self) -> None:
+        """Default config should use HINT severity for impure-method."""
+        source = b"""
+        class T {
+            String f(String input) {
+                String result = input.trim();
+                System.out.println(result);
+                return result;
+            }
+        }
+        """
+        from java_functional_lsp.analyzers.base import Severity
+
+        diags = parse_and_analyze(FunctionalChecker(), source)
+        impure_diags = [d for d in diags if d.code == "impure-method"]
+        assert len(impure_diags) == 1
+        assert impure_diags[0].severity == Severity.HINT
 
     def test_disabled_by_config(self) -> None:
         source = b"""
