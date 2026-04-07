@@ -20,6 +20,15 @@ class Severity(IntEnum):
 
 
 @dataclass(frozen=True)
+class DiagnosticData:
+    """Machine-readable metadata for AI agents and automated refactoring."""
+
+    fix_type: str  # e.g. "REPLACE_WITH_VAVR_LIST", "WRAP_IN_OPTION"
+    target_library: str  # e.g. "io.vavr.collection.List"
+    rationale: str  # human+machine readable explanation
+
+
+@dataclass(frozen=True)
 class Diagnostic:
     line: int  # 0-based
     col: int
@@ -29,6 +38,7 @@ class Diagnostic:
     code: str  # rule ID
     message: str
     source: str = "java-functional-lsp"
+    data: DiagnosticData | None = None
 
 
 class Analyzer(Protocol):

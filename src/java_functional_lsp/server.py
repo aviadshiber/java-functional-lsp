@@ -21,9 +21,11 @@ from pygls.uris import to_fs_path
 from .analyzers.base import Analyzer, Severity, get_parser, is_excluded, is_suppressed
 from .analyzers.base import Diagnostic as LintDiagnostic
 from .analyzers.exception_checker import ExceptionChecker
+from .analyzers.functional_checker import FunctionalChecker
 from .analyzers.mutation_checker import MutationChecker
 from .analyzers.null_checker import NullChecker
 from .analyzers.spring_checker import SpringChecker
+from .fixes import get_fix
 from .proxy import JdtlsProxy
 
 logger = logging.getLogger(__name__)
@@ -35,7 +37,13 @@ _SEVERITY_MAP = {
     Severity.HINT: lsp.DiagnosticSeverity.Hint,
 }
 
-_ANALYZERS: list[Analyzer] = [NullChecker(), ExceptionChecker(), MutationChecker(), SpringChecker()]
+_ANALYZERS: list[Analyzer] = [
+    NullChecker(),
+    ExceptionChecker(),
+    MutationChecker(),
+    SpringChecker(),
+    FunctionalChecker(),
+]
 
 _converter = cattrs.Converter()
 
@@ -89,6 +97,13 @@ def _load_config(workspace_root: str | None) -> dict[str, Any]:
 
 def _to_lsp_diagnostic(diag: LintDiagnostic) -> lsp.Diagnostic:
     """Convert an internal diagnostic to an LSP diagnostic."""
+    data = None
+    if diag.data is not None:
+        data = {
+            "fixType": diag.data.fix_type,
+            "targetLibrary": diag.data.target_library,
+            "rationale": diag.data.rationale,
+        }
     return lsp.Diagnostic(
         range=lsp.Range(
             start=lsp.Position(line=diag.line, character=diag.col),
@@ -98,6 +113,7 @@ def _to_lsp_diagnostic(diag: LintDiagnostic) -> lsp.Diagnostic:
         code=diag.code,
         source=diag.source,
         message=diag.message,
+        data=data,
     )
 
 
@@ -210,6 +226,9 @@ def on_initialize(params: lsp.InitializeParams) -> lsp.InitializeResult:
             definition_provider=True,
             references_provider=True,
             document_symbol_provider=True,
+            code_action_provider=lsp.CodeActionOptions(
+                code_action_kinds=[lsp.CodeActionKind.QuickFix],
+            ),
         )
     )
 
@@ -356,6 +375,59 @@ async def on_document_symbol(params: lsp.DocumentSymbolParams) -> list[lsp.Docum
         return [_converter.structure(sym, lsp.DocumentSymbol) for sym in result]
     except Exception:
         return None
+
+
+# --- Code actions (quick fixes) ---
+
+# Rule IDs that have fix generators
+_FIXABLE_RULES = {"frozen-mutation", "null-check-to-monadic", "null-return"}
+
+# Human-readable titles for code actions
+_FIX_TITLES: dict[str, str] = {
+    "frozen-mutation": "Switch to Vavr Immutable Collection",
+    "null-check-to-monadic": "Convert to Option monadic flow",
+    "null-return": "Replace with Option.none()",
+}
+
+
+@server.feature(lsp.TEXT_DOCUMENT_CODE_ACTION)
+def on_code_action(params: lsp.CodeActionParams) -> list[lsp.CodeAction] | None:
+    """Return quick-fix code actions for functional diagnostics."""
+    doc = server.workspace.get_text_document(params.text_document.uri)
+    uri = params.text_document.uri
+    actions: list[lsp.CodeAction] = []
+
+    for diag in params.context.diagnostics:
+        if diag.source != "java-functional-lsp":
+            continue
+        rule_id = diag.code if isinstance(diag.code, str) else str(diag.code) if diag.code is not None else ""
+        if rule_id not in _FIXABLE_RULES:
+            continue
+
+        fix_fn = get_fix(rule_id)
+        if fix_fn is None:
+            continue
+
+        try:
+            workspace_edit = fix_fn(uri, doc.source, diag.range, server._config)
+        except Exception as e:
+            logger.error("Fix generator for %s failed: %s", rule_id, e)
+            continue
+
+        if workspace_edit is None:
+            continue
+
+        title = _FIX_TITLES.get(rule_id, f"Fix {rule_id}")
+        actions.append(
+            lsp.CodeAction(
+                title=title,
+                kind=lsp.CodeActionKind.QuickFix,
+                diagnostics=[diag],
+                edit=workspace_edit,
+            )
+        )
+
+    return actions if actions else None
 
 
 # --- Entry point ---

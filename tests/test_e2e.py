@@ -175,6 +175,14 @@ class TestE2EInitialize:
         caps = result.get("capabilities", {})
         assert "textDocumentSync" in caps
 
+    def test_code_action_capability(self, server: subprocess.Popen[bytes]) -> None:
+        """Server should advertise code action capability."""
+        response = _initialize(server)
+        assert response is not None
+        result = response.get("result", {})
+        caps = result.get("capabilities", {})
+        assert "codeActionProvider" in caps
+
     def test_server_name(self, server: subprocess.Popen[bytes]) -> None:
         """Server should identify itself."""
         response = _initialize(server)
@@ -374,3 +382,67 @@ class TestE2ESuppressWarnings:
         # f() suppressed, g() not — should have exactly 1 null-return diagnostic on line 4 (g)
         assert len(null_diags) == 1
         assert null_diags[0]["range"]["start"]["line"] == 4
+
+
+class TestE2EDiagnosticData:
+    def test_diagnostics_include_data_field(self, server: subprocess.Popen[bytes], tmp_path: Path) -> None:
+        """Diagnostics should include machine-readable data payload for AI agents."""
+        java_file = tmp_path / "Data.java"
+        java_file.write_text("class T { String f() { return null; } }")
+        uri = java_file.as_uri()
+
+        _initialize(server, root_uri=tmp_path.as_uri())
+        _did_open(server, uri, java_file.read_text())
+
+        msg = _wait_diagnostics(server)
+        assert msg is not None
+        null_diags = [d for d in msg["params"]["diagnostics"] if d["code"] == "null-return"]
+        assert len(null_diags) == 1
+        data = null_diags[0].get("data")
+        assert data is not None
+        assert "fixType" in data
+        assert "targetLibrary" in data
+        assert "rationale" in data
+        assert data["fixType"] == "WRAP_IN_OPTION"
+        assert data["targetLibrary"] == "io.vavr.control.Option"
+
+
+class TestE2ECodeAction:
+    def test_code_action_returns_quickfix(self, server: subprocess.Popen[bytes], tmp_path: Path) -> None:
+        """Code action request for a fixable diagnostic should return a quick fix."""
+        java_file = tmp_path / "Action.java"
+        java_file.write_text("class T { String f() { return null; } }")
+        uri = java_file.as_uri()
+
+        _initialize(server, root_uri=tmp_path.as_uri())
+        _did_open(server, uri, java_file.read_text())
+
+        msg = _wait_diagnostics(server)
+        assert msg is not None
+        null_diags = [d for d in msg["params"]["diagnostics"] if d["code"] == "null-return"]
+        assert len(null_diags) >= 1
+
+        # Request code actions
+        _send(
+            server,
+            {
+                "jsonrpc": "2.0",
+                "id": 100,
+                "method": "textDocument/codeAction",
+                "params": {
+                    "textDocument": {"uri": uri},
+                    "range": null_diags[0]["range"],
+                    "context": {"diagnostics": null_diags},
+                },
+            },
+        )
+
+        response = _read_lsp(server)
+        assert response is not None
+        result = response.get("result")
+        assert result is not None
+        assert len(result) >= 1
+        action = result[0]
+        assert action["kind"] == "quickfix"
+        assert "edit" in action
+        assert action["title"] == "Replace with Option.none()"
