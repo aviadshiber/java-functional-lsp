@@ -92,7 +92,6 @@ class TestFixFrozenMutation:
             import_edits = [e for e in edits if "import" in e.new_text]
             assert len(import_edits) == 0
 
-
     def test_no_import_when_disabled(self) -> None:
         source = (
             "import java.util.List;\n"

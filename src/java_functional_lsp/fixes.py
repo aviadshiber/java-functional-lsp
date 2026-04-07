@@ -159,9 +159,7 @@ def fix_frozen_mutation(
     return lsp.WorkspaceEdit(changes={uri: edits})
 
 
-def _add_vavr_decl_rewrite(
-    tree: Any, var_name: str, edits: list[lsp.TextEdit], collection_type: str = "List"
-) -> None:
+def _add_vavr_decl_rewrite(tree: Any, var_name: str, edits: list[lsp.TextEdit], collection_type: str = "List") -> None:
     """Find the variable declaration for var_name and rewrite its type + init to Vavr."""
     var_bytes = var_name.encode("utf-8")
     for decl in find_nodes(tree.root_node, "local_variable_declaration"):
