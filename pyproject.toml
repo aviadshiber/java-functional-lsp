@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "java-functional-lsp"
-version = "0.6.2"
+version = "0.6.3"
 description = "Java LSP server enforcing functional programming best practices — null safety, immutability, no exceptions"
 readme = "README.md"
 license = { text = "MIT" }
@@ -79,6 +79,7 @@ ignore = ["PLR0913", "PLC0415", "PLW0603", "PLW0602"]
 "__init__.py" = ["E402"]
 "**/test_*.py" = ["PLR2004"]
 "**/cli.py" = ["T20", "PLR0912", "PLR2004"]
+"**/fixes.py" = ["PLR0911", "PLR0912"]
 
 [tool.ruff.format]
 quote-style = "double"

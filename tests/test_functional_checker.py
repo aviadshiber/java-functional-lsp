@@ -349,6 +349,29 @@ class TestNullCheckToMonadic:
         diags = parse_and_analyze(FunctionalChecker(), source)
         assert any(d.code == "null-check-to-monadic" for d in diags)
 
+    def test_inner_chained_if_suppressed(self) -> None:
+        """Inner if in a chain should NOT produce a separate diagnostic."""
+        source = b"""
+    class T {
+        int f(String key) {
+            Integer val = map.get(key);
+            if (val != null) {
+                return val;
+            } else {
+                val = fallback.get(key);
+                if (val != null) {
+                    return val;
+                }
+            }
+            return defaultVal;
+        }
+    }
+    """
+        diags = parse_and_analyze(FunctionalChecker(), source)
+        null_check_diags = [d for d in diags if d.code == "null-check-to-monadic"]
+        # Should be exactly 1 (outer if), not 2
+        assert len(null_check_diags) == 1
+
 
 class TestImpureMethod:
     def test_detects_mixed_method(self) -> None:

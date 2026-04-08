@@ -513,6 +513,54 @@ class TestE2ECodeAction:
         assert "edit" in action
         assert action["title"] == "Convert to Option monadic flow"
 
+    def test_chained_null_check_code_action(self, server: subprocess.Popen[bytes], tmp_path: Path) -> None:
+        """E2E: chained null-check should produce code action with orElse chain."""
+        java_file = tmp_path / "Chained.java"
+        java_file.write_text(
+            "class T {\n"
+            "    int f(String key) {\n"
+            "        Integer val = map.get(key);\n"
+            "        if (val != null) {\n"
+            "            return val;\n"
+            "        } else {\n"
+            "            val = fallback.get(key);\n"
+            "            if (val != null) {\n"
+            "                return val;\n"
+            "            }\n"
+            "        }\n"
+            "        return defaultVal;\n"
+            "    }\n"
+            "}\n"
+        )
+        uri = java_file.as_uri()
+
+        _initialize(server, root_uri=tmp_path.as_uri())
+        _did_open(server, uri, java_file.read_text())
+
+        msg = _wait_diagnostics(server)
+        assert msg is not None
+        monadic_diags = [d for d in msg["params"]["diagnostics"] if d["code"] == "null-check-to-monadic"]
+        assert len(monadic_diags) >= 1
+
+        response = _request_code_actions(server, uri, monadic_diags[0]["range"], monadic_diags)
+        assert response is not None
+        result = response.get("result")
+        assert result is not None
+        assert len(result) >= 1
+
+        # Find the quickfix action
+        quickfix_actions = [a for a in result if a.get("kind") == "quickfix"]
+        assert len(quickfix_actions) >= 1
+        action = quickfix_actions[0]
+        assert "edit" in action
+
+        # Verify the edit contains an orElse chain
+        changes = action["edit"].get("changes", {})
+        all_new_text = " ".join(e["newText"] for edits in changes.values() for e in edits if "newText" in e)
+        assert "Option.of(" in all_new_text
+        assert ".orElse(" in all_new_text
+        assert ".getOrElse(" in all_new_text
+
     def test_code_action_unknown_source_returns_none(self, server: subprocess.Popen[bytes], tmp_path: Path) -> None:
         """Code action request with diagnostics from a non-java-functional-lsp source should return null."""
         java_file = tmp_path / "Other.java"
