@@ -235,6 +235,19 @@ class FunctionalChecker:
             if not self._references_var(stmt, checked_var):
                 continue
 
+            # Suppress inner if_nodes that are part of an outer chained null-check.
+            # Walk: if_node → parent block → check if that block is the "alternative"
+            # of an outer if_statement that null-checks the same variable.
+            parent_block = if_node.parent
+            if parent_block is not None and parent_block.type == "block":
+                outer_if = parent_block.parent
+                if outer_if is not None and outer_if.type == "if_statement":
+                    alt_node = outer_if.child_by_field_name("alternative")
+                    if alt_node is not None and alt_node == parent_block:
+                        outer_condition = outer_if.child_by_field_name("condition")
+                        if outer_condition is not None and extract_null_check_var(outer_condition) == checked_var:
+                            continue  # outer if already carries the diagnostic
+
             diagnostics.append(
                 Diagnostic(
                     line=if_node.start_point[0],

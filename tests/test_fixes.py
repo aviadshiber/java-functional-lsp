@@ -401,6 +401,227 @@ class TestFixNullCheckToMonadic:
         assert ".map(" not in rewrite[0].new_text
         assert ".getOrElse(defaultVal)" in rewrite[0].new_text
 
+    def test_chained_two_level_identity(self) -> None:
+        """Two-level chain -> Option.of().orElse().getOrElse()."""
+        source = (
+            "class T {\n"
+            "    int f(String key) {\n"
+            "        Integer val = map.get(key);\n"
+            "        if (val != null) {\n"
+            "            return val;\n"
+            "        } else {\n"
+            "            val = fallback.get(key);\n"
+            "            if (val != null) {\n"
+            "                return val;\n"
+            "            }\n"
+            "        }\n"
+            "        return defaultVal;\n"
+            "    }\n"
+            "}"
+        )
+        result = fix_null_check_to_monadic("file:///test.java", source, _range(3, 8, 10, 9), {})
+        assert result is not None
+        assert result.changes is not None
+        edits = result.changes["file:///test.java"]
+        rewrite = [e for e in edits if "Option.of(" in e.new_text]
+        assert len(rewrite) == 1
+        text = rewrite[0].new_text
+        assert "Option.of(map.get(key))" in text
+        assert ".orElse(() -> Option.of(fallback.get(key)))" in text
+        assert ".getOrElse(defaultVal)" in text
+
+    def test_chained_three_level_identity(self) -> None:
+        """Three-level chain -> two .orElse() calls."""
+        source = (
+            "class T {\n"
+            "    int f(String key) {\n"
+            "        Integer val = m1.get(key);\n"
+            "        if (val != null) {\n"
+            "            return val;\n"
+            "        } else {\n"
+            "            val = m2.get(key);\n"
+            "            if (val != null) {\n"
+            "                return val;\n"
+            "            } else {\n"
+            "                val = m3.get(key);\n"
+            "                if (val != null) {\n"
+            "                    return val;\n"
+            "                }\n"
+            "            }\n"
+            "        }\n"
+            "        return defaultVal;\n"
+            "    }\n"
+            "}"
+        )
+        result = fix_null_check_to_monadic("file:///test.java", source, _range(3, 8, 15, 9), {})
+        assert result is not None
+        assert result.changes is not None
+        edits = result.changes["file:///test.java"]
+        rewrite = [e for e in edits if "Option.of(" in e.new_text]
+        assert len(rewrite) == 1
+        text = rewrite[0].new_text
+        assert text.count(".orElse(") == 2
+
+    def test_chained_lazy_default(self) -> None:
+        """Method call default -> .getOrElse(() -> compute())."""
+        source = (
+            "class T {\n"
+            "    int f(String key) {\n"
+            "        Integer val = map.get(key);\n"
+            "        if (val != null) {\n"
+            "            return val;\n"
+            "        } else {\n"
+            "            val = fallback.get(key);\n"
+            "            if (val != null) {\n"
+            "                return val;\n"
+            "            }\n"
+            "        }\n"
+            "        return computeDefault();\n"
+            "    }\n"
+            "}"
+        )
+        result = fix_null_check_to_monadic("file:///test.java", source, _range(3, 8, 10, 9), {})
+        assert result is not None
+        assert result.changes is not None
+        edits = result.changes["file:///test.java"]
+        rewrite = [e for e in edits if "Option.of(" in e.new_text]
+        assert len(rewrite) == 1
+        assert ".getOrElse(() -> computeDefault())" in rewrite[0].new_text
+
+    def test_chained_null_default_returns_none(self) -> None:
+        """Null default -> no code action (return type change unsafe)."""
+        source = (
+            "class T {\n"
+            "    Integer f(String key) {\n"
+            "        Integer val = map.get(key);\n"
+            "        if (val != null) {\n"
+            "            return val;\n"
+            "        } else {\n"
+            "            val = fallback.get(key);\n"
+            "            if (val != null) {\n"
+            "                return val;\n"
+            "            }\n"
+            "        }\n"
+            "        return null;\n"
+            "    }\n"
+            "}"
+        )
+        result = fix_null_check_to_monadic("file:///test.java", source, _range(3, 8, 10, 9), {})
+        assert result is None
+
+    def test_chained_non_identity_returns_none(self) -> None:
+        """Non-identity return in chain -> no code action."""
+        source = (
+            "class T {\n"
+            "    String f(String key) {\n"
+            "        String val = map.get(key);\n"
+            "        if (val != null) {\n"
+            "            return val.trim();\n"
+            "        } else {\n"
+            "            val = fallback.get(key);\n"
+            "            if (val != null) {\n"
+            "                return val;\n"
+            "            }\n"
+            "        }\n"
+            "        return defaultVal;\n"
+            "    }\n"
+            "}"
+        )
+        result = fix_null_check_to_monadic("file:///test.java", source, _range(3, 8, 10, 9), {})
+        assert result is None
+
+    def test_chained_extra_statements_returns_none(self) -> None:
+        """Side effects in else -> no code action."""
+        source = (
+            "class T {\n"
+            "    int f(String key) {\n"
+            "        Integer val = map.get(key);\n"
+            "        if (val != null) {\n"
+            "            return val;\n"
+            "        } else {\n"
+            "            logger.debug(key);\n"
+            "            val = fallback.get(key);\n"
+            "            if (val != null) {\n"
+            "                return val;\n"
+            "            }\n"
+            "        }\n"
+            "        return defaultVal;\n"
+            "    }\n"
+            "}"
+        )
+        result = fix_null_check_to_monadic("file:///test.java", source, _range(3, 8, 11, 9), {})
+        assert result is None
+
+    def test_chained_no_default_return_returns_none(self) -> None:
+        """No return after if/else -> no code action."""
+        source = (
+            "class T {\n"
+            "    void f(String key) {\n"
+            "        Integer val = map.get(key);\n"
+            "        if (val != null) {\n"
+            "            return val;\n"
+            "        } else {\n"
+            "            val = fallback.get(key);\n"
+            "            if (val != null) {\n"
+            "                return val;\n"
+            "            }\n"
+            "        }\n"
+            "        doSomething();\n"
+            "    }\n"
+            "}"
+        )
+        result = fix_null_check_to_monadic("file:///test.java", source, _range(3, 8, 10, 9), {})
+        assert result is None
+
+    def test_chained_declaration_not_adjacent_returns_none(self) -> None:
+        """Declaration separated from if by other statements -> no code action."""
+        source = (
+            "class T {\n"
+            "    int f(String key) {\n"
+            "        Integer val = map.get(key);\n"
+            "        log(val);\n"
+            "        if (val != null) {\n"
+            "            return val;\n"
+            "        } else {\n"
+            "            val = fallback.get(key);\n"
+            "            if (val != null) {\n"
+            "                return val;\n"
+            "            }\n"
+            "        }\n"
+            "        return defaultVal;\n"
+            "    }\n"
+            "}"
+        )
+        result = fix_null_check_to_monadic("file:///test.java", source, _range(4, 8, 11, 9), {})
+        assert result is None
+
+    def test_chained_complex_fallback_parenthesized(self) -> None:
+        """Ternary in fallback expression -> parenthesized in output."""
+        source = (
+            "class T {\n"
+            "    int f(String key) {\n"
+            "        Integer val = map.get(key);\n"
+            "        if (val != null) {\n"
+            "            return val;\n"
+            "        } else {\n"
+            "            val = useBackup ? backup.get(key) : other.get(key);\n"
+            "            if (val != null) {\n"
+            "                return val;\n"
+            "            }\n"
+            "        }\n"
+            "        return defaultVal;\n"
+            "    }\n"
+            "}"
+        )
+        result = fix_null_check_to_monadic("file:///test.java", source, _range(3, 8, 10, 9), {})
+        assert result is not None
+        assert result.changes is not None
+        edits = result.changes["file:///test.java"]
+        rewrite = [e for e in edits if "Option.of(" in e.new_text]
+        assert len(rewrite) == 1
+        # Ternary should be parenthesized
+        assert "(useBackup ? backup.get(key) : other.get(key))" in rewrite[0].new_text
+
 
 class TestFixNullReturn:
     def test_replaces_null_with_option_none(self) -> None:

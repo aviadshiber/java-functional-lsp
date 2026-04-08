@@ -5,6 +5,7 @@ Each fix generator takes document context and returns a list of TextEdits.
 
 from __future__ import annotations
 
+import logging
 import re
 from collections.abc import Callable
 from typing import Any
@@ -13,6 +14,11 @@ from lsprotocol import types as lsp
 from tree_sitter import Node, Tree
 
 from .analyzers.base import extract_null_check_var, find_ancestor, find_nodes, get_parser
+
+logger = logging.getLogger(__name__)
+
+_MAX_CHAIN_DEPTH = 10
+_COMPLEX_EXPR_TYPES: frozenset[str] = frozenset({"ternary_expression", "lambda_expression", "assignment_expression"})
 
 # Type for fix generator functions: (uri, source, diag_range, config, *, tree, lines) -> WorkspaceEdit | None
 FixGenerator = Callable[..., lsp.WorkspaceEdit | None]
@@ -309,6 +315,185 @@ def _else_terminal(alternative: Node) -> str | None:
     return f".getOrElse(() -> {val_text})"
 
 
+def _safe_expr_text(node: Node) -> str:
+    """Extract expression text, parenthesizing complex expressions to avoid syntax issues."""
+    text = node.text.decode("utf-8") if node.text else ""
+    if node.type in _COMPLEX_EXPR_TYPES:
+        return f"({text})"
+    return text
+
+
+def _is_identity_return(consequence: Node | None, var_name: str) -> bool:
+    """Return True if consequence block has exactly one return_statement returning var_name."""
+    if consequence is None:
+        return False
+    stmts = [c for c in consequence.named_children if c.type not in ("line_comment", "block_comment")]
+    if len(stmts) != 1 or stmts[0].type != "return_statement":
+        return False
+    expr_children = list(stmts[0].named_children)
+    if not expr_children:
+        return False
+    ret_node = expr_children[0]
+    return ret_node.type == "identifier" and ret_node.text == var_name.encode("utf-8")
+
+
+def _collect_chained_fallbacks(alternative: Node, var_name: str) -> list[str] | None:
+    """Collect fallback expressions from chained identity null-checks.
+
+    Iteratively walks nested else blocks. Each level must have exactly:
+    1. expression_statement with assignment_expression (left == var_name)
+    2. if_statement with null-check on var_name and identity return
+
+    Returns list of fallback expression texts, or None if pattern doesn't match.
+    """
+    fallbacks: list[str] = []
+    current_alt = alternative
+    var_bytes = var_name.encode("utf-8")
+
+    for _ in range(_MAX_CHAIN_DEPTH):
+        stmts = [c for c in current_alt.named_children if c.type not in ("line_comment", "block_comment")]
+        if len(stmts) != 2:  # noqa: PLR2004
+            return None
+
+        assign_stmt, nested_if = stmts[0], stmts[1]
+
+        # Validate assignment statement
+        if assign_stmt.type != "expression_statement":
+            return None
+        assign = next(
+            (c for c in assign_stmt.named_children if c.type == "assignment_expression"),
+            None,
+        )
+        if assign is None:
+            return None
+        left = assign.child_by_field_name("left")
+        right = assign.child_by_field_name("right")
+        if left is None or right is None or left.text != var_bytes:
+            return None
+
+        # Validate nested if_statement
+        if nested_if.type != "if_statement":
+            return None
+        condition = nested_if.child_by_field_name("condition")
+        if condition is None or extract_null_check_var(condition) != var_bytes:
+            return None
+
+        # Check identity return in consequence
+        consequence = nested_if.child_by_field_name("consequence")
+        if not _is_identity_return(consequence, var_name):
+            return None
+
+        # Extract fallback expression text, parenthesize if complex
+        fallback_text = _safe_expr_text(right)
+        fallbacks.append(fallback_text)
+
+        # Continue to next level if there is a nested alternative
+        next_alt = nested_if.child_by_field_name("alternative")
+        if next_alt is None:
+            return fallbacks
+        current_alt = next_alt
+
+    return None  # exceeded max depth
+
+
+def _try_chained_null_rewrite(if_node: Node, var_name: str) -> lsp.TextEdit | None:
+    """Attempt to rewrite a chained identity null-check pattern to Option.of().orElse().getOrElse().
+
+    The pattern is:
+        T var = expr1;
+        if (var != null) { return var; }
+        else {
+            var = expr2;
+            if (var != null) { return var; }
+            [else { var = expr3; if (var != null) { return var; } }]
+        }
+        return default;
+
+    Returns a TextEdit replacing the variable declaration through the final return, or None.
+    """
+    # 1. Verify consequence is identity return
+    consequence = if_node.child_by_field_name("consequence")
+    if not _is_identity_return(consequence, var_name):
+        return None
+
+    # 2. Require an else branch
+    alternative = if_node.child_by_field_name("alternative")
+    if alternative is None:
+        return None
+
+    # 3. prev_named_sibling must be local_variable_declaration containing var_name
+    prev_sib = if_node.prev_named_sibling
+    if prev_sib is None or prev_sib.type != "local_variable_declaration":
+        return None
+
+    # Extract initializer from the declarator
+    var_bytes = var_name.encode("utf-8")
+    initial_expr: str | None = None
+    for declarator in prev_sib.children:
+        if declarator.type != "variable_declarator":
+            continue
+        name_node = declarator.child_by_field_name("name")
+        if name_node is None or name_node.text != var_bytes:
+            continue
+        value_node = declarator.child_by_field_name("value")
+        if value_node is None:
+            return None
+        initial_expr = _safe_expr_text(value_node)
+        break
+
+    if initial_expr is None:
+        return None
+
+    # 4. Collect chained fallbacks from the else branch
+    fallbacks = _collect_chained_fallbacks(alternative, var_name)
+    if fallbacks is None:
+        return None
+
+    # 5. next_named_sibling must be return_statement with non-null value
+    next_sib = if_node.next_named_sibling
+    if next_sib is None or next_sib.type != "return_statement":
+        return None
+
+    ret_children = list(next_sib.named_children)
+    if not ret_children:
+        return None
+
+    default_node = ret_children[0]
+    # Null default → changing return type is unsafe, no code action
+    if default_node.type == "null_literal":
+        return None
+
+    default_text = default_node.text.decode("utf-8") if default_node.text else ""
+    if _is_eager(default_node):
+        terminal = f".getOrElse({default_text})"
+    else:
+        terminal = f".getOrElse(() -> {default_text})"
+
+    # 6. Build replacement text
+    indent = " " * prev_sib.start_point[1]
+    align = " " * len("return ")
+    lines_out: list[str] = [f"return Option.of({initial_expr})"]
+    for fb in fallbacks:
+        lines_out.append(f"{indent}{align}.orElse(() -> Option.of({fb}))")
+    lines_out[-1] += terminal + ";"
+
+    # Join all but the last with newline (last has the semicolon already)
+    new_text = "\n".join(lines_out)
+
+    # 7. Replace range from variable declaration start through final return end
+    replace_start = lsp.Position(line=prev_sib.start_point[0], character=prev_sib.start_point[1])
+    replace_end = lsp.Position(line=next_sib.end_point[0], character=next_sib.end_point[1])
+
+    logger.debug(
+        "Chained null-check rewrite: %d fallbacks, lines %d-%d",
+        len(fallbacks),
+        prev_sib.start_point[0],
+        next_sib.end_point[0],
+    )
+
+    return lsp.TextEdit(range=lsp.Range(start=replace_start, end=replace_end), new_text=new_text)
+
+
 def _build_monadic_rewrite(if_node: Node, var_name: str) -> lsp.TextEdit | None:
     """Build the Option.of().map() replacement TextEdit for a null-check if-block.
 
@@ -354,9 +539,15 @@ def _build_monadic_rewrite(if_node: Node, var_name: str) -> lsp.TextEdit | None:
         terminal = ""  # bare Option — no .getOrNull()
     else:
         else_result = _else_terminal(alternative)
-        if else_result is None:
-            return None  # complex else
-        terminal = else_result
+        if else_result is not None:
+            terminal = else_result
+        else:
+            # Try chained identity null-check pattern
+            if is_identity:
+                chained = _try_chained_null_rewrite(if_node, var_name)
+                if chained is not None:
+                    return chained
+            return None  # complex else, diagnostic only
 
     # --- Assemble new_text ---
     base = f"Option.of({var_name})"
