@@ -111,10 +111,10 @@ def _find_frozen_decl_info(tree: Tree, var_name: str) -> tuple[str, Node | None]
             collection_type = "List"
             if type_node is not None and type_node.text:
                 type_text = type_node.text.decode("utf-8")
-                if type_text.startswith("Set"):
-                    collection_type = "Set"
-                elif type_text.startswith("Map"):
+                if any(kw in type_text for kw in ("SortedMap", "Map")):
                     collection_type = "Map"
+                elif any(kw in type_text for kw in ("Multiset", "SortedSet", "Set")):
+                    collection_type = "Set"
             return collection_type, decl
     return "List", None
 
@@ -257,8 +257,67 @@ def _extract_null_check_var_str(if_node: Node) -> str | None:
     return var_bytes.decode("utf-8")
 
 
+_EAGER_NODE_TYPES: frozenset[str] = frozenset(
+    {
+        "string_literal",
+        "number_literal",
+        "decimal_integer_literal",
+        "hex_integer_literal",
+        "octal_integer_literal",
+        "binary_integer_literal",
+        "decimal_floating_point_literal",
+        "boolean_literal",
+        "character_literal",
+        "identifier",
+        "field_access",
+    }
+)
+
+
+def _is_eager(node: Node) -> bool:
+    """Return True if the node is a literal or simple identifier (safe to use eagerly in getOrElse)."""
+    return node.type in _EAGER_NODE_TYPES
+
+
+def _else_terminal(alternative: Node) -> str | None:
+    """Derive the terminal suffix (.getOrElse / '') from an else branch node.
+
+    Returns:
+        ``""``  — else returns null (bare ``Option.of(x)`` is the right result).
+        ``".getOrElse(...)"`` — else returns a simple/eager value.
+        ``".getOrElse(() -> ...)"`` — else returns a lazy expression.
+        ``None`` — complex else that cannot be rewritten.
+    """
+    if alternative.type == "return_statement":
+        else_stmts = [alternative]
+    else:
+        else_stmts = [c for c in alternative.named_children if c.type not in ("line_comment", "block_comment")]
+
+    if len(else_stmts) != 1 or else_stmts[0].type != "return_statement":
+        return None  # complex else
+
+    val_children = list(else_stmts[0].named_children)
+    if not val_children:
+        return None
+
+    val_node = val_children[0]
+    val_text = val_node.text.decode("utf-8") if val_node.text else ""
+    if val_node.type == "null_literal":
+        return ""
+    if _is_eager(val_node):
+        return f".getOrElse({val_text})"
+    return f".getOrElse(() -> {val_text})"
+
+
 def _build_monadic_rewrite(if_node: Node, var_name: str) -> lsp.TextEdit | None:
-    """Build the Option.of().map() replacement TextEdit for a null-check if-block."""
+    """Build the Option.of().map() replacement TextEdit for a null-check if-block.
+
+    Handles four cases:
+    - Identity return (return x) + null fallback → ``return Option.of(x);``
+    - Non-identity return + null fallback → ``return Option.of(x)\\n.map(it -> ...);``
+    - Identity return + else value → ``return Option.of(x).getOrElse(val);``
+    - Non-identity return + else value → ``return Option.of(x)\\n.map(it -> ...).getOrElse(val);``
+    """
     consequence = if_node.child_by_field_name("consequence")
     if consequence is None:
         return None
@@ -272,21 +331,43 @@ def _build_monadic_rewrite(if_node: Node, var_name: str) -> lsp.TextEdit | None:
         return None
 
     return_text = expr_children[0].text.decode("utf-8") if expr_children[0].text else ""
-    map_expr = _to_map_expression(return_text, var_name)
+    is_identity = return_text == var_name
 
     replace_start = lsp.Position(line=if_node.start_point[0], character=if_node.start_point[1])
     replace_end = lsp.Position(line=if_node.end_point[0], character=if_node.end_point[1])
 
-    # Extend range to include following `return null;`
-    next_sib = if_node.next_named_sibling
-    if next_sib is not None and next_sib.type == "return_statement":
-        if any(c.type == "null_literal" for c in next_sib.named_children):
-            replace_end = lsp.Position(line=next_sib.end_point[0], character=next_sib.end_point[1])
-
     indent = " " * if_node.start_point[1]
-    # Align the chained call to the opening parenthesis of Option.of(...)
-    align = " " * (len("return Option.of(") + len(var_name) + 1)
-    new_text = f"return Option.of({var_name})\n{indent}{align}{map_expr}.getOrNull();"
+
+    # --- Determine terminal suffix and (possibly) extend the replace range ---
+    alternative = if_node.child_by_field_name("alternative")
+    if alternative is None:
+        # No else branch — look for an immediately following `return null;`
+        next_sib = if_node.next_named_sibling
+        is_null_return = (
+            next_sib is not None
+            and next_sib.type == "return_statement"
+            and any(c.type == "null_literal" for c in next_sib.named_children)
+        )
+        if not is_null_return or next_sib is None:
+            return None
+        replace_end = lsp.Position(line=next_sib.end_point[0], character=next_sib.end_point[1])
+        terminal = ""  # bare Option — no .getOrNull()
+    else:
+        else_result = _else_terminal(alternative)
+        if else_result is None:
+            return None  # complex else
+        terminal = else_result
+
+    # --- Assemble new_text ---
+    base = f"Option.of({var_name})"
+    if is_identity:
+        new_text = f"return {base}{terminal};"
+    else:
+        # Align the chained call to the opening parenthesis of Option.of(...)
+        align = " " * (len("return Option.of(") + len(var_name) + 1)
+        map_expr = _to_map_expression(return_text, var_name)
+        new_text = f"return {base}\n{indent}{align}{map_expr}{terminal};"
+
     return lsp.TextEdit(range=lsp.Range(start=replace_start, end=replace_end), new_text=new_text)
 
 
@@ -336,10 +417,15 @@ def fix_null_check_to_monadic(
 def _to_map_expression(return_text: str, var_name: str) -> str:
     """Convert a return expression into a .map() lambda call.
 
-    E.g. 'user.getName()' with var='user' -> '.map(user -> user.getName())'
-    Always uses lambda form since the variable type is not reliably available.
+    Uses ``it`` as the lambda parameter to avoid shadowing the outer Java variable.
+    E.g. 'user.getName()' with var='user' -> '.map(it -> it.getName())'
     """
-    return f".map({var_name} -> {return_text})"
+    # Use 'it' as lambda param to avoid shadowing the outer variable in Java.
+    # Precompile with word-boundary anchors to avoid mangling substrings
+    # (e.g. var 's' in 's.toString()').
+    pattern = re.compile(rf"\b{re.escape(var_name)}\b")
+    lambda_body = pattern.sub("it", return_text)
+    return f".map(it -> {lambda_body})"
 
 
 def fix_null_return(

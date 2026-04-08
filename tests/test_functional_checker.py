@@ -127,6 +127,58 @@ class TestFrozenMutation:
         diags = parse_and_analyze(FunctionalChecker(), source, config)
         assert not any(d.code == "frozen-mutation" for d in diags)
 
+    def test_detects_immutable_list_of_add(self) -> None:
+        """Guava ImmutableList.of() then .add() should trigger."""
+        source = b"""
+        class T {
+            void f() {
+                List<String> list = ImmutableList.of("a", "b");
+                list.add("c");
+            }
+        }
+        """
+        diags = parse_and_analyze(FunctionalChecker(), source)
+        assert any(d.code == "frozen-mutation" for d in diags)
+
+    def test_detects_immutable_set_of_add(self) -> None:
+        """Guava ImmutableSet.of() then .add() should trigger."""
+        source = b"""
+        class T {
+            void f() {
+                Set<String> s = ImmutableSet.of("a");
+                s.add("b");
+            }
+        }
+        """
+        diags = parse_and_analyze(FunctionalChecker(), source)
+        assert any(d.code == "frozen-mutation" for d in diags)
+
+    def test_detects_immutable_map_of_put(self) -> None:
+        """Guava ImmutableMap.of() then .put() should trigger."""
+        source = b"""
+        class T {
+            void f() {
+                Map<String, Integer> m = ImmutableMap.of("a", 1);
+                m.put("b", 2);
+            }
+        }
+        """
+        diags = parse_and_analyze(FunctionalChecker(), source)
+        assert any(d.code == "frozen-mutation" for d in diags)
+
+    def test_detects_immutable_sorted_set_of_add(self) -> None:
+        """Guava ImmutableSortedSet.of() then .add() should trigger."""
+        source = b"""
+        class T {
+            void f() {
+                Set<String> s = ImmutableSortedSet.of("a");
+                s.add("b");
+            }
+        }
+        """
+        diags = parse_and_analyze(FunctionalChecker(), source)
+        assert any(d.code == "frozen-mutation" for d in diags)
+
 
 class TestNullCheckToMonadic:
     def test_detects_reversed_null_check(self) -> None:
@@ -247,6 +299,55 @@ class TestNullCheckToMonadic:
         config = {"rules": {"null-check-to-monadic": "off"}}
         diags = parse_and_analyze(FunctionalChecker(), source, config)
         assert not any(d.code == "null-check-to-monadic" for d in diags)
+
+    def test_detects_identity_return(self) -> None:
+        """if (x != null) { return x; } should still trigger — rewrite skips .map()."""
+        source = b"""
+        class T {
+            String f(User user) {
+                if (user != null) {
+                    return user;
+                }
+                return null;
+            }
+        }
+        """
+        diags = parse_and_analyze(FunctionalChecker(), source)
+        assert any(d.code == "null-check-to-monadic" for d in diags)
+
+    def test_detects_simple_else_branch(self) -> None:
+        """Simple else with single return should trigger."""
+        source = b"""
+        class T {
+            String f(User user) {
+                if (user != null) {
+                    return user.getName();
+                } else {
+                    return "unknown";
+                }
+            }
+        }
+        """
+        diags = parse_and_analyze(FunctionalChecker(), source)
+        assert any(d.code == "null-check-to-monadic" for d in diags)
+
+    def test_detects_complex_else_branch(self) -> None:
+        """Complex else should still trigger diagnostic (no code action, but agents use it)."""
+        source = b"""
+        class T {
+            String f(String key) {
+                String val = map.get(key);
+                if (val != null) {
+                    return val;
+                } else {
+                    log(key);
+                    return fallback.get(key);
+                }
+            }
+        }
+        """
+        diags = parse_and_analyze(FunctionalChecker(), source)
+        assert any(d.code == "null-check-to-monadic" for d in diags)
 
 
 class TestImpureMethod:

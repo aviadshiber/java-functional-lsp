@@ -66,6 +66,13 @@ _FROZEN_QUALIFIERS = {
     b"List",
     b"Set",
     b"Map",
+    # Guava immutable collections (same frozen semantics as List.of / Set.of)
+    b"ImmutableList",
+    b"ImmutableSet",
+    b"ImmutableMap",
+    b"ImmutableSortedSet",
+    b"ImmutableSortedMap",
+    b"ImmutableMultiset",
 }
 
 # Collections utility methods that produce frozen wrappers
