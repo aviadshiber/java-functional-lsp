@@ -21,7 +21,7 @@ _MESSAGES = {
         "Runtime Exception Risk: Mutating a frozen structure (e.g. List.of()). "
         "Use io.vavr.collection.List for safe persistent immutability."
     ),
-    "null-check-to-monadic": ("Imperative null handling: Consider monadic flow with Option.of().map().getOrNull()."),
+    "null-check-to-monadic": ("Imperative null handling: Consider monadic flow with Option.of().map().getOrElse()."),
     "impure-method": (
         "Hidden side-effect: Method mixes pure logic with IO/state mutations. "
         "Extract pure logic to a separate method; wrap side-effects in Try."
