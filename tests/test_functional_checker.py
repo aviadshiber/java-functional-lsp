@@ -166,6 +166,19 @@ class TestFrozenMutation:
         diags = parse_and_analyze(FunctionalChecker(), source)
         assert any(d.code == "frozen-mutation" for d in diags)
 
+    def test_detects_immutable_sorted_set_of_add(self) -> None:
+        """Guava ImmutableSortedSet.of() then .add() should trigger."""
+        source = b"""
+        class T {
+            void f() {
+                Set<String> s = ImmutableSortedSet.of("a");
+                s.add("b");
+            }
+        }
+        """
+        diags = parse_and_analyze(FunctionalChecker(), source)
+        assert any(d.code == "frozen-mutation" for d in diags)
+
 
 class TestNullCheckToMonadic:
     def test_detects_reversed_null_check(self) -> None:
@@ -327,12 +340,9 @@ class TestNullCheckToMonadic:
                 if (val != null) {
                     return val;
                 } else {
-                    val = fallback.get(key);
-                    if (val != null) {
-                        return val;
-                    }
+                    log(key);
+                    return fallback.get(key);
                 }
-                return defaultVal;
             }
         }
         """

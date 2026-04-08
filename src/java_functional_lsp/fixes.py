@@ -111,10 +111,10 @@ def _find_frozen_decl_info(tree: Tree, var_name: str) -> tuple[str, Node | None]
             collection_type = "List"
             if type_node is not None and type_node.text:
                 type_text = type_node.text.decode("utf-8")
-                if type_text.startswith("Set"):
-                    collection_type = "Set"
-                elif type_text.startswith("Map"):
+                if any(kw in type_text for kw in ("SortedMap", "Map")):
                     collection_type = "Map"
+                elif any(kw in type_text for kw in ("Multiset", "SortedSet", "Set")):
+                    collection_type = "Set"
             return collection_type, decl
     return "List", None
 
@@ -268,7 +268,6 @@ _EAGER_NODE_TYPES: frozenset[str] = frozenset(
         "decimal_floating_point_literal",
         "boolean_literal",
         "character_literal",
-        "null_literal",
         "identifier",
         "field_access",
     }
@@ -338,8 +337,6 @@ def _build_monadic_rewrite(if_node: Node, var_name: str) -> lsp.TextEdit | None:
     replace_end = lsp.Position(line=if_node.end_point[0], character=if_node.end_point[1])
 
     indent = " " * if_node.start_point[1]
-    # Align the chained call to the opening parenthesis of Option.of(...)
-    align = " " * (len("return Option.of(") + len(var_name) + 1)
 
     # --- Determine terminal suffix and (possibly) extend the replace range ---
     alternative = if_node.child_by_field_name("alternative")
@@ -366,6 +363,8 @@ def _build_monadic_rewrite(if_node: Node, var_name: str) -> lsp.TextEdit | None:
     if is_identity:
         new_text = f"return {base}{terminal};"
     else:
+        # Align the chained call to the opening parenthesis of Option.of(...)
+        align = " " * (len("return Option.of(") + len(var_name) + 1)
         map_expr = _to_map_expression(return_text, var_name)
         new_text = f"return {base}\n{indent}{align}{map_expr}{terminal};"
 
@@ -422,8 +421,10 @@ def _to_map_expression(return_text: str, var_name: str) -> str:
     E.g. 'user.getName()' with var='user' -> '.map(it -> it.getName())'
     """
     # Use 'it' as lambda param to avoid shadowing the outer variable in Java.
-    # Word-boundary replace to avoid mangling substrings (e.g. var 's' in 's.toString()').
-    lambda_body = re.sub(rf"\b{re.escape(var_name)}\b", "it", return_text)
+    # Precompile with word-boundary anchors to avoid mangling substrings
+    # (e.g. var 's' in 's.toString()').
+    pattern = re.compile(rf"\b{re.escape(var_name)}\b")
+    lambda_body = pattern.sub("it", return_text)
     return f".map(it -> {lambda_body})"
 
 

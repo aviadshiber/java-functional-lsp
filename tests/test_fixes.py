@@ -252,11 +252,11 @@ class TestFixNullCheckToMonadic:
         assert result is not None
         assert result.changes is not None
         edits = result.changes["file:///test.java"]
-        rewrite = [e for e in edits if "Option" in e.new_text]
-        assert len(rewrite) >= 1
-        option_edit = next(e for e in rewrite if "Option.of(user)" in e.new_text)
-        assert ".map(" not in option_edit.new_text
-        assert ".getOrNull()" not in option_edit.new_text
+        rewrite = [e for e in edits if "Option.of(" in e.new_text]
+        assert len(rewrite) == 1
+        assert "Option.of(user)" in rewrite[0].new_text
+        assert ".map(" not in rewrite[0].new_text
+        assert ".getOrNull()" not in rewrite[0].new_text
 
     def test_null_fallback_returns_option(self) -> None:
         """When fallback is return null, generate Option.of() without .getOrNull()."""
@@ -284,10 +284,9 @@ class TestFixNullCheckToMonadic:
         assert result is not None
         assert result.changes is not None
         edits = result.changes["file:///test.java"]
-        rewrite = [e for e in edits if "Option" in e.new_text]
-        assert len(rewrite) >= 1
-        option_edit = next(e for e in rewrite if "getOrElse" in e.new_text)
-        assert '.getOrElse("unknown")' in option_edit.new_text
+        rewrite = [e for e in edits if "Option.of(" in e.new_text]
+        assert len(rewrite) == 1
+        assert '.getOrElse("unknown")' in rewrite[0].new_text
 
     def test_lazy_else_uses_supplier(self) -> None:
         """Else with method call should use lazy .getOrElse(() -> ...)."""
@@ -300,10 +299,9 @@ class TestFixNullCheckToMonadic:
         assert result is not None
         assert result.changes is not None
         edits = result.changes["file:///test.java"]
-        rewrite = [e for e in edits if "Option" in e.new_text]
-        assert len(rewrite) >= 1
-        option_edit = next(e for e in rewrite if "getOrElse" in e.new_text)
-        assert ".getOrElse(() -> computeDefault())" in option_edit.new_text
+        rewrite = [e for e in edits if "Option.of(" in e.new_text]
+        assert len(rewrite) == 1
+        assert ".getOrElse(() -> computeDefault())" in rewrite[0].new_text
 
     def test_complex_else_returns_none(self) -> None:
         """Complex else (multi-statement) should return None — no code action."""
@@ -314,6 +312,77 @@ class TestFixNullCheckToMonadic:
         )
         result = fix_null_check_to_monadic("file:///test.java", source, _range(3, 8, 8, 9), {})
         assert result is None
+
+    def test_eager_identifier_in_else(self) -> None:
+        """Else returning an identifier should use eager .getOrElse()."""
+        source = (
+            "class T {\n    String f(User user) {\n        if (user != null) {\n"
+            "            return user.getName();\n        } else {\n"
+            "            return fallbackName;\n        }\n    }\n}"
+        )
+        result = fix_null_check_to_monadic("file:///test.java", source, _range(2, 8, 6, 9), {})
+        assert result is not None
+        assert result.changes is not None
+        edits = result.changes["file:///test.java"]
+        rewrite = [e for e in edits if "Option.of(" in e.new_text]
+        assert len(rewrite) == 1
+        assert ".getOrElse(fallbackName)" in rewrite[0].new_text
+        assert "() ->" not in rewrite[0].new_text
+
+    def test_eager_field_access_in_else(self) -> None:
+        """Else returning a field access should use eager .getOrElse()."""
+        source = (
+            "class T {\n    String f(User user) {\n        if (user != null) {\n"
+            "            return user.getName();\n        } else {\n"
+            "            return Config.DEFAULT_VALUE;\n        }\n    }\n}"
+        )
+        result = fix_null_check_to_monadic("file:///test.java", source, _range(2, 8, 6, 9), {})
+        assert result is not None
+        assert result.changes is not None
+        edits = result.changes["file:///test.java"]
+        rewrite = [e for e in edits if "Option.of(" in e.new_text]
+        assert len(rewrite) == 1
+        assert ".getOrElse(Config.DEFAULT_VALUE)" in rewrite[0].new_text
+        assert "() ->" not in rewrite[0].new_text
+
+    def test_short_var_name_word_boundary(self) -> None:
+        """Short var names should not mangle substrings via regex replace."""
+        source = (
+            "class T {\n    String f(String s) {\n        if (s != null) {\n"
+            "            return s.toString();\n        }\n        return null;\n    }\n}"
+        )
+        result = fix_null_check_to_monadic("file:///test.java", source, _range(2, 8, 4, 9), {})
+        assert result is not None
+        assert result.changes is not None
+        edits = result.changes["file:///test.java"]
+        rewrite = [e for e in edits if "Option" in e.new_text and "map" in e.new_text]
+        assert len(rewrite) == 1
+        assert ".map(it -> it.toString())" in rewrite[0].new_text
+
+    def test_empty_else_returns_none(self) -> None:
+        """Empty else body should return None — no code action."""
+        source = (
+            "class T {\n    String f(String x) {\n        if (x != null) {\n"
+            "            return x;\n        } else {\n        }\n    }\n}"
+        )
+        result = fix_null_check_to_monadic("file:///test.java", source, _range(2, 8, 5, 9), {})
+        assert result is None
+
+    def test_else_returning_null_returns_bare_option(self) -> None:
+        """Else { return null; } should produce bare Option (no .getOrElse)."""
+        source = (
+            "class T {\n    String f(User user) {\n        if (user != null) {\n"
+            "            return user.getName();\n        } else {\n"
+            "            return null;\n        }\n    }\n}"
+        )
+        result = fix_null_check_to_monadic("file:///test.java", source, _range(2, 8, 6, 9), {})
+        assert result is not None
+        assert result.changes is not None
+        edits = result.changes["file:///test.java"]
+        rewrite = [e for e in edits if "Option" in e.new_text and "map" in e.new_text]
+        assert len(rewrite) == 1
+        assert ".getOrElse" not in rewrite[0].new_text
+        assert ".getOrNull()" not in rewrite[0].new_text
 
     def test_identity_with_else_uses_get_or_else(self) -> None:
         """Identity return with else value should use Option.of(x).getOrElse(val) — no .map()."""
@@ -326,11 +395,11 @@ class TestFixNullCheckToMonadic:
         assert result is not None
         assert result.changes is not None
         edits = result.changes["file:///test.java"]
-        rewrite = [e for e in edits if "Option" in e.new_text]
-        assert len(rewrite) >= 1
-        option_edit = next(e for e in rewrite if "Option.of(x)" in e.new_text)
-        assert ".map(" not in option_edit.new_text
-        assert ".getOrElse(defaultVal)" in option_edit.new_text
+        rewrite = [e for e in edits if "Option.of(" in e.new_text]
+        assert len(rewrite) == 1
+        assert "Option.of(x)" in rewrite[0].new_text
+        assert ".map(" not in rewrite[0].new_text
+        assert ".getOrElse(defaultVal)" in rewrite[0].new_text
 
 
 class TestFixNullReturn:
