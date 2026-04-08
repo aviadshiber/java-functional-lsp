@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import shutil
 from collections.abc import Callable
+from pathlib import Path
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -81,14 +83,24 @@ class JdtlsProxy:
             logger.warning("jdtls not found on PATH — running in standalone mode (custom rules only)")
             return False
 
+        # jdtls requires a -data directory for workspace metadata (index, classpath, build state).
+        # Use ~/.cache/jdtls-data/<hash> so it persists across reboots and LSP restarts.
+        # Fallback order mirrors LSP spec: rootUri → rootPath → cwd.
+        root_uri = init_params.get("rootUri") or init_params.get("rootPath") or str(Path.cwd())
+        workspace_hash = hashlib.sha256(root_uri.encode()).hexdigest()[:12]
+        data_dir = Path.home() / ".cache" / "jdtls-data" / workspace_hash
+        data_dir.mkdir(parents=True, exist_ok=True)
+
         try:
             self._process = await asyncio.create_subprocess_exec(
                 jdtls_path,
+                "-data",
+                str(data_dir),
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
-            logger.info("jdtls subprocess started (pid=%s)", self._process.pid)
+            logger.info("jdtls subprocess started (pid=%s, data=%s)", self._process.pid, data_dir)
 
             # Start background reader
             assert self._process.stdout is not None

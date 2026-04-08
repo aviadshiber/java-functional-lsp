@@ -16,11 +16,17 @@ echo "  Type check..."
 uv run mypy src/
 
 echo "  Version bump check..."
-# If source files changed, version must be bumped too
+# If source files changed, version must be bumped compared to the base branch.
+# Compares the actual version value (not just file presence) so it works with --amend.
 src_changed=$(git diff --cached --name-only -- 'src/' | grep -v '__pycache__' | head -1)
 if [ -n "$src_changed" ]; then
-    version_changed=$(git diff --cached --name-only -- 'pyproject.toml' 'src/java_functional_lsp/__init__.py' | head -1)
-    if [ -z "$version_changed" ]; then
+    # Resolve base branch: try remote main, then local main, then parent commit.
+    base_branch=$(git rev-parse --verify origin/main 2>/dev/null || git rev-parse --verify main 2>/dev/null || echo "HEAD~1")
+    # Extract the quoted version value (e.g., "0.6.4") from pyproject.toml
+    base_version=$(git show "$base_branch":pyproject.toml 2>/dev/null | grep -o 'version = "[^"]*"' | head -1)
+    staged_version=$(git show :pyproject.toml 2>/dev/null | grep -o 'version = "[^"]*"' | head -1)
+    # Skip check if either version is unresolvable (new project, missing file)
+    if [ -n "$base_version" ] && [ -n "$staged_version" ] && [ "$base_version" = "$staged_version" ]; then
         echo "ERROR: Source files changed but version was not bumped."
         echo "Update the version in both pyproject.toml and src/java_functional_lsp/__init__.py"
         echo ""
