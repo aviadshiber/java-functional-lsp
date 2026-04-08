@@ -4,12 +4,30 @@ from __future__ import annotations
 
 from typing import Any
 
-from .base import Diagnostic, find_nodes, has_sibling_annotation, severity_from_config
+from .base import Diagnostic, DiagnosticData, find_nodes, has_sibling_annotation, severity_from_config
 
 _MESSAGES = {
     "throw-statement": ("Avoid throwing exceptions. Use Either.left(error) or Try.of(() -> ...).toEither()."),
     "catch-rethrow": (
         "Avoid catching and rethrowing. Use Try.of(() -> ...).toEither() to convert exceptions to values."
+    ),
+}
+
+_DATA = {
+    "throw-statement": DiagnosticData(
+        fix_type="USE_EITHER_OR_TRY",
+        target_library="io.vavr.control.Either",
+        rationale=(
+            "Throwing exceptions breaks referential transparency."
+            " Use Either.left(error) to represent failures as values."
+        ),
+    ),
+    "catch-rethrow": DiagnosticData(
+        fix_type="USE_TRY_TO_EITHER",
+        target_library="io.vavr.control.Try",
+        rationale=(
+            "Catching and rethrowing adds noise. Use Try.of(() -> ...).toEither() to convert exceptions to values."
+        ),
     ),
 }
 
@@ -48,6 +66,7 @@ class ExceptionChecker:
                         severity=severity,
                         code="throw-statement",
                         message=_MESSAGES["throw-statement"],
+                        data=_DATA["throw-statement"],
                     )
                 )
 
@@ -71,6 +90,7 @@ class ExceptionChecker:
                             severity=severity,
                             code="catch-rethrow",
                             message=_MESSAGES["catch-rethrow"],
+                            data=_DATA["catch-rethrow"],
                         )
                     )
 

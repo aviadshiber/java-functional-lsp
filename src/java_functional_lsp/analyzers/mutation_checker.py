@@ -4,13 +4,50 @@ from __future__ import annotations
 
 from typing import Any
 
-from .base import Diagnostic, find_nodes, find_nodes_multi, has_ancestor, has_sibling_annotation, severity_from_config
+from .base import (
+    Diagnostic,
+    DiagnosticData,
+    find_nodes,
+    find_nodes_multi,
+    has_ancestor,
+    has_sibling_annotation,
+    severity_from_config,
+)
 
 _MESSAGES = {
     "mutable-variable": "Avoid reassigning variables. Use final + functional transforms (map, flatMap, fold).",
     "imperative-loop": "Replace imperative loop with .map(), .filter(), .flatMap(), or .foldLeft().",
     "mutable-dto": "Use @Value instead of @Data/@Setter for immutable DTOs.",
     "imperative-option-unwrap": "Avoid imperative unwrapping (isDefined/get). Use map(), flatMap(), or fold().",
+}
+
+_DATA = {
+    "mutable-variable": DiagnosticData(
+        fix_type="USE_FINAL_TRANSFORMS",
+        target_library="io.vavr.collection.List",
+        rationale=(
+            "Reassigning variables creates temporal coupling."
+            " Use final + functional transforms for predictable data flow."
+        ),
+    ),
+    "imperative-loop": DiagnosticData(
+        fix_type="USE_FUNCTIONAL_TRANSFORMS",
+        target_library="io.vavr.collection.List",
+        rationale=(
+            "Imperative loops hide intent."
+            " Use .map(), .filter(), .flatMap(), or .foldLeft() for declarative transforms."
+        ),
+    ),
+    "mutable-dto": DiagnosticData(
+        fix_type="USE_VALUE_ANNOTATION",
+        target_library="lombok.Value",
+        rationale="Mutable DTOs allow uncontrolled state changes. Use @Value for immutable data classes.",
+    ),
+    "imperative-option-unwrap": DiagnosticData(
+        fix_type="USE_MAP_FLATMAP",
+        target_library="io.vavr.control.Option",
+        rationale="Imperative isDefined/get is error-prone. Use map(), flatMap(), or fold() for safe monadic access.",
+    ),
 }
 
 _LOOP_TYPES = {"enhanced_for_statement", "for_statement", "while_statement"}
@@ -63,6 +100,7 @@ class MutationChecker:
                                 severity=severity,
                                 code="mutable-dto",
                                 message=message,
+                                data=_DATA["mutable-dto"],
                             )
                         )
 
@@ -95,6 +133,7 @@ class MutationChecker:
                         severity=severity,
                         code="imperative-loop",
                         message=_MESSAGES["imperative-loop"],
+                        data=_DATA["imperative-loop"],
                     )
                 )
 
@@ -140,6 +179,7 @@ class MutationChecker:
                             severity=severity,
                             code="imperative-option-unwrap",
                             message=_MESSAGES["imperative-option-unwrap"],
+                            data=_DATA["imperative-option-unwrap"],
                         )
                     )
                 break  # Only check first invocation in condition
@@ -171,5 +211,6 @@ class MutationChecker:
                     severity=severity,
                     code="mutable-variable",
                     message=_MESSAGES["mutable-variable"],
+                    data=_DATA["mutable-variable"],
                 )
             )

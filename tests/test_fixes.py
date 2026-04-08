@@ -1,0 +1,252 @@
+"""Tests for quick fix generators."""
+
+from __future__ import annotations
+
+from lsprotocol import types as lsp
+
+from java_functional_lsp.fixes import (
+    ensure_import,
+    fix_frozen_mutation,
+    fix_null_check_to_monadic,
+    fix_null_return,
+    get_fix_registry_keys,
+)
+
+
+class TestFixRegistryConsistency:
+    def test_fix_registry_keys_match_server_titles(self) -> None:
+        """Every rule with a fix generator must have a title registered in server._FIX_TITLES."""
+        from java_functional_lsp.server import _FIX_TITLES
+
+        registry_keys = get_fix_registry_keys()
+        title_keys = set(_FIX_TITLES.keys())
+        assert registry_keys == title_keys, f"Mismatch: registry has {registry_keys}, titles has {title_keys}"
+
+    def test_ensure_import_rejects_invalid_path(self) -> None:
+        """ensure_import should return None for paths that contain invalid characters."""
+        lines: list[str] = ["class T {}"]
+        # Paths with spaces, semicolons, or other invalid chars should be rejected
+        assert ensure_import(lines, "io.vavr; DROP TABLE") is None
+        assert ensure_import(lines, "io.vavr collection.List") is None
+        assert ensure_import(lines, "") is None
+
+    def test_ensure_import_accepts_valid_path(self) -> None:
+        """ensure_import should accept valid Java FQN paths."""
+        lines: list[str] = ["class T {}"]
+        edit = ensure_import(lines, "io.vavr.collection.List")
+        assert edit is not None
+
+    def test_import_insert_position_no_blank_line_after_package(self) -> None:
+        """When there's no blank line after package, position should not exceed file length."""
+        from java_functional_lsp.fixes import _find_import_insert_position
+
+        lines = ["package com.example;", "class T {}"]
+        pos = _find_import_insert_position(lines)
+        assert pos <= len(lines)
+
+
+class TestEnsureImport:
+    def test_adds_import_after_last_import(self) -> None:
+        lines = [
+            "package com.example;",
+            "",
+            "import java.util.List;",
+            "import java.util.Map;",
+            "",
+            "class T {}",
+        ]
+        edit = ensure_import(lines, "io.vavr.collection.List")
+        assert edit is not None
+        assert edit.range.start.line == 4
+        assert "import io.vavr.collection.List;" in edit.new_text
+
+    def test_adds_import_after_package(self) -> None:
+        lines = [
+            "package com.example;",
+            "",
+            "class T {}",
+        ]
+        edit = ensure_import(lines, "io.vavr.collection.List")
+        assert edit is not None
+        assert edit.range.start.line == 2  # blank line after package
+
+    def test_adds_import_at_top_if_no_package(self) -> None:
+        lines = ["class T {}"]
+        edit = ensure_import(lines, "io.vavr.collection.List")
+        assert edit is not None
+        assert edit.range.start.line == 0
+
+    def test_skips_existing_import(self) -> None:
+        lines = [
+            "import io.vavr.collection.List;",
+            "class T {}",
+        ]
+        edit = ensure_import(lines, "io.vavr.collection.List")
+        assert edit is None
+
+
+class TestFixFrozenMutation:
+    def test_generates_workspace_edit(self) -> None:
+        source = (
+            "import java.util.List;\n"
+            "\n"
+            "class T {\n"
+            "    void f() {\n"
+            '        List<String> list = List.of("a", "b");\n'
+            '        list.add("c");\n'
+            "    }\n"
+            "}\n"
+        )
+        diag_range = lsp.Range(
+            start=lsp.Position(line=5, character=8),
+            end=lsp.Position(line=5, character=22),
+        )
+        result = fix_frozen_mutation("file:///test.java", source, diag_range, {})
+        assert result is not None
+        assert isinstance(result, lsp.WorkspaceEdit)
+        assert result.changes is not None
+        assert "file:///test.java" in result.changes
+        edits = result.changes["file:///test.java"]
+        # Should have at least an import edit and the mutation rewrite
+        assert len(edits) >= 1
+
+    def test_no_duplicate_import(self) -> None:
+        source = (
+            "import io.vavr.collection.List;\n"
+            "\n"
+            "class T {\n"
+            "    void f() {\n"
+            '        List<String> list = List.of("a", "b");\n'
+            '        list.add("c");\n'
+            "    }\n"
+            "}\n"
+        )
+        diag_range = lsp.Range(
+            start=lsp.Position(line=5, character=8),
+            end=lsp.Position(line=5, character=22),
+        )
+        result = fix_frozen_mutation("file:///test.java", source, diag_range, {})
+        assert result is not None
+        assert result.changes is not None
+        edits = result.changes.get("file:///test.java", [])
+        import_edits = [e for e in edits if "import" in e.new_text]
+        assert len(import_edits) == 0
+
+    def test_no_import_when_disabled(self) -> None:
+        source = (
+            "import java.util.List;\n"
+            "\n"
+            "class T {\n"
+            "    void f() {\n"
+            '        List<String> list = List.of("a", "b");\n'
+            '        list.add("c");\n'
+            "    }\n"
+            "}\n"
+        )
+        diag_range = lsp.Range(
+            start=lsp.Position(line=5, character=8),
+            end=lsp.Position(line=5, character=22),
+        )
+        result = fix_frozen_mutation("file:///test.java", source, diag_range, {"autoImportVavr": False})
+        assert result is not None
+        assert result.changes is not None
+        edits = result.changes.get("file:///test.java", [])
+        import_edits = [e for e in edits if "import" in e.new_text]
+        assert len(import_edits) == 0
+
+    def test_imports_vavr_set_for_set_collection(self) -> None:
+        source = (
+            "import java.util.Set;\n"
+            "\n"
+            "class T {\n"
+            "    void f() {\n"
+            '        Set<String> s = Set.of("a");\n'
+            '        s.add("b");\n'
+            "    }\n"
+            "}\n"
+        )
+        diag_range = lsp.Range(
+            start=lsp.Position(line=5, character=8),
+            end=lsp.Position(line=5, character=18),
+        )
+        result = fix_frozen_mutation("file:///test.java", source, diag_range, {})
+        assert result is not None
+        assert result.changes is not None
+        edits = result.changes["file:///test.java"]
+        import_edits = [e for e in edits if "import" in e.new_text]
+        assert any("io.vavr.collection.Set" in e.new_text for e in import_edits)
+
+
+class TestFixNullCheckToMonadic:
+    def test_generates_option_rewrite(self) -> None:
+        source = (
+            "class T {\n"
+            "    String f(User user) {\n"
+            "        if (user != null) {\n"
+            "            return user.getName();\n"
+            "        }\n"
+            "        return null;\n"
+            "    }\n"
+            "}\n"
+        )
+        diag_range = lsp.Range(
+            start=lsp.Position(line=2, character=8),
+            end=lsp.Position(line=4, character=9),
+        )
+        result = fix_null_check_to_monadic("file:///test.java", source, diag_range, {})
+        assert result is not None
+        assert isinstance(result, lsp.WorkspaceEdit)
+
+    def test_no_import_when_disabled(self) -> None:
+        source = (
+            "class T {\n"
+            "    String f(User user) {\n"
+            "        if (user != null) {\n"
+            "            return user.getName();\n"
+            "        }\n"
+            "        return null;\n"
+            "    }\n"
+            "}\n"
+        )
+        diag_range = lsp.Range(
+            start=lsp.Position(line=2, character=8),
+            end=lsp.Position(line=4, character=9),
+        )
+        result = fix_null_check_to_monadic("file:///test.java", source, diag_range, {"autoImportVavr": False})
+        assert result is not None
+        assert result.changes is not None
+        edits = result.changes["file:///test.java"]
+        import_edits = [e for e in edits if "import" in e.new_text]
+        assert len(import_edits) == 0
+
+
+class TestFixNullReturn:
+    def test_replaces_null_with_option_none(self) -> None:
+        source = "class T { String f() { return null; } }\n"
+        diag_range = lsp.Range(
+            start=lsp.Position(line=0, character=30),
+            end=lsp.Position(line=0, character=34),
+        )
+        result = fix_null_return("file:///test.java", source, diag_range, {})
+        assert result is not None
+        assert isinstance(result, lsp.WorkspaceEdit)
+        assert result.changes is not None
+        edits = result.changes["file:///test.java"]
+        # Should have import + replacement
+        assert len(edits) == 2
+        texts = [e.new_text for e in edits]
+        assert any("Option.none()" in t for t in texts)
+        assert any("import io.vavr.control.Option;" in t for t in texts)
+
+    def test_no_import_when_disabled(self) -> None:
+        source = "class T { String f() { return null; } }\n"
+        diag_range = lsp.Range(
+            start=lsp.Position(line=0, character=30),
+            end=lsp.Position(line=0, character=34),
+        )
+        result = fix_null_return("file:///test.java", source, diag_range, {"autoImportVavr": False})
+        assert result is not None
+        assert result.changes is not None
+        edits = result.changes["file:///test.java"]
+        assert len(edits) == 1
+        assert "Option.none()" in edits[0].new_text

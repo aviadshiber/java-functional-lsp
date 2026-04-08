@@ -19,6 +19,25 @@ class TestFieldInjection:
         assert not any(d.code == "field-injection" for d in diags)
 
 
+class TestSpringCheckerData:
+    def test_field_injection_has_data_field(self) -> None:
+        source = b"class T { @Autowired private Foo foo; }"
+        diags = parse_and_analyze(SpringChecker(), source)
+        fi_diags = [d for d in diags if d.code == "field-injection"]
+        assert len(fi_diags) == 1
+        assert fi_diags[0].data is not None
+        assert fi_diags[0].data.fix_type == "USE_CONSTRUCTOR_INJECTION"
+        assert fi_diags[0].data.target_library == "lombok.Value"
+
+    def test_component_annotation_has_data_field(self) -> None:
+        source = b"@Service class Foo { }"
+        diags = parse_and_analyze(SpringChecker(), source)
+        comp_diags = [d for d in diags if d.code == "component-annotation"]
+        assert len(comp_diags) == 1
+        assert comp_diags[0].data is not None
+        assert comp_diags[0].data.fix_type == "USE_CONFIGURATION_BEAN"
+
+
 class TestComponentAnnotation:
     def test_detects_service(self) -> None:
         source = b"@Service class Foo { }"

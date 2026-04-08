@@ -4,11 +4,29 @@ from __future__ import annotations
 
 from typing import Any
 
-from .base import Diagnostic, find_nodes, severity_from_config
+from .base import Diagnostic, DiagnosticData, find_nodes, severity_from_config
 
 _MESSAGES = {
     "field-injection": "Avoid @Autowired field injection. Use constructor injection with @Value (Lombok) classes.",
     "component-annotation": "Avoid @Component/@Service/@Repository. Use @Configuration + @Bean instead.",
+}
+
+_DATA = {
+    "field-injection": DiagnosticData(
+        fix_type="USE_CONSTRUCTOR_INJECTION",
+        target_library="lombok.Value",
+        rationale=(
+            "Field injection hides dependencies and prevents immutability. Use constructor injection with @Value."
+        ),
+    ),
+    "component-annotation": DiagnosticData(
+        fix_type="USE_CONFIGURATION_BEAN",
+        target_library="org.springframework.context.annotation.Configuration",
+        rationale=(
+            "Component scanning reduces explicit wiring control."
+            " Use @Configuration + @Bean for explicit dependency graphs."
+        ),
+    ),
 }
 
 _BAD_ANNOTATIONS = {b"Component", b"Service", b"Repository"}
@@ -51,6 +69,7 @@ class SpringChecker:
                         severity=severity,
                         code="field-injection",
                         message=_MESSAGES["field-injection"],
+                        data=_DATA["field-injection"],
                     )
                 )
 
@@ -80,5 +99,6 @@ class SpringChecker:
                         severity=severity,
                         code="component-annotation",
                         message=_MESSAGES["component-annotation"],
+                        data=_DATA["component-annotation"],
                     )
                 )
