@@ -289,9 +289,7 @@ def _else_terminal(alternative: Node) -> str | None:
         ``".getOrElse(() -> ...)"`` — else returns a lazy expression.
         ``None`` — complex else that cannot be rewritten.
     """
-    if alternative.type == "block":
-        else_stmts = [c for c in alternative.named_children if c.type not in ("line_comment", "block_comment")]
-    elif alternative.type == "return_statement":
+    if alternative.type == "return_statement":
         else_stmts = [alternative]
     else:
         else_stmts = [c for c in alternative.named_children if c.type not in ("line_comment", "block_comment")]
@@ -348,14 +346,14 @@ def _build_monadic_rewrite(if_node: Node, var_name: str) -> lsp.TextEdit | None:
     if alternative is None:
         # No else branch — look for an immediately following `return null;`
         next_sib = if_node.next_named_sibling
-        has_null_fallback = (
+        is_null_return = (
             next_sib is not None
             and next_sib.type == "return_statement"
             and any(c.type == "null_literal" for c in next_sib.named_children)
         )
-        if not has_null_fallback:
+        if not is_null_return or next_sib is None:
             return None
-        replace_end = lsp.Position(line=next_sib.end_point[0], character=next_sib.end_point[1])  # type: ignore[union-attr]
+        replace_end = lsp.Position(line=next_sib.end_point[0], character=next_sib.end_point[1])
         terminal = ""  # bare Option — no .getOrNull()
     else:
         else_result = _else_terminal(alternative)
@@ -423,8 +421,9 @@ def _to_map_expression(return_text: str, var_name: str) -> str:
     Uses ``it`` as the lambda parameter to avoid shadowing the outer Java variable.
     E.g. 'user.getName()' with var='user' -> '.map(it -> it.getName())'
     """
-    # Use 'it' as lambda param to avoid shadowing the outer variable in Java
-    lambda_body = return_text.replace(var_name, "it")
+    # Use 'it' as lambda param to avoid shadowing the outer variable in Java.
+    # Word-boundary replace to avoid mangling substrings (e.g. var 's' in 's.toString()').
+    lambda_body = re.sub(rf"\b{re.escape(var_name)}\b", "it", return_text)
     return f".map(it -> {lambda_body})"
 
 
