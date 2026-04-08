@@ -5,11 +5,17 @@ Each fix generator takes document context and returns a list of TextEdits.
 
 from __future__ import annotations
 
+import re
+from collections.abc import Callable
 from typing import Any
 
 from lsprotocol import types as lsp
+from tree_sitter import Node, Tree
 
 from .analyzers.base import extract_null_check_var, find_ancestor, find_nodes, get_parser
+
+# Type for fix generator functions: (uri, source, diag_range, config, *, tree, lines) -> WorkspaceEdit | None
+FixGenerator = Callable[..., lsp.WorkspaceEdit | None]
 
 # --- Import management ---
 
@@ -33,7 +39,8 @@ def _find_import_insert_position(lines: list[str]) -> int:
     if last_import_line >= 0:
         return last_import_line + 1
     if package_line >= 0:
-        return package_line + 2  # blank line after package
+        # +2 to leave a blank line after the package declaration, but clamp to file length
+        return min(package_line + 2, len(lines))
     return 0
 
 
@@ -43,8 +50,16 @@ def _has_import(lines: list[str], import_path: str) -> bool:
     return any(line.strip() == target for line in lines)
 
 
+_JAVA_IMPORT_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_.]*$")
+
+
 def ensure_import(lines: list[str], import_path: str) -> lsp.TextEdit | None:
-    """Return a TextEdit adding the import if it doesn't exist, or None."""
+    """Return a TextEdit adding the import if it doesn't exist, or None.
+
+    Returns None for invalid import paths (must match a valid Java FQN pattern).
+    """
+    if not _JAVA_IMPORT_RE.match(import_path):
+        return None
     if _has_import(lines, import_path):
         return None
     insert_line = _find_import_insert_position(lines)
@@ -60,7 +75,7 @@ def ensure_import(lines: list[str], import_path: str) -> lsp.TextEdit | None:
 # --- Fix generators ---
 
 
-def _find_method_invocation(tree: Any, diag_range: lsp.Range) -> Any | None:
+def _find_method_invocation(tree: Tree, diag_range: lsp.Range) -> Node | None:
     """Find the method_invocation node at or near the diagnostic range."""
     target = tree.root_node.descendant_for_point_range(
         (diag_range.start.line, diag_range.start.character),
@@ -77,35 +92,52 @@ def _find_method_invocation(tree: Any, diag_range: lsp.Range) -> Any | None:
     return find_ancestor(target, "method_invocation")
 
 
-def _detect_frozen_collection_type(tree: Any, var_name: str) -> str:
-    """Detect the collection type (List, Set, or Map) for a frozen variable declaration."""
+def _find_frozen_decl_info(tree: Tree, var_name: str) -> tuple[str, Node | None]:
+    """Find the variable declaration for var_name and return (collection_type, decl_node).
+
+    Scans local_variable_declaration nodes once to detect both the collection type
+    and the declaration node — avoiding a second full tree walk.
+
+    Returns ("List", None) if no matching declaration is found.
+    """
     var_bytes = var_name.encode("utf-8")
     for decl in find_nodes(tree.root_node, "local_variable_declaration"):
         for declarator in find_nodes(decl, "variable_declarator"):
             name_node = declarator.child_by_field_name("name")
             if name_node is None or name_node.text != var_bytes:
                 continue
-            # Check the type annotation
+            # Determine collection type from the type annotation
             type_node = decl.child_by_field_name("type")
+            collection_type = "List"
             if type_node is not None and type_node.text:
                 type_text = type_node.text.decode("utf-8")
                 if type_text.startswith("Set"):
-                    return "Set"
-                if type_text.startswith("Map"):
-                    return "Map"
-            return "List"
-    return "List"
+                    collection_type = "Set"
+                elif type_text.startswith("Map"):
+                    collection_type = "Map"
+            return collection_type, decl
+    return "List", None
 
 
 def fix_frozen_mutation(
-    uri: str, source: str, diag_range: lsp.Range, config: dict[str, Any], *, tree: Any = None
+    uri: str,
+    source: str,
+    diag_range: lsp.Range,
+    config: dict[str, Any],
+    *,
+    tree: Tree | None = None,
+    lines: list[str] | None = None,
 ) -> lsp.WorkspaceEdit | None:
     """Generate a fix for frozen-mutation: rewrite to Vavr persistent collection.
 
     Rewrites the variable declaration from List.of(...) to io.vavr.collection.List.of(...)
     and the mutation call (e.g. .add(x)) to the persistent equivalent (e.g. = var.append(x)).
+
+    Pass ``lines`` to avoid re-splitting the source when called from a context that has
+    already split it (e.g. ``on_code_action`` in server.py).
     """
-    lines = source.split("\n")
+    if lines is None:
+        lines = source.split("\n")
     if tree is None:
         tree = get_parser().parse(source.encode("utf-8"))
 
@@ -122,8 +154,8 @@ def fix_frozen_mutation(
 
     var_name = obj_node.text.decode("utf-8") if obj_node.text else ""
 
-    # Detect collection type and add correct Vavr import
-    collection_type = _detect_frozen_collection_type(tree, var_name)
+    # Single pass: detect collection type AND locate the declaration node
+    collection_type, decl_node = _find_frozen_decl_info(tree, var_name)
     if config.get("autoImportVavr", True):
         import_edit = ensure_import(lines, f"io.vavr.collection.{collection_type}")
         if import_edit is not None:
@@ -140,7 +172,7 @@ def fix_frozen_mutation(
         b"sort": "sorted",
         b"set": "update",
     }
-    vavr_method = mutation_map.get(method_name.text, "append")
+    vavr_method = mutation_map.get(method_name.text, "append") if method_name.text else "append"
 
     # Find the expression_statement containing this invocation to replace the whole statement
     stmt = invocation.parent
@@ -150,8 +182,9 @@ def fix_frozen_mutation(
         new_text = f"{var_name} = {var_name}.{vavr_method}{args_text};"
         edits.append(lsp.TextEdit(range=lsp.Range(start=stmt_start, end=stmt_end), new_text=new_text))
 
-    # Try to find and rewrite the variable declaration to use Vavr type
-    _add_vavr_decl_rewrite(tree, var_name, edits, collection_type)
+    # Rewrite the declaration using the already-found decl_node (no second tree walk)
+    if decl_node is not None:
+        _add_vavr_decl_rewrite_from_node(decl_node, var_name, edits, collection_type)
 
     if not edits:
         return None
@@ -159,45 +192,48 @@ def fix_frozen_mutation(
     return lsp.WorkspaceEdit(changes={uri: edits})
 
 
-def _add_vavr_decl_rewrite(tree: Any, var_name: str, edits: list[lsp.TextEdit], collection_type: str = "List") -> None:
-    """Find the variable declaration for var_name and rewrite its type + init to Vavr."""
+def _add_vavr_decl_rewrite_from_node(
+    decl: Node, var_name: str, edits: list[lsp.TextEdit], collection_type: str = "List"
+) -> None:
+    """Rewrite a variable declaration node's type + initializer to Vavr.
+
+    Accepts a pre-located decl node so the caller avoids a redundant tree walk.
+    """
     var_bytes = var_name.encode("utf-8")
-    for decl in find_nodes(tree.root_node, "local_variable_declaration"):
-        for declarator in find_nodes(decl, "variable_declarator"):
-            name_node = declarator.child_by_field_name("name")
-            if name_node is None or name_node.text != var_bytes:
-                continue
-            # Rewrite the whole declaration
-            value_node = declarator.child_by_field_name("value")
-            if value_node is None:
-                continue
-            # Extract the arguments from the factory call
-            init_args = ""
-            if value_node.type == "method_invocation":
-                args_node = value_node.child_by_field_name("arguments")
-                if args_node and args_node.text:
-                    init_args = args_node.text.decode("utf-8")
+    for declarator in find_nodes(decl, "variable_declarator"):
+        name_node = declarator.child_by_field_name("name")
+        if name_node is None or name_node.text != var_bytes:
+            continue
+        value_node = declarator.child_by_field_name("value")
+        if value_node is None:
+            continue
+        # Extract the arguments from the factory call
+        init_args = ""
+        if value_node.type == "method_invocation":
+            args_node = value_node.child_by_field_name("arguments")
+            if args_node and args_node.text:
+                init_args = args_node.text.decode("utf-8")
 
-            # Rewrite the entire declaration
-            decl_start = lsp.Position(line=decl.start_point[0], character=decl.start_point[1])
-            decl_end = lsp.Position(line=decl.end_point[0], character=decl.end_point[1])
+        # Rewrite the entire declaration
+        decl_start = lsp.Position(line=decl.start_point[0], character=decl.start_point[1])
+        decl_end = lsp.Position(line=decl.end_point[0], character=decl.end_point[1])
 
-            # Try to extract the generic type from the original declaration
-            type_node = decl.child_by_field_name("type")
-            generic = ""
-            if type_node is not None:
-                for child in find_nodes(type_node, "type_arguments"):
-                    if child.text:
-                        generic = child.text.decode("utf-8")
-                        break
+        # Try to extract the generic type from the original declaration
+        type_node = decl.child_by_field_name("type")
+        generic = ""
+        if type_node is not None:
+            for child in find_nodes(type_node, "type_arguments"):
+                if child.text:
+                    generic = child.text.decode("utf-8")
+                    break
 
-            vavr_type = f"io.vavr.collection.{collection_type}"
-            new_decl = f"{vavr_type}{generic} {var_name} = {vavr_type}.of{init_args};"
-            edits.append(lsp.TextEdit(range=lsp.Range(start=decl_start, end=decl_end), new_text=new_decl))
-            return
+        vavr_type = f"io.vavr.collection.{collection_type}"
+        new_decl = f"{vavr_type}{generic} {var_name} = {vavr_type}.of{init_args};"
+        edits.append(lsp.TextEdit(range=lsp.Range(start=decl_start, end=decl_end), new_text=new_decl))
+        return
 
 
-def _find_if_node(tree: Any, diag_range: lsp.Range) -> Any | None:
+def _find_if_node(tree: Tree, diag_range: lsp.Range) -> Node | None:
     """Find the if_statement node at the given diagnostic range."""
     target = tree.root_node.descendant_for_point_range(
         (diag_range.start.line, diag_range.start.character),
@@ -210,7 +246,7 @@ def _find_if_node(tree: Any, diag_range: lsp.Range) -> Any | None:
     return find_ancestor(target, "if_statement")
 
 
-def _extract_null_check_var_str(if_node: Any) -> str | None:
+def _extract_null_check_var_str(if_node: Node) -> str | None:
     """Extract the variable name from an if(x != null) condition as a string."""
     condition = if_node.child_by_field_name("condition")
     if condition is None:
@@ -221,7 +257,7 @@ def _extract_null_check_var_str(if_node: Any) -> str | None:
     return var_bytes.decode("utf-8")
 
 
-def _build_monadic_rewrite(if_node: Any, var_name: str) -> lsp.TextEdit | None:
+def _build_monadic_rewrite(if_node: Node, var_name: str) -> lsp.TextEdit | None:
     """Build the Option.of().map() replacement TextEdit for a null-check if-block."""
     consequence = if_node.child_by_field_name("consequence")
     if consequence is None:
@@ -248,15 +284,28 @@ def _build_monadic_rewrite(if_node: Any, var_name: str) -> lsp.TextEdit | None:
             replace_end = lsp.Position(line=next_sib.end_point[0], character=next_sib.end_point[1])
 
     indent = " " * if_node.start_point[1]
-    new_text = f"return Option.of({var_name})\n{indent}             {map_expr}.getOrNull();"
+    # Align the chained call to the opening parenthesis of Option.of(...)
+    align = " " * (len("return Option.of(") + len(var_name) + 1)
+    new_text = f"return Option.of({var_name})\n{indent}{align}{map_expr}.getOrNull();"
     return lsp.TextEdit(range=lsp.Range(start=replace_start, end=replace_end), new_text=new_text)
 
 
 def fix_null_check_to_monadic(
-    uri: str, source: str, diag_range: lsp.Range, config: dict[str, Any], *, tree: Any = None
+    uri: str,
+    source: str,
+    diag_range: lsp.Range,
+    config: dict[str, Any],
+    *,
+    tree: Tree | None = None,
+    lines: list[str] | None = None,
 ) -> lsp.WorkspaceEdit | None:
-    """Generate a fix for null-check-to-monadic: rewrite if(x != null) to Option.of(x).map(...)."""
-    lines = source.split("\n")
+    """Generate a fix for null-check-to-monadic: rewrite if(x != null) to Option.of(x).map(...).
+
+    Pass ``lines`` to avoid re-splitting the source when called from a context that has
+    already split it (e.g. ``on_code_action`` in server.py).
+    """
+    if lines is None:
+        lines = source.split("\n")
     if tree is None:
         tree = get_parser().parse(source.encode("utf-8"))
 
@@ -294,10 +343,24 @@ def _to_map_expression(return_text: str, var_name: str) -> str:
 
 
 def fix_null_return(
-    uri: str, source: str, diag_range: lsp.Range, config: dict[str, Any], *, tree: Any = None
+    uri: str,
+    source: str,
+    diag_range: lsp.Range,
+    config: dict[str, Any],
+    *,
+    tree: Tree | None = None,  # Unused but kept for uniform call signature with other fix generators
+    lines: list[str] | None = None,
 ) -> lsp.WorkspaceEdit | None:
-    """Generate a fix for null-return: replace 'return null;' with 'return Option.none();'."""
-    lines = source.split("\n")
+    """Generate a fix for null-return: replace 'return null;' with 'return Option.none();'.
+
+    The ``tree`` parameter is unused here but kept to maintain a uniform call signature
+    with the other fix generators (server.py calls all generators with ``tree=tree``).
+
+    Pass ``lines`` to avoid re-splitting the source when called from a context that has
+    already split it (e.g. ``on_code_action`` in server.py).
+    """
+    if lines is None:
+        lines = source.split("\n")
     edits: list[lsp.TextEdit] = []
 
     auto_import = config.get("autoImportVavr", True)
@@ -322,13 +385,18 @@ def fix_null_return(
 
 # --- Fix registry ---
 
-_FIX_REGISTRY: dict[str, Any] = {
+_FIX_REGISTRY: dict[str, FixGenerator] = {
     "frozen-mutation": fix_frozen_mutation,
     "null-check-to-monadic": fix_null_check_to_monadic,
     "null-return": fix_null_return,
 }
 
 
-def get_fix(rule_id: str) -> Any | None:
+def get_fix(rule_id: str) -> FixGenerator | None:
     """Look up a fix generator by rule ID."""
     return _FIX_REGISTRY.get(rule_id)
+
+
+def get_fix_registry_keys() -> set[str]:
+    """Return the set of rule IDs that have registered fix generators."""
+    return set(_FIX_REGISTRY.keys())

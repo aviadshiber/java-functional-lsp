@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from tree_sitter import Node, Tree
+
 from .base import (
     Diagnostic,
     DiagnosticData,
@@ -124,7 +126,7 @@ _METHOD_SCOPES = {"method_declaration", "constructor_declaration", "lambda_expre
 class FunctionalChecker:
     """Detects frozen mutation traps, imperative null checks, and impure methods."""
 
-    def analyze(self, tree: Any, source: bytes, config: dict[str, Any]) -> list[Diagnostic]:
+    def analyze(self, tree: Tree, source: bytes, config: dict[str, Any]) -> list[Diagnostic]:
         diagnostics: list[Diagnostic] = []
 
         self._check_frozen_mutation(tree, diagnostics, config)
@@ -133,7 +135,7 @@ class FunctionalChecker:
 
         return diagnostics
 
-    def _check_frozen_mutation(self, tree: Any, diagnostics: list[Diagnostic], config: dict[str, Any]) -> None:
+    def _check_frozen_mutation(self, tree: Tree, diagnostics: list[Diagnostic], config: dict[str, Any]) -> None:
         """Detect mutation calls on frozen collections (List.of(), Collections.unmodifiable*, etc.)."""
         severity = severity_from_config(config, "frozen-mutation")
         if severity is None:
@@ -149,8 +151,8 @@ class FunctionalChecker:
                 value_node = decl.child_by_field_name("value")
                 if name_node is None or value_node is None:
                     continue
-                if self._is_frozen_init(value_node):
-                    frozen_vars.add(name_node.text or b"")
+                if self._is_frozen_init(value_node) and name_node.text:
+                    frozen_vars.add(name_node.text)
 
             if not frozen_vars:
                 continue
@@ -175,7 +177,7 @@ class FunctionalChecker:
                         )
                     )
 
-    def _is_frozen_init(self, value_node: Any) -> bool:
+    def _is_frozen_init(self, value_node: Node) -> bool:
         """Check if a value node is a frozen collection factory call."""
         if value_node.type != "method_invocation":
             return False
@@ -191,7 +193,7 @@ class FunctionalChecker:
             return True
         return False
 
-    def _check_null_check_to_monadic(self, tree: Any, diagnostics: list[Diagnostic], config: dict[str, Any]) -> None:
+    def _check_null_check_to_monadic(self, tree: Tree, diagnostics: list[Diagnostic], config: dict[str, Any]) -> None:
         """Detect if (x != null) { return x.something(); } patterns."""
         severity = severity_from_config(config, "null-check-to-monadic")
         if severity is None:
@@ -217,8 +219,9 @@ class FunctionalChecker:
                 continue
 
             stmt = statements[0]
-            # Must be a return statement or expression statement referencing the checked var
-            if stmt.type not in ("return_statement", "expression_statement"):
+            # Must be a return_statement: expression_statement case is not yet fixable
+            # (no automatic rewrite is available for side-effect-only bodies).
+            if stmt.type != "return_statement":
                 continue
 
             # Verify the statement references the checked variable
@@ -238,21 +241,34 @@ class FunctionalChecker:
                 )
             )
 
-    def _references_var(self, node: Any, var_name: bytes) -> bool:
-        """Check if a node (or descendants) references a given variable name."""
-        if node.type == "identifier" and node.text == var_name:
-            return True
-        # Check method_invocation receiver
-        if node.type == "method_invocation":
-            obj = node.child_by_field_name("object")
-            if obj is not None and obj.type == "identifier" and obj.text == var_name:
-                return True
-        for child in node.named_children:
-            if self._references_var(child, var_name):
-                return True
+    def _references_var(self, node: Node, var_name: bytes) -> bool:
+        """Check if a node (or descendants) references a given variable name.
+
+        Uses TreeCursor for traversal to avoid Python object allocation per child
+        (tree-sitter best practice for performance on large ASTs).
+        """
+        cursor = node.walk()
+        visited_children = False
+        while True:
+            if not visited_children:
+                current: Node | None = cursor.node
+                if current is not None:
+                    if current.type == "identifier" and current.text == var_name:
+                        return True
+                    # Check method_invocation receiver explicitly
+                    if current.type == "method_invocation":
+                        obj = current.child_by_field_name("object")
+                        if obj is not None and obj.type == "identifier" and obj.text == var_name:
+                            return True
+                if not cursor.goto_first_child():
+                    visited_children = True
+            elif cursor.goto_next_sibling():
+                visited_children = False
+            elif not cursor.goto_parent():
+                break
         return False
 
-    def _check_impure_method(self, tree: Any, diagnostics: list[Diagnostic], config: dict[str, Any]) -> None:
+    def _check_impure_method(self, tree: Tree, diagnostics: list[Diagnostic], config: dict[str, Any]) -> None:
         """Detect methods mixing pure logic with side-effects."""
         default = Severity.WARNING if config.get("strictPurity", False) else Severity.HINT
         severity = severity_from_config(config, "impure-method", default=default)
@@ -294,32 +310,52 @@ class FunctionalChecker:
                     )
                 )
 
-    def _is_side_effect_statement(self, stmt: Any) -> bool:
-        """Check if a statement contains side-effect calls."""
-        for invocation in find_nodes(stmt, "method_invocation"):
-            obj_node = invocation.child_by_field_name("object")
-            method_name = invocation.child_by_field_name("name")
-            if method_name is None:
-                continue
+    def _is_side_effect_statement(self, stmt: Node) -> bool:
+        """Check if a statement contains side-effect calls or throw statements.
 
-            # Direct side-effect methods (e.g., System.out.println)
-            if obj_node is not None:
-                # Check for System.out.println / System.err.println
-                if obj_node.type == "field_access":
-                    receiver = obj_node.child_by_field_name("object")
-                    if receiver is not None and receiver.text in _SIDE_EFFECT_RECEIVERS:
+        Single TreeCursor traversal to detect both method_invocation side-effects
+        and throw_statement nodes (avoids two separate find_nodes walks).
+        """
+        cursor = stmt.walk()
+        visited_children = False
+        while True:
+            if not visited_children:
+                current: Node | None = cursor.node
+                if current is not None:
+                    if current.type == "throw_statement":
                         return True
-                # Check for logger.info, log.debug, etc.
-                if obj_node.type == "identifier" and obj_node.text in _SIDE_EFFECT_RECEIVERS:
-                    if method_name.text in _SIDE_EFFECT_METHODS:
-                        return True
+                    if current.type == "method_invocation":
+                        if self._is_side_effect_invocation(current):
+                            return True
+                if not cursor.goto_first_child():
+                    visited_children = True
+            elif cursor.goto_next_sibling():
+                visited_children = False
+            elif not cursor.goto_parent():
+                break
+        return False
 
-            # Standalone side-effect method names
-            if method_name.text in _SIDE_EFFECT_METHODS and obj_node is None:
-                return True
+    @staticmethod
+    def _is_side_effect_invocation(invocation: Node) -> bool:
+        """Check if a method_invocation node is a side-effect call."""
+        obj_node = invocation.child_by_field_name("object")
+        method_name = invocation.child_by_field_name("name")
+        if method_name is None:
+            return False
 
-        # throw statements are side-effects
-        for _ in find_nodes(stmt, "throw_statement"):
+        if obj_node is not None:
+            # System.out.println / System.err.println
+            if obj_node.type == "field_access":
+                receiver = obj_node.child_by_field_name("object")
+                if receiver is not None and receiver.text in _SIDE_EFFECT_RECEIVERS:
+                    return True
+            # logger.info, log.debug, etc.
+            if obj_node.type == "identifier" and obj_node.text in _SIDE_EFFECT_RECEIVERS:
+                if method_name.text in _SIDE_EFFECT_METHODS:
+                    return True
+
+        # Standalone side-effect method names
+        if method_name.text in _SIDE_EFFECT_METHODS and obj_node is None:
             return True
 
         return False

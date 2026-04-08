@@ -59,6 +59,19 @@ class TestFrozenMutation:
         codes = [d.code for d in diags]
         assert "frozen-mutation" in codes
 
+    def test_detects_list_copy_of_add(self) -> None:
+        source = b"""
+        class T {
+            void f(List<String> other) {
+                List<String> frozen = List.copyOf(other);
+                frozen.add("x");
+            }
+        }
+        """
+        diags = parse_and_analyze(FunctionalChecker(), source)
+        codes = [d.code for d in diags]
+        assert "frozen-mutation" in codes
+
     def test_ignores_normal_arraylist(self) -> None:
         source = b"""
         class T {
@@ -147,7 +160,8 @@ class TestNullCheckToMonadic:
         codes = [d.code for d in diags]
         assert "null-check-to-monadic" in codes
 
-    def test_detects_null_check_with_method_call(self) -> None:
+    def test_ignores_null_check_with_expression_statement(self) -> None:
+        """expression_statement bodies are not yet fixable — diagnostic should not fire."""
         source = b"""
         class T {
             void f(User user) {
@@ -158,8 +172,7 @@ class TestNullCheckToMonadic:
         }
         """
         diags = parse_and_analyze(FunctionalChecker(), source)
-        codes = [d.code for d in diags]
-        assert "null-check-to-monadic" in codes
+        assert not any(d.code == "null-check-to-monadic" for d in diags)
 
     def test_ignores_complex_if_body(self) -> None:
         """Multi-statement if-body should NOT trigger."""
@@ -257,6 +270,23 @@ class TestImpureMethod:
             int calculate(int x) {
                 int result = x * 2 + 1;
                 logger.info("result: " + result);
+                return result;
+            }
+        }
+        """
+        diags = parse_and_analyze(FunctionalChecker(), source)
+        codes = [d.code for d in diags]
+        assert "impure-method" in codes
+
+    def test_detects_throw_with_pure_logic(self) -> None:
+        """throw statement in a method with pure logic should trigger impure-method."""
+        source = b"""
+        class T {
+            String process(String input) {
+                String result = input.trim();
+                if (result.isEmpty()) {
+                    throw new IllegalArgumentException("empty input");
+                }
                 return result;
             }
         }

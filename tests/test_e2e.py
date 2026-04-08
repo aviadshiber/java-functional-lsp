@@ -315,6 +315,8 @@ class TestE2EDidClose:
         _wait_diagnostics(server)
 
         _did_close(server, uri)
+        # didClose publishes empty diagnostics — consume that notification
+        _wait_diagnostics(server)
 
         # Re-open should still work
         _did_open(server, uri, java_file.read_text(), version=2)
@@ -407,6 +409,26 @@ class TestE2EDiagnosticData:
         assert data["targetLibrary"] == "io.vavr.control.Option"
 
 
+def _request_code_actions(
+    proc: subprocess.Popen[bytes], uri: str, diag_range: dict, diagnostics: list[dict]
+) -> dict | None:
+    """Send a textDocument/codeAction request and return the response."""
+    _send(
+        proc,
+        {
+            "jsonrpc": "2.0",
+            "id": 100,
+            "method": "textDocument/codeAction",
+            "params": {
+                "textDocument": {"uri": uri},
+                "range": diag_range,
+                "context": {"diagnostics": diagnostics},
+            },
+        },
+    )
+    return _read_lsp(proc)
+
+
 class TestE2ECodeAction:
     def test_code_action_returns_quickfix(self, server: subprocess.Popen[bytes], tmp_path: Path) -> None:
         """Code action request for a fixable diagnostic should return a quick fix."""
@@ -422,22 +444,7 @@ class TestE2ECodeAction:
         null_diags = [d for d in msg["params"]["diagnostics"] if d["code"] == "null-return"]
         assert len(null_diags) >= 1
 
-        # Request code actions
-        _send(
-            server,
-            {
-                "jsonrpc": "2.0",
-                "id": 100,
-                "method": "textDocument/codeAction",
-                "params": {
-                    "textDocument": {"uri": uri},
-                    "range": null_diags[0]["range"],
-                    "context": {"diagnostics": null_diags},
-                },
-            },
-        )
-
-        response = _read_lsp(server)
+        response = _request_code_actions(server, uri, null_diags[0]["range"], null_diags)
         assert response is not None
         result = response.get("result")
         assert result is not None
@@ -446,3 +453,86 @@ class TestE2ECodeAction:
         assert action["kind"] == "quickfix"
         assert "edit" in action
         assert action["title"] == "Replace with Option.none()"
+
+    def test_frozen_mutation_code_action(self, server: subprocess.Popen[bytes], tmp_path: Path) -> None:
+        """Code action for frozen-mutation should suggest switching to Vavr collection."""
+        java_file = tmp_path / "Frozen.java"
+        java_file.write_text(
+            'class T {\n    void f() {\n        List<String> list = List.of("a");\n        list.add("b");\n    }\n}\n'
+        )
+        uri = java_file.as_uri()
+
+        _initialize(server, root_uri=tmp_path.as_uri())
+        _did_open(server, uri, java_file.read_text())
+
+        msg = _wait_diagnostics(server)
+        assert msg is not None
+        frozen_diags = [d for d in msg["params"]["diagnostics"] if d["code"] == "frozen-mutation"]
+        assert len(frozen_diags) >= 1
+
+        response = _request_code_actions(server, uri, frozen_diags[0]["range"], frozen_diags)
+        assert response is not None
+        result = response.get("result")
+        assert result is not None
+        assert len(result) >= 1
+        action = result[0]
+        assert action["kind"] == "quickfix"
+        assert "edit" in action
+        assert action["title"] == "Switch to Vavr Immutable Collection"
+
+    def test_null_check_to_monadic_code_action(self, server: subprocess.Popen[bytes], tmp_path: Path) -> None:
+        """Code action for null-check-to-monadic should suggest Option monadic flow."""
+        java_file = tmp_path / "Monadic.java"
+        java_file.write_text(
+            "class T {\n"
+            "    String f(Object user) {\n"
+            "        if (user != null) {\n"
+            "            return user.toString();\n"
+            "        }\n"
+            "        return null;\n"
+            "    }\n"
+            "}\n"
+        )
+        uri = java_file.as_uri()
+
+        _initialize(server, root_uri=tmp_path.as_uri())
+        _did_open(server, uri, java_file.read_text())
+
+        msg = _wait_diagnostics(server)
+        assert msg is not None
+        monadic_diags = [d for d in msg["params"]["diagnostics"] if d["code"] == "null-check-to-monadic"]
+        assert len(monadic_diags) >= 1
+
+        response = _request_code_actions(server, uri, monadic_diags[0]["range"], monadic_diags)
+        assert response is not None
+        result = response.get("result")
+        assert result is not None
+        assert len(result) >= 1
+        action = result[0]
+        assert action["kind"] == "quickfix"
+        assert "edit" in action
+        assert action["title"] == "Convert to Option monadic flow"
+
+    def test_code_action_unknown_source_returns_none(self, server: subprocess.Popen[bytes], tmp_path: Path) -> None:
+        """Code action request with diagnostics from a non-java-functional-lsp source should return null."""
+        java_file = tmp_path / "Other.java"
+        java_file.write_text("class T { String f() { return null; } }")
+        uri = java_file.as_uri()
+
+        _initialize(server, root_uri=tmp_path.as_uri())
+        _did_open(server, uri, java_file.read_text())
+        _wait_diagnostics(server)
+
+        # Send a diagnostic from a foreign source — server should return null (no actions)
+        fake_diag = {
+            "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 5}},
+            "code": "null-return",
+            "source": "external-linter",
+            "message": "some issue",
+            "severity": 1,
+        }
+        response = _request_code_actions(server, uri, fake_diag["range"], [fake_diag])
+        assert response is not None
+        # Server returns null (no actions) when no diagnostics match
+        result = response.get("result")
+        assert result is None

@@ -122,6 +122,34 @@ class TestImperativeOptionUnwrap:
         assert not any(d.code == "imperative-option-unwrap" for d in diags)
 
 
+class TestMutationCheckerData:
+    def test_mutable_variable_has_data_field(self) -> None:
+        source = b"class T { void f() { int x = 1; x = 2; } }"
+        diags = parse_and_analyze(MutationChecker(), source)
+        mut_diags = [d for d in diags if d.code == "mutable-variable"]
+        assert len(mut_diags) >= 1
+        assert mut_diags[0].data is not None
+        assert mut_diags[0].data.fix_type == "USE_FINAL_TRANSFORMS"
+        assert mut_diags[0].data.target_library == "io.vavr.collection.List"
+
+    def test_imperative_loop_has_data_field(self) -> None:
+        source = b"class T { void f() { for (String s : list) { process(s); } } }"
+        diags = parse_and_analyze(MutationChecker(), source)
+        loop_diags = [d for d in diags if d.code == "imperative-loop"]
+        assert len(loop_diags) == 1
+        assert loop_diags[0].data is not None
+        assert loop_diags[0].data.fix_type == "USE_FUNCTIONAL_TRANSFORMS"
+
+    def test_mutable_dto_has_data_field(self) -> None:
+        source = b"@Data class Foo { private String name; }"
+        diags = parse_and_analyze(MutationChecker(), source)
+        dto_diags = [d for d in diags if d.code == "mutable-dto"]
+        assert len(dto_diags) == 1
+        assert dto_diags[0].data is not None
+        assert dto_diags[0].data.fix_type == "USE_VALUE_ANNOTATION"
+        assert dto_diags[0].data.target_library == "lombok.Value"
+
+
 class TestConstructorAssignment:
     def test_ignores_this_field_in_constructor(self) -> None:
         source = b"class T { final int x; T(int x) { this.x = x; } }"

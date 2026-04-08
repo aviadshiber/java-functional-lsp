@@ -25,7 +25,7 @@ from .analyzers.functional_checker import FunctionalChecker
 from .analyzers.mutation_checker import MutationChecker
 from .analyzers.null_checker import NullChecker
 from .analyzers.spring_checker import SpringChecker
-from .fixes import get_fix
+from .fixes import get_fix, get_fix_registry_keys
 from .proxy import JdtlsProxy
 
 logger = logging.getLogger(__name__)
@@ -293,11 +293,13 @@ async def on_did_save(params: lsp.DidSaveTextDocumentParams) -> None:
 
 @server.feature(lsp.TEXT_DOCUMENT_DID_CLOSE)
 async def on_did_close(params: lsp.DidCloseTextDocumentParams) -> None:
-    """Clean up cached state and forward to jdtls."""
+    """Clean up cached state, clear diagnostics, and forward to jdtls."""
     uri = params.text_document.uri
     if uri in _pending:
         _pending[uri].cancel()
         del _pending[uri]
+    # Clear diagnostics for the closed document (LSP best practice)
+    server.text_document_publish_diagnostics(lsp.PublishDiagnosticsParams(uri=uri, diagnostics=[]))
     if server._proxy.is_available:
         await server._proxy.send_notification("textDocument/didClose", _serialize_params(params))
 
@@ -386,6 +388,11 @@ _FIX_TITLES: dict[str, str] = {
     "null-return": "Replace with Option.none()",
 }
 
+# Guard against title/registry mismatch at import time
+assert set(_FIX_TITLES) == get_fix_registry_keys(), (
+    f"_FIX_TITLES keys {set(_FIX_TITLES)} do not match fix registry keys {get_fix_registry_keys()}"
+)
+
 
 @server.feature(lsp.TEXT_DOCUMENT_CODE_ACTION)
 def on_code_action(params: lsp.CodeActionParams) -> list[lsp.CodeAction] | None:
@@ -394,8 +401,9 @@ def on_code_action(params: lsp.CodeActionParams) -> list[lsp.CodeAction] | None:
     uri = params.text_document.uri
     actions: list[lsp.CodeAction] = []
 
-    # Parse the tree once for all fix generators (avoid re-parsing per diagnostic)
+    # Parse the tree once and split source lines once — shared across all fix generators.
     tree = server._parser.parse(doc.source.encode("utf-8"))
+    source_lines = doc.source.split("\n")
 
     for diag in params.context.diagnostics:
         if diag.source != "java-functional-lsp":
@@ -406,7 +414,7 @@ def on_code_action(params: lsp.CodeActionParams) -> list[lsp.CodeAction] | None:
             continue
 
         try:
-            workspace_edit = fix_fn(uri, doc.source, diag.range, server._config, tree=tree)
+            workspace_edit = fix_fn(uri, doc.source, diag.range, server._config, tree=tree, lines=source_lines)
         except Exception as e:
             logger.error("Fix generator for %s failed: %s", rule_id, e)
             continue
