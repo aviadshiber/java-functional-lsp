@@ -9,11 +9,18 @@ from typing import Any
 
 from .analyzers.base import Analyzer, Diagnostic, Severity, get_parser, is_excluded
 from .analyzers.exception_checker import ExceptionChecker
+from .analyzers.functional_checker import FunctionalChecker
 from .analyzers.mutation_checker import MutationChecker
 from .analyzers.null_checker import NullChecker
 from .analyzers.spring_checker import SpringChecker
 
-_ANALYZERS: list[Analyzer] = [NullChecker(), ExceptionChecker(), MutationChecker(), SpringChecker()]
+_ANALYZERS: list[Analyzer] = [
+    NullChecker(),
+    ExceptionChecker(),
+    MutationChecker(),
+    SpringChecker(),
+    FunctionalChecker(),
+]
 
 _SEVERITY_SYMBOLS = {
     Severity.ERROR: "E",

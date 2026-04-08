@@ -20,6 +20,15 @@ class Severity(IntEnum):
 
 
 @dataclass(frozen=True)
+class DiagnosticData:
+    """Machine-readable metadata for AI agents and automated refactoring."""
+
+    fix_type: str  # e.g. "REPLACE_WITH_VAVR_LIST", "WRAP_IN_OPTION"
+    target_library: str  # e.g. "io.vavr.collection.List"
+    rationale: str  # human+machine readable explanation
+
+
+@dataclass(frozen=True)
 class Diagnostic:
     line: int  # 0-based
     col: int
@@ -29,6 +38,7 @@ class Diagnostic:
     code: str  # rule ID
     message: str
     source: str = "java-functional-lsp"
+    data: DiagnosticData | None = None
 
 
 class Analyzer(Protocol):
@@ -213,6 +223,34 @@ def _annotation_args_suppress(args: Node, rule_id: str) -> bool:
         if value == f"{_SUPPRESS_PREFIX}:{rule_id}":
             return True
     return False
+
+
+def extract_null_check_var(condition: Node) -> bytes | None:
+    """Extract the variable from a `x != null` or `null != x` binary condition.
+
+    Handles parenthesized expressions. Returns the variable name as bytes, or None.
+    """
+    node = condition
+    if node.type == "parenthesized_expression" and node.named_child_count == 1:
+        node = node.named_children[0]
+
+    if node.type != "binary_expression":
+        return None
+
+    # Must have != operator (tree-sitter stores operators as unnamed children)
+    if not any(c.type == "!=" for c in node.children):
+        return None
+
+    left = node.child_by_field_name("left")
+    right = node.child_by_field_name("right")
+    if left is None or right is None:
+        return None
+
+    var_node = left if right.type == "null_literal" else (right if left.type == "null_literal" else None)
+    if var_node is not None and var_node.type == "identifier":
+        val: bytes | None = var_node.text
+        return val
+    return None
 
 
 def has_sibling_annotation(modifiers_node: Node, annotation_name: bytes) -> bool:

@@ -46,6 +46,26 @@ class TestNullAssignment:
         assert "null-field-assignment" in codes
 
 
+class TestNullCheckerData:
+    def test_null_return_has_data_field(self) -> None:
+        source = b"class T { String f() { return null; } }"
+        diags = parse_and_analyze(NullChecker(), source)
+        null_diags = [d for d in diags if d.code == "null-return"]
+        assert len(null_diags) == 1
+        assert null_diags[0].data is not None
+        assert null_diags[0].data.fix_type == "WRAP_IN_OPTION"
+        assert null_diags[0].data.target_library == "io.vavr.control.Option"
+
+    def test_null_literal_arg_has_data_field(self) -> None:
+        source = b"class T { void f() { foo(null); } }"
+        diags = parse_and_analyze(NullChecker(), source)
+        arg_diags = [d for d in diags if d.code == "null-literal-arg"]
+        assert len(arg_diags) == 1
+        assert arg_diags[0].data is not None
+        assert arg_diags[0].data.fix_type == "WRAP_IN_OPTION_NONE"
+        assert arg_diags[0].data.target_library == "io.vavr.control.Option"
+
+
 class TestNullConfig:
     def test_disabled_rule_produces_no_diagnostics(self) -> None:
         source = b"class T { void f() { foo(null); return null; } }"
