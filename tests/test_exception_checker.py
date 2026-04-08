@@ -62,6 +62,33 @@ class TestCatchRethrow:
         assert not any(d.code == "catch-rethrow" for d in diags)
 
 
+class TestExceptionCheckerData:
+    def test_throw_statement_has_data_field(self) -> None:
+        source = b"class T { void f() { throw new RuntimeException(); } }"
+        diags = parse_and_analyze(ExceptionChecker(), source)
+        throw_diags = [d for d in diags if d.code == "throw-statement"]
+        assert len(throw_diags) == 1
+        assert throw_diags[0].data is not None
+        assert throw_diags[0].data.fix_type == "USE_EITHER_OR_TRY"
+        assert throw_diags[0].data.target_library == "io.vavr.control.Either"
+
+    def test_catch_rethrow_has_data_field(self) -> None:
+        source = b"""
+        class T {
+            void f() {
+                try { foo(); }
+                catch (Exception e) { throw new RuntimeException(e); }
+            }
+        }
+        """
+        diags = parse_and_analyze(ExceptionChecker(), source)
+        rethrow_diags = [d for d in diags if d.code == "catch-rethrow"]
+        assert len(rethrow_diags) == 1
+        assert rethrow_diags[0].data is not None
+        assert rethrow_diags[0].data.fix_type == "USE_TRY_TO_EITHER"
+        assert rethrow_diags[0].data.target_library == "io.vavr.control.Try"
+
+
 class TestBeanSuppression:
     def test_ignores_throw_in_bean_method(self) -> None:
         source = b"""

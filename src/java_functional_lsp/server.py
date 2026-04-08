@@ -21,9 +21,11 @@ from pygls.uris import to_fs_path
 from .analyzers.base import Analyzer, Severity, get_parser, is_excluded, is_suppressed
 from .analyzers.base import Diagnostic as LintDiagnostic
 from .analyzers.exception_checker import ExceptionChecker
+from .analyzers.functional_checker import FunctionalChecker
 from .analyzers.mutation_checker import MutationChecker
 from .analyzers.null_checker import NullChecker
 from .analyzers.spring_checker import SpringChecker
+from .fixes import get_fix, get_fix_registry_keys
 from .proxy import JdtlsProxy
 
 logger = logging.getLogger(__name__)
@@ -35,7 +37,13 @@ _SEVERITY_MAP = {
     Severity.HINT: lsp.DiagnosticSeverity.Hint,
 }
 
-_ANALYZERS: list[Analyzer] = [NullChecker(), ExceptionChecker(), MutationChecker(), SpringChecker()]
+_ANALYZERS: list[Analyzer] = [
+    NullChecker(),
+    ExceptionChecker(),
+    MutationChecker(),
+    SpringChecker(),
+    FunctionalChecker(),
+]
 
 _converter = cattrs.Converter()
 
@@ -89,6 +97,13 @@ def _load_config(workspace_root: str | None) -> dict[str, Any]:
 
 def _to_lsp_diagnostic(diag: LintDiagnostic) -> lsp.Diagnostic:
     """Convert an internal diagnostic to an LSP diagnostic."""
+    data = None
+    if diag.data is not None:
+        data = {
+            "fixType": diag.data.fix_type,
+            "targetLibrary": diag.data.target_library,
+            "rationale": diag.data.rationale,
+        }
     return lsp.Diagnostic(
         range=lsp.Range(
             start=lsp.Position(line=diag.line, character=diag.col),
@@ -98,6 +113,7 @@ def _to_lsp_diagnostic(diag: LintDiagnostic) -> lsp.Diagnostic:
         code=diag.code,
         source=diag.source,
         message=diag.message,
+        data=data,
     )
 
 
@@ -210,6 +226,9 @@ def on_initialize(params: lsp.InitializeParams) -> lsp.InitializeResult:
             definition_provider=True,
             references_provider=True,
             document_symbol_provider=True,
+            code_action_provider=lsp.CodeActionOptions(
+                code_action_kinds=[lsp.CodeActionKind.QuickFix],
+            ),
         )
     )
 
@@ -274,11 +293,13 @@ async def on_did_save(params: lsp.DidSaveTextDocumentParams) -> None:
 
 @server.feature(lsp.TEXT_DOCUMENT_DID_CLOSE)
 async def on_did_close(params: lsp.DidCloseTextDocumentParams) -> None:
-    """Clean up cached state and forward to jdtls."""
+    """Clean up cached state, clear diagnostics, and forward to jdtls."""
     uri = params.text_document.uri
     if uri in _pending:
         _pending[uri].cancel()
         del _pending[uri]
+    # Clear diagnostics for the closed document (LSP best practice)
+    server.text_document_publish_diagnostics(lsp.PublishDiagnosticsParams(uri=uri, diagnostics=[]))
     if server._proxy.is_available:
         await server._proxy.send_notification("textDocument/didClose", _serialize_params(params))
 
@@ -356,6 +377,62 @@ async def on_document_symbol(params: lsp.DocumentSymbolParams) -> list[lsp.Docum
         return [_converter.structure(sym, lsp.DocumentSymbol) for sym in result]
     except Exception:
         return None
+
+
+# --- Code actions (quick fixes) ---
+
+# Human-readable titles for code actions
+_FIX_TITLES: dict[str, str] = {
+    "frozen-mutation": "Switch to Vavr Immutable Collection",
+    "null-check-to-monadic": "Convert to Option monadic flow",
+    "null-return": "Replace with Option.none()",
+}
+
+# Guard against title/registry mismatch at import time
+assert set(_FIX_TITLES) == get_fix_registry_keys(), (
+    f"_FIX_TITLES keys {set(_FIX_TITLES)} do not match fix registry keys {get_fix_registry_keys()}"
+)
+
+
+@server.feature(lsp.TEXT_DOCUMENT_CODE_ACTION)
+def on_code_action(params: lsp.CodeActionParams) -> list[lsp.CodeAction] | None:
+    """Return quick-fix code actions for functional diagnostics."""
+    doc = server.workspace.get_text_document(params.text_document.uri)
+    uri = params.text_document.uri
+    actions: list[lsp.CodeAction] = []
+
+    # Parse the tree once and split source lines once — shared across all fix generators.
+    tree = server._parser.parse(doc.source.encode("utf-8"))
+    source_lines = doc.source.split("\n")
+
+    for diag in params.context.diagnostics:
+        if diag.source != "java-functional-lsp":
+            continue
+        rule_id = diag.code if isinstance(diag.code, str) else str(diag.code) if diag.code is not None else ""
+        fix_fn = get_fix(rule_id)
+        if fix_fn is None:
+            continue
+
+        try:
+            workspace_edit = fix_fn(uri, doc.source, diag.range, server._config, tree=tree, lines=source_lines)
+        except Exception as e:
+            logger.error("Fix generator for %s failed: %s", rule_id, e)
+            continue
+
+        if workspace_edit is None:
+            continue
+
+        title = _FIX_TITLES.get(rule_id, f"Fix {rule_id}")
+        actions.append(
+            lsp.CodeAction(
+                title=title,
+                kind=lsp.CodeActionKind.QuickFix,
+                diagnostics=[diag],
+                edit=workspace_edit,
+            )
+        )
+
+    return actions if actions else None
 
 
 # --- Entry point ---

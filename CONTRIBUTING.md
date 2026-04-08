@@ -45,8 +45,11 @@ uv run pytest
 1. Choose the appropriate analyzer in `src/java_functional_lsp/analyzers/`
 2. Add the detection logic using tree-sitter node walking (see `base.py` helpers)
 3. Add the rule ID and message to the module's `_MESSAGES` dict
-4. Add tests in `tests/test_<analyzer>.py`
-5. Update the rules table in `README.md`
+4. Add a `DiagnosticData` entry to the module's `_DATA` dict with `fix_type`, `target_library`, and `rationale`
+5. Pass `data=_DATA["rule-id"]` when creating the `Diagnostic`
+6. Add tests in `tests/test_<analyzer>.py` (including a test verifying the `data` field)
+7. Optionally add a quick fix generator in `src/java_functional_lsp/fixes.py` and register it in `_FIX_REGISTRY`
+8. Update the rules table in `README.md`
 
 ## Reporting Issues
 
