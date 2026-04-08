@@ -66,6 +66,12 @@ _FROZEN_QUALIFIERS = {
     b"List",
     b"Set",
     b"Map",
+    b"ImmutableList",
+    b"ImmutableSet",
+    b"ImmutableMap",
+    b"ImmutableSortedSet",
+    b"ImmutableSortedMap",
+    b"ImmutableMultiset",
 }
 
 # Collections utility methods that produce frozen wrappers
