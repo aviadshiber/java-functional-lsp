@@ -14,6 +14,8 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 REQUEST_TIMEOUT = 30.0  # seconds
+DEFAULT_JVM_MAX_HEAP = "4g"
+_STDERR_LINE_MAX = 1000
 
 
 def encode_message(body: dict[str, Any]) -> bytes:
@@ -55,6 +57,7 @@ class JdtlsProxy:
     def __init__(self, on_diagnostics: Callable[[str, list[Any]], None] | None = None) -> None:
         self._process: asyncio.subprocess.Process | None = None
         self._reader_task: asyncio.Task[None] | None = None
+        self._stderr_task: asyncio.Task[None] | None = None
         self._next_id: int = 1
         self._pending: dict[int, asyncio.Future[Any]] = {}
         self._diagnostics_cache: dict[str, list[Any]] = {}
@@ -96,15 +99,18 @@ class JdtlsProxy:
                 jdtls_path,
                 "-data",
                 str(data_dir),
+                f"--jvm-arg=-Xmx{DEFAULT_JVM_MAX_HEAP}",
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
             logger.info("jdtls subprocess started (pid=%s, data=%s)", self._process.pid, data_dir)
 
-            # Start background reader
+            # Start background readers for stdout (JSON-RPC) and stderr (diagnostics/errors)
             assert self._process.stdout is not None
             self._reader_task = asyncio.create_task(self._reader_loop(self._process.stdout))
+            if self._process.stderr is not None:
+                self._stderr_task = asyncio.create_task(self._stderr_reader(self._process.stderr))
 
             # Send initialize request
             result = await self.send_request("initialize", init_params)
@@ -131,6 +137,8 @@ class JdtlsProxy:
 
         if self._reader_task and not self._reader_task.done():
             self._reader_task.cancel()
+        if self._stderr_task and not self._stderr_task.done():
+            self._stderr_task.cancel()
 
         if self._process and self._process.returncode is None:
             try:
@@ -216,6 +224,34 @@ class JdtlsProxy:
         except Exception as e:
             logger.error("jdtls reader loop error: %s", e)
             self._available = False
+
+    async def _stderr_reader(self, stderr: asyncio.StreamReader) -> None:
+        """Background task: log jdtls stderr output for debugging.
+
+        Uses read() with a fixed buffer instead of readline() to avoid
+        asyncio.LimitOverrunError on long lines (>64KB), which would kill
+        the task and deadlock jdtls when the stderr pipe buffer fills.
+        """
+        try:
+            while True:
+                chunk = await stderr.read(8192)
+                if not chunk:
+                    break
+                for line in chunk.decode("utf-8", errors="replace").splitlines():
+                    text = line.rstrip()
+                    if not text:
+                        continue
+                    # Truncate long lines to avoid flooding logs
+                    if len(text) > _STDERR_LINE_MAX:
+                        text = text[:_STDERR_LINE_MAX] + "..."
+                    if "SEVERE" in text or "ERROR" in text or "Exception" in text:
+                        logger.error("jdtls stderr: %s", text)
+                    else:
+                        logger.debug("jdtls stderr: %s", text)
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            logger.error("jdtls stderr reader error: %s", e)
 
     def _dispatch_message(self, msg: dict[str, Any]) -> None:
         """Route a message from jdtls to the appropriate handler."""
