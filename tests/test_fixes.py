@@ -9,6 +9,7 @@ from java_functional_lsp.fixes import (
     fix_frozen_mutation,
     fix_null_check_to_monadic,
     fix_null_return,
+    fix_try_catch_to_monadic,
     get_fix_registry_keys,
 )
 
@@ -653,3 +654,285 @@ class TestFixNullReturn:
         edits = result.changes["file:///test.java"]
         assert len(edits) == 1
         assert "Option.none()" in edits[0].new_text
+
+
+class TestFixTryCatchToMonadic:
+    # The canonical test source places the `try` keyword at line 2, cols 8-11
+    # (under a top-level class declaration with a single-method body).
+    _TRY_RANGE = _range(2, 8, 2, 11)
+
+    def test_pattern1_eager_literal(self) -> None:
+        """String literal default → eager .getOrElse("default") with no lambda."""
+        source = (
+            "class T {\n"
+            "    String f() {\n"
+            "        try {\n"
+            "            return risky();\n"
+            "        } catch (IOException e) {\n"
+            '            return "default";\n'
+            "        }\n"
+            "    }\n"
+            "}\n"
+        )
+        result = fix_try_catch_to_monadic("file:///test.java", source, self._TRY_RANGE, {})
+        assert result is not None
+        assert result.changes is not None
+        edits = result.changes["file:///test.java"]
+        rewrite = next(e for e in edits if "Try.of" in e.new_text)
+        assert "Try.of(() -> risky())" in rewrite.new_text
+        assert '.getOrElse("default")' in rewrite.new_text
+        # Eager — no lambda wrapping on the default
+        assert '() -> "default"' not in rewrite.new_text
+
+    def test_pattern1_eager_identifier(self) -> None:
+        """Bare identifier → eager .getOrElse(identifier)."""
+        source = (
+            "class T {\n"
+            "    String f() {\n"
+            "        try {\n"
+            "            return risky();\n"
+            "        } catch (IOException e) {\n"
+            "            return fallback;\n"
+            "        }\n"
+            "    }\n"
+            "}\n"
+        )
+        result = fix_try_catch_to_monadic("file:///test.java", source, self._TRY_RANGE, {})
+        assert result is not None
+        assert result.changes is not None
+        edits = result.changes["file:///test.java"]
+        rewrite = next(e for e in edits if "Try.of" in e.new_text)
+        assert ".getOrElse(fallback)" in rewrite.new_text
+        assert "() -> fallback" not in rewrite.new_text
+
+    def test_pattern1_lazy_method_call(self) -> None:
+        """Method-call default → lazy .getOrElse(() -> computeDefault())."""
+        source = (
+            "class T {\n"
+            "    String f() {\n"
+            "        try {\n"
+            "            return risky();\n"
+            "        } catch (IOException e) {\n"
+            "            return computeDefault();\n"
+            "        }\n"
+            "    }\n"
+            "}\n"
+        )
+        result = fix_try_catch_to_monadic("file:///test.java", source, self._TRY_RANGE, {})
+        assert result is not None
+        assert result.changes is not None
+        edits = result.changes["file:///test.java"]
+        rewrite = next(e for e in edits if "Try.of" in e.new_text)
+        assert ".getOrElse(() -> computeDefault())" in rewrite.new_text
+
+    def test_pattern2_logging_onfailure(self) -> None:
+        """Logging + return → Try.of().onFailure(e -> log).getOrElse(default)."""
+        source = (
+            "class T {\n"
+            "    String f() {\n"
+            "        try {\n"
+            "            return risky();\n"
+            "        } catch (IOException e) {\n"
+            '            logger.warn("failed", e);\n'
+            '            return "default";\n'
+            "        }\n"
+            "    }\n"
+            "}\n"
+        )
+        result = fix_try_catch_to_monadic("file:///test.java", source, self._TRY_RANGE, {})
+        assert result is not None
+        assert result.changes is not None
+        edits = result.changes["file:///test.java"]
+        rewrite = next(e for e in edits if "Try.of" in e.new_text)
+        assert '.onFailure(e -> logger.warn("failed", e))' in rewrite.new_text
+        assert '.getOrElse("default")' in rewrite.new_text
+
+    def test_pattern3_recover_with_exception_var(self) -> None:
+        """Recovery uses exception var → .recover(Type.class, e -> expr).get()."""
+        source = (
+            "class T {\n"
+            "    String f() {\n"
+            "        try {\n"
+            "            return risky();\n"
+            "        } catch (IOException e) {\n"
+            "            return fallback(e);\n"
+            "        }\n"
+            "    }\n"
+            "}\n"
+        )
+        result = fix_try_catch_to_monadic("file:///test.java", source, self._TRY_RANGE, {})
+        assert result is not None
+        assert result.changes is not None
+        edits = result.changes["file:///test.java"]
+        rewrite = next(e for e in edits if "Try.of" in e.new_text)
+        assert ".recover(IOException.class, e -> fallback(e))" in rewrite.new_text
+        assert ".get()" in rewrite.new_text
+        # Must not use getOrElse in Pattern 3
+        assert ".getOrElse(" not in rewrite.new_text
+
+    def test_pattern3_generic_exception_type(self) -> None:
+        """Generic Exception type works the same as specific types."""
+        source = (
+            "class T {\n"
+            "    String f() {\n"
+            "        try {\n"
+            "            return risky();\n"
+            "        } catch (Exception ex) {\n"
+            "            return handle(ex);\n"
+            "        }\n"
+            "    }\n"
+            "}\n"
+        )
+        result = fix_try_catch_to_monadic("file:///test.java", source, self._TRY_RANGE, {})
+        assert result is not None
+        assert result.changes is not None
+        edits = result.changes["file:///test.java"]
+        rewrite = next(e for e in edits if "Try.of" in e.new_text)
+        assert ".recover(Exception.class, ex -> handle(ex))" in rewrite.new_text
+
+    def test_imports_vavr_try(self) -> None:
+        source = (
+            "class T {\n"
+            "    String f() {\n"
+            "        try {\n"
+            "            return risky();\n"
+            "        } catch (Exception e) {\n"
+            "            return fallback;\n"
+            "        }\n"
+            "    }\n"
+            "}\n"
+        )
+        result = fix_try_catch_to_monadic("file:///test.java", source, self._TRY_RANGE, {})
+        assert result is not None
+        assert result.changes is not None
+        edits = result.changes["file:///test.java"]
+        assert any("import io.vavr.control.Try;" in e.new_text for e in edits)
+
+    def test_no_import_when_disabled(self) -> None:
+        source = (
+            "class T {\n"
+            "    String f() {\n"
+            "        try {\n"
+            "            return risky();\n"
+            "        } catch (Exception e) {\n"
+            "            return fallback;\n"
+            "        }\n"
+            "    }\n"
+            "}\n"
+        )
+        result = fix_try_catch_to_monadic("file:///test.java", source, self._TRY_RANGE, {"autoImportVavr": False})
+        assert result is not None
+        assert result.changes is not None
+        edits = result.changes["file:///test.java"]
+        assert not any("import" in e.new_text for e in edits)
+
+    def test_no_duplicate_import(self) -> None:
+        source = (
+            "import io.vavr.control.Try;\n"
+            "\n"
+            "class T {\n"
+            "    String f() {\n"
+            "        try {\n"
+            "            return risky();\n"
+            "        } catch (Exception e) {\n"
+            "            return fallback;\n"
+            "        }\n"
+            "    }\n"
+            "}\n"
+        )
+        # try keyword is on line 4 now (import + blank + class + method)
+        result = fix_try_catch_to_monadic("file:///test.java", source, _range(4, 8, 4, 11), {})
+        assert result is not None
+        assert result.changes is not None
+        edits = result.changes["file:///test.java"]
+        assert not any("import" in e.new_text for e in edits)
+
+    def test_multi_statement_try_returns_none(self) -> None:
+        source = (
+            "class T {\n"
+            "    String f() {\n"
+            "        try {\n"
+            "            String x = risky();\n"
+            "            return x.trim();\n"
+            "        } catch (Exception e) { return fallback; }\n"
+            "    }\n"
+            "}\n"
+        )
+        result = fix_try_catch_to_monadic("file:///test.java", source, self._TRY_RANGE, {})
+        assert result is None
+
+    def test_finally_returns_none(self) -> None:
+        source = (
+            "class T {\n"
+            "    String f() {\n"
+            "        try {\n"
+            "            return risky();\n"
+            "        } catch (Exception e) {\n"
+            "            return fallback;\n"
+            "        } finally {\n"
+            "            cleanup();\n"
+            "        }\n"
+            "    }\n"
+            "}\n"
+        )
+        result = fix_try_catch_to_monadic("file:///test.java", source, self._TRY_RANGE, {})
+        assert result is None
+
+    def test_multi_catch_returns_none(self) -> None:
+        source = (
+            "class T {\n"
+            "    String f() {\n"
+            "        try {\n"
+            "            return risky();\n"
+            "        } catch (IOException e) {\n"
+            "            return a;\n"
+            "        } catch (SQLException e) {\n"
+            "            return b;\n"
+            "        }\n"
+            "    }\n"
+            "}\n"
+        )
+        result = fix_try_catch_to_monadic("file:///test.java", source, self._TRY_RANGE, {})
+        assert result is None
+
+    def test_unknown_prior_statement_returns_none(self) -> None:
+        """Prior statement that isn't a recognized side-effect call → no auto-fix."""
+        source = (
+            "class T {\n"
+            "    String f() {\n"
+            "        try {\n"
+            "            return risky();\n"
+            "        } catch (Exception e) {\n"
+            "            cache.put(key, fallback);\n"
+            "            return fallback;\n"
+            "        }\n"
+            "    }\n"
+            "}\n"
+        )
+        result = fix_try_catch_to_monadic("file:///test.java", source, self._TRY_RANGE, {})
+        assert result is None
+
+    def test_replaces_full_try_statement(self) -> None:
+        """The fix should replace the entire try_statement range with `return <chain>;`."""
+        source = (
+            "class T {\n"
+            "    String f() {\n"
+            "        try {\n"
+            "            return risky();\n"
+            "        } catch (Exception e) {\n"
+            "            return fallback;\n"
+            "        }\n"
+            "    }\n"
+            "}\n"
+        )
+        result = fix_try_catch_to_monadic("file:///test.java", source, self._TRY_RANGE, {})
+        assert result is not None
+        assert result.changes is not None
+        edits = result.changes["file:///test.java"]
+        rewrite = next(e for e in edits if "Try.of" in e.new_text)
+        # Replacement text should start with "return " and end with ";"
+        assert rewrite.new_text.startswith("return ")
+        assert rewrite.new_text.endswith(";")
+        # The range should start at the `try` keyword (line 2, col 8)
+        assert rewrite.range.start.line == 2
+        assert rewrite.range.start.character == 8

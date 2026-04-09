@@ -184,7 +184,7 @@ wheels = [
 
 [[package]]
 name = "java-functional-lsp"
-version = "0.6.2"
+version = "0.6.6"
 source = { editable = "." }
 dependencies = [
     { name = "pygls" },

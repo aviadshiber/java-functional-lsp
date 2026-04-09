@@ -129,3 +129,168 @@ class TestBeanSuppression:
         diags = parse_and_analyze(ExceptionChecker(), source)
         assert not any(d.code == "catch-rethrow" for d in diags)
         assert not any(d.code == "throw-statement" for d in diags)
+
+
+class TestTryCatchToMonadic:
+    def test_detects_simple_try_return(self) -> None:
+        source = b"""
+        class T {
+            String f() {
+                try { return risky(); }
+                catch (IOException e) { return "default"; }
+            }
+        }
+        """
+        diags = parse_and_analyze(ExceptionChecker(), source)
+        assert any(d.code == "try-catch-to-monadic" for d in diags)
+
+    def test_detects_logging_then_return(self) -> None:
+        source = b"""
+        class T {
+            String f() {
+                try { return risky(); }
+                catch (IOException e) {
+                    logger.warn("failed", e);
+                    return "fallback";
+                }
+            }
+        }
+        """
+        diags = parse_and_analyze(ExceptionChecker(), source)
+        assert any(d.code == "try-catch-to-monadic" for d in diags)
+
+    def test_detects_recover_pattern(self) -> None:
+        source = b"""
+        class T {
+            String f() {
+                try { return risky(); }
+                catch (IOException e) { return fallback(e); }
+            }
+        }
+        """
+        diags = parse_and_analyze(ExceptionChecker(), source)
+        assert any(d.code == "try-catch-to-monadic" for d in diags)
+
+    def test_diagnostic_on_try_keyword(self) -> None:
+        """Diagnostic range should cover only the `try` keyword (3 chars)."""
+        source = b"""
+        class T {
+            String f() {
+                try { return risky(); }
+                catch (Exception e) { return "x"; }
+            }
+        }
+        """
+        diags = parse_and_analyze(ExceptionChecker(), source)
+        d = next(x for x in diags if x.code == "try-catch-to-monadic")
+        # Narrow range: only the `try` keyword
+        assert d.line == d.end_line
+        assert d.end_col - d.col == 3  # len("try")
+
+    def test_ignores_try_with_finally(self) -> None:
+        source = b"""
+        class T {
+            String f() {
+                try { return risky(); }
+                catch (Exception e) { return "x"; }
+                finally { cleanup(); }
+            }
+        }
+        """
+        diags = parse_and_analyze(ExceptionChecker(), source)
+        assert not any(d.code == "try-catch-to-monadic" for d in diags)
+
+    def test_ignores_multi_catch(self) -> None:
+        source = b"""
+        class T {
+            String f() {
+                try { return risky(); }
+                catch (IOException e) { return "io"; }
+                catch (SQLException e) { return "sql"; }
+            }
+        }
+        """
+        diags = parse_and_analyze(ExceptionChecker(), source)
+        assert not any(d.code == "try-catch-to-monadic" for d in diags)
+
+    def test_ignores_multi_statement_try_body(self) -> None:
+        source = b"""
+        class T {
+            String f() {
+                try {
+                    String x = risky();
+                    return x.trim();
+                } catch (Exception e) { return "x"; }
+            }
+        }
+        """
+        diags = parse_and_analyze(ExceptionChecker(), source)
+        assert not any(d.code == "try-catch-to-monadic" for d in diags)
+
+    def test_ignores_try_without_return(self) -> None:
+        source = b"""
+        class T {
+            void f() {
+                try { risky(); }
+                catch (Exception e) { log(e); }
+            }
+        }
+        """
+        diags = parse_and_analyze(ExceptionChecker(), source)
+        assert not any(d.code == "try-catch-to-monadic" for d in diags)
+
+    def test_severity_is_hint_by_default(self) -> None:
+        from java_functional_lsp.analyzers.base import Severity
+
+        source = b"""
+        class T {
+            String f() {
+                try { return risky(); }
+                catch (Exception e) { return "x"; }
+            }
+        }
+        """
+        diags = parse_and_analyze(ExceptionChecker(), source)
+        d = next(x for x in diags if x.code == "try-catch-to-monadic")
+        assert d.severity == Severity.HINT
+
+    def test_suppressed_in_bean_method(self) -> None:
+        source = b"""
+        class Config {
+            @Bean
+            DataSource dataSource() {
+                try { return connect(); }
+                catch (Exception e) { return fallback; }
+            }
+        }
+        """
+        diags = parse_and_analyze(ExceptionChecker(), source)
+        assert not any(d.code == "try-catch-to-monadic" for d in diags)
+
+    def test_has_diagnostic_data(self) -> None:
+        source = b"""
+        class T {
+            String f() {
+                try { return risky(); }
+                catch (Exception e) { return "x"; }
+            }
+        }
+        """
+        diags = parse_and_analyze(ExceptionChecker(), source)
+        d = next(x for x in diags if x.code == "try-catch-to-monadic")
+        assert d.data is not None
+        assert d.data.fix_type == "WRAP_IN_TRY"
+        assert d.data.target_library == "io.vavr.control.Try"
+
+    def test_disabled_by_config(self) -> None:
+        source = b"""
+        class T {
+            String f() {
+                try { return risky(); }
+                catch (Exception e) { return "x"; }
+            }
+        }
+        """
+        config = {"rules": {"try-catch-to-monadic": "off"}}
+        diags = parse_and_analyze(ExceptionChecker(), source, config)
+        assert not any(d.code == "try-catch-to-monadic" for d in diags)

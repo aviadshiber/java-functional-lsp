@@ -14,6 +14,7 @@ from lsprotocol import types as lsp
 from tree_sitter import Node, Tree
 
 from .analyzers.base import extract_null_check_var, find_ancestor, find_nodes, get_parser
+from .analyzers.functional_checker import is_side_effect_invocation
 
 logger = logging.getLogger(__name__)
 
@@ -660,12 +661,212 @@ def fix_null_return(
     return lsp.WorkspaceEdit(changes={uri: edits})
 
 
+# --- try-catch-to-monadic ---
+
+
+def _find_try_node(tree: Tree, diag_range: lsp.Range) -> Node | None:
+    """Find the try_statement node at the given diagnostic range."""
+    target = tree.root_node.descendant_for_point_range(
+        (diag_range.start.line, diag_range.start.character),
+        (diag_range.end.line, diag_range.end.character),
+    )
+    if target is None:
+        return None
+    if target.type == "try_statement":
+        return target
+    return find_ancestor(target, "try_statement")
+
+
+def _first_method_invocation(stmt: Node) -> Node | None:
+    """Return the first method_invocation descendant of stmt, or None."""
+    for inv in find_nodes(stmt, "method_invocation"):
+        return inv
+    return None
+
+
+def _references_var(node: Node, var_name: bytes) -> bool:
+    """True if any identifier descendant of node has text equal to var_name."""
+    cursor = node.walk()
+    visited_children = False
+    while True:
+        if not visited_children:
+            cur = cursor.node
+            if cur is not None and cur.type == "identifier" and cur.text == var_name:
+                return True
+            if not cursor.goto_first_child():
+                visited_children = True
+        elif cursor.goto_next_sibling():
+            visited_children = False
+        elif not cursor.goto_parent():
+            break
+    return False
+
+
+def _extract_try_catch_parts(
+    try_node: Node,
+) -> tuple[Node, str, str, list[Node], Node] | None:
+    """Extract (try_return_expr, catch_type_text, exc_var_name, prior_stmts, catch_return_expr).
+
+    Returns None if the shape doesn't match the supported try-catch-to-monadic pattern:
+    - No finally clause
+    - Exactly one catch clause
+    - Try body is a block with a single return_statement that has an expression
+    - Catch body ends with a return_statement; prior statements are expression_statements
+    """
+    # Reject if finally present
+    if any(c.type == "finally_clause" for c in try_node.children):
+        return None
+
+    # Exactly one catch clause
+    catches = [c for c in try_node.children if c.type == "catch_clause"]
+    if len(catches) != 1:
+        return None
+    catch = catches[0]
+
+    # Try body must be a block with a single return_statement with an expression
+    body = try_node.child_by_field_name("body")
+    if body is None or body.type != "block":
+        return None
+    try_stmts = [c for c in body.named_children if c.type not in ("line_comment", "block_comment")]
+    if len(try_stmts) != 1 or try_stmts[0].type != "return_statement":
+        return None
+    try_ret_children = [c for c in try_stmts[0].named_children if c.type not in ("line_comment", "block_comment")]
+    if not try_ret_children:
+        return None
+    try_return_expr = try_ret_children[0]
+
+    # Extract catch parameter: type + name
+    param = next((c for c in catch.children if c.type == "catch_formal_parameter"), None)
+    if param is None:
+        return None
+    catch_type_node = next((c for c in param.children if c.type == "catch_type"), None)
+    # The name is an identifier child of the catch_formal_parameter
+    exc_name_node = next((c for c in param.children if c.type == "identifier"), None)
+    if catch_type_node is None or exc_name_node is None:
+        return None
+    catch_type_text = catch_type_node.text.decode("utf-8") if catch_type_node.text else ""
+    exc_var_name = exc_name_node.text.decode("utf-8") if exc_name_node.text else ""
+    if not catch_type_text or not exc_var_name:
+        return None
+    # Reject union types (multi-catch): "A | B"
+    if "|" in catch_type_text:
+        return None
+
+    # Catch body: 0+ expression_statements then return_statement
+    catch_body = catch.child_by_field_name("body")
+    if catch_body is None or catch_body.type != "block":
+        return None
+    catch_stmts = [c for c in catch_body.named_children if c.type not in ("line_comment", "block_comment")]
+    if not catch_stmts or catch_stmts[-1].type != "return_statement":
+        return None
+    prior_stmts = catch_stmts[:-1]
+    if any(s.type != "expression_statement" for s in prior_stmts):
+        return None
+    ret_children = [c for c in catch_stmts[-1].named_children if c.type not in ("line_comment", "block_comment")]
+    if not ret_children:
+        return None
+    catch_return_expr = ret_children[0]
+
+    return (try_return_expr, catch_type_text, exc_var_name, prior_stmts, catch_return_expr)
+
+
+def fix_try_catch_to_monadic(
+    uri: str,
+    source: str,
+    diag_range: lsp.Range,
+    config: dict[str, Any],
+    *,
+    tree: Tree | None = None,
+    lines: list[str] | None = None,
+) -> lsp.WorkspaceEdit | None:
+    """Generate a fix for try-catch-to-monadic: rewrite try/catch to Try.of() monadic chain.
+
+    Supports three patterns:
+    - Pattern 1: simple catch with default → ``Try.of(() -> expr).getOrElse(default)``
+    - Pattern 2: logging + default → ``Try.of(() -> expr).onFailure(e -> log).getOrElse(default)``
+    - Pattern 3: exception-dependent recovery → ``Try.of(() -> expr).recover(E.class, e -> f(e)).get()``
+
+    Pass ``lines`` to avoid re-splitting the source when called from a context that has
+    already split it (e.g. ``on_code_action`` in server.py).
+    """
+    if lines is None:
+        lines = source.split("\n")
+    if tree is None:
+        tree = get_parser().parse(source.encode("utf-8"))
+
+    try_node = _find_try_node(tree, diag_range)
+    if try_node is None:
+        return None
+
+    parts = _extract_try_catch_parts(try_node)
+    if parts is None:
+        return None
+    try_return_expr, catch_type_text, exc_var_name, prior_stmts, catch_return_expr = parts
+
+    # Pattern 2 gating: only allow a single prior statement that is a recognized side-effect call
+    on_failure: str | None = None
+    if len(prior_stmts) > 1:
+        return None
+    if len(prior_stmts) == 1:
+        prior = prior_stmts[0]
+        invocation = _first_method_invocation(prior)
+        if invocation is None or not is_side_effect_invocation(invocation):
+            return None
+        prior_text = prior.text.decode("utf-8") if prior.text else ""
+        stmt_text = prior_text.rstrip().rstrip(";").strip()
+        on_failure = f".onFailure({exc_var_name} -> {stmt_text})"
+
+    # Build Try.of(() -> <try_return_expr>) [+ .onFailure(...)]
+    try_body_text = try_return_expr.text.decode("utf-8") if try_return_expr.text else ""
+    chain = f"Try.of(() -> {try_body_text})"
+    if on_failure is not None:
+        chain += on_failure
+
+    # Pattern 3 vs Pattern 1: does the catch-return expression reference the exception var?
+    catch_expr_text = catch_return_expr.text.decode("utf-8") if catch_return_expr.text else ""
+    if _references_var(catch_return_expr, exc_var_name.encode("utf-8")):
+        # Pattern 3: .recover(Type.class, e -> expr).get()
+        chain += f".recover({catch_type_text}.class, {exc_var_name} -> {catch_expr_text}).get()"
+    elif _is_eager(catch_return_expr):
+        # Pattern 1 (eager): literal/identifier default
+        chain += f".getOrElse({catch_expr_text})"
+    else:
+        # Pattern 1 (lazy): method call or complex expression
+        chain += f".getOrElse(() -> {catch_expr_text})"
+
+    # Build edits
+    edits: list[lsp.TextEdit] = []
+    if config.get("autoImportVavr", True):
+        import_edit = ensure_import(lines, "io.vavr.control.Try")
+        if import_edit is not None:
+            edits.append(import_edit)
+
+    replace_start = lsp.Position(line=try_node.start_point[0], character=try_node.start_point[1])
+    replace_end = lsp.Position(line=try_node.end_point[0], character=try_node.end_point[1])
+    edits.append(
+        lsp.TextEdit(
+            range=lsp.Range(start=replace_start, end=replace_end),
+            new_text=f"return {chain};",
+        )
+    )
+
+    logger.debug(
+        "try-catch-to-monadic rewrite: pattern=%s, lines %d-%d",
+        "recover" if ".recover(" in chain else ("onFailure" if on_failure else "getOrElse"),
+        try_node.start_point[0],
+        try_node.end_point[0],
+    )
+
+    return lsp.WorkspaceEdit(changes={uri: edits})
+
+
 # --- Fix registry ---
 
 _FIX_REGISTRY: dict[str, FixGenerator] = {
     "frozen-mutation": fix_frozen_mutation,
     "null-check-to-monadic": fix_null_check_to_monadic,
     "null-return": fix_null_return,
+    "try-catch-to-monadic": fix_try_catch_to_monadic,
 }
 
 
