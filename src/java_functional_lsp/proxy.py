@@ -11,7 +11,7 @@ import platform
 import re
 import shutil
 import subprocess
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any
 
@@ -20,9 +20,69 @@ logger = logging.getLogger(__name__)
 REQUEST_TIMEOUT = 30.0  # seconds
 DEFAULT_JVM_MAX_HEAP = "4g"
 _STDERR_LINE_MAX = 1000
+
+#: Minimum Java major version required by jdtls 1.57+. Anything below this
+#: is rejected by the jdtls Python launcher with ``"jdtls requires at least
+#: Java 21"`` before the server even starts.
 _MIN_JDTLS_JAVA_MAJOR = 21
+
+#: Matches the first version token in ``java -version`` output. Handles:
+#: - modern format: ``openjdk version "21.0.10" 2026-01-20``
+#: - legacy Java 8: ``openjdk version "1.8.0_452"`` (captures ``1``; caller
+#:   must still apply the ``>= _MIN_JDTLS_JAVA_MAJOR`` semantic check)
+#: - early access: ``openjdk version "25-ea" 2026-02-15``
+#: - internal: ``openjdk version "17-internal"``
 _JAVA_VERSION_PATTERN = re.compile(r'version\s"(\d+)(?:\.\d+\.\d+(?:_\d+)?)?(?:-[^"]*)?"')
-_JAVA_VERSION_CHECK_TIMEOUT_SEC = 5
+
+#: Timeout for ``java -version`` and ``/usr/libexec/java_home`` subprocess calls.
+#: Cold JVM startup is typically 200-500ms; 2 seconds covers slow filesystems
+#: and macOS Gatekeeper signing checks while bounding event-loop blockage for
+#: hung/broken binaries. These calls run in a thread pool (see JdtlsProxy.start)
+#: so they never block the asyncio event loop.
+_JAVA_VERSION_CHECK_TIMEOUT_SEC = 2
+
+#: Trusted-prefix allow-list for the PATH-based Java fallback. When deriving
+#: JAVA_HOME from ``which java``, we reject anything whose parent.parent is
+#: a system root prefix — a direct ``/usr/bin/java`` binary would otherwise
+#: yield ``JAVA_HOME=/usr`` which is not a valid JDK home.
+_SYSTEM_ROOT_PREFIXES = frozenset({"/", "/usr", "/usr/local", "/bin", "/sbin", "/opt"})
+
+#: Allow-list of environment variables forwarded to the jdtls subprocess.
+#: Everything else is dropped to avoid leaking secrets (AWS/GitHub/Anthropic
+#: tokens, API keys) that may live in the LSP parent-process environment.
+#: jdtls is a third-party binary and we cannot guarantee how it handles
+#: inherited env vars (crash dumps, telemetry, verbose logs).
+_JDTLS_ENV_ALLOWLIST = frozenset(
+    {
+        "PATH",
+        "HOME",
+        "USER",
+        "LOGNAME",
+        "SHELL",
+        "LANG",
+        "TMPDIR",
+        "TEMP",
+        "TMP",
+        "JAVA_HOME",
+        "JAVA_TOOL_OPTIONS",
+    }
+)
+
+#: Variable-name prefixes also forwarded (locale and XDG desktop config).
+_JDTLS_ENV_PREFIX_ALLOWLIST = ("LC_", "XDG_", "JDTLS_")
+
+
+def _redact_path(path: str | None) -> str:
+    """Return a log-safe representation of a filesystem path.
+
+    Logs only the basename and a path-length indicator to avoid leaking
+    usernames and internal directory layouts through diagnostic output
+    (CWE-532). Returns ``"<unset>"`` for None/empty paths.
+    """
+    if not path:
+        return "<unset>"
+    basename = os.path.basename(path.rstrip("/")) or path
+    return f".../{basename}"
 
 
 def _read_java_major_version(java_executable: str) -> int | None:
@@ -31,6 +91,10 @@ def _read_java_major_version(java_executable: str) -> int | None:
     Runs ``java -version`` and parses the first ``"<major>..."`` token.
     Returns None on any subprocess or parse failure so callers can keep
     probing alternative candidates without raising.
+
+    Note: for Java 8 (``"1.8.0_452"``) this captures ``1``. Callers must
+    still apply the ``>= _MIN_JDTLS_JAVA_MAJOR`` semantic check — do not
+    interpret the return value as "Java 1".
     """
     try:
         out = subprocess.check_output(
@@ -51,15 +115,40 @@ def _read_java_major_version(java_executable: str) -> int | None:
 
 
 def _java_home_has_suitable_version(java_home: str) -> bool:
-    """Return True if ``java_home/bin/java`` exists and is Java 21 or later."""
+    """Return True if ``java_home/bin/java`` exists and is Java 21 or later.
+
+    Logs at debug level when the binary exists but the version check fails
+    (e.g., permission denied, corrupt binary) so users can understand why
+    their JAVA_HOME was rejected.
+    """
     candidate = Path(java_home) / "bin" / "java"
     if not candidate.is_file():
+        logger.debug("jdtls: JAVA_HOME candidate %s missing bin/java", _redact_path(java_home))
         return False
     major = _read_java_major_version(str(candidate))
-    return major is not None and major >= _MIN_JDTLS_JAVA_MAJOR
+    if major is None:
+        logger.debug(
+            "jdtls: could not read java -version from %s (not executable or unreadable)",
+            _redact_path(java_home),
+        )
+        return False
+    if major < _MIN_JDTLS_JAVA_MAJOR:
+        logger.debug(
+            "jdtls: JAVA_HOME candidate %s is Java %d (< %d)", _redact_path(java_home), major, _MIN_JDTLS_JAVA_MAJOR
+        )
+        return False
+    return True
 
 
-def find_jdtls_java_home(environ: dict[str, str] | None = None) -> str | None:
+def _is_system_root_prefix(path: Path) -> bool:
+    """Return True if ``path`` is a system root directory unsuitable as JAVA_HOME."""
+    try:
+        return str(path.resolve()) in _SYSTEM_ROOT_PREFIXES
+    except OSError:
+        return False
+
+
+def find_jdtls_java_home(environ: Mapping[str, str] | None = None) -> str | None:
     """Find a JAVA_HOME that points at Java 21+ suitable for running jdtls.
 
     Checks in order:
@@ -76,17 +165,29 @@ def find_jdtls_java_home(environ: dict[str, str] | None = None) -> str | None:
     """
     env = environ if environ is not None else os.environ
 
-    # 1. Explicit override takes precedence over everything.
+    # 1. Explicit override takes precedence over everything. If set but invalid,
+    #    log a warning so users understand why their override was rejected and
+    #    fall through to the remaining resolution steps.
     override = env.get("JDTLS_JAVA_HOME")
-    if override and _java_home_has_suitable_version(override):
-        return override
+    if override:
+        if _java_home_has_suitable_version(override):
+            logger.debug("jdtls: using JDTLS_JAVA_HOME override")
+            return override
+        logger.warning(
+            "jdtls: JDTLS_JAVA_HOME (%s) does not point at Java %d+; ignoring and probing other sources",
+            _redact_path(override),
+            _MIN_JDTLS_JAVA_MAJOR,
+        )
 
     # 2. Current JAVA_HOME if it's already Java 21+.
     existing = env.get("JAVA_HOME")
     if existing and _java_home_has_suitable_version(existing):
+        logger.debug("jdtls: using inherited JAVA_HOME")
         return existing
 
-    # 3. macOS: ask the OS for a Java 21+ install.
+    # 3. macOS: ask the OS for a Java 21+ install. /usr/libexec/java_home -v 21+
+    #    guarantees the returned path is Java 21+ (it errors otherwise), so we
+    #    trust its output and skip a redundant java -version re-check.
     if platform.system() == "Darwin":
         try:
             out = subprocess.check_output(
@@ -97,50 +198,84 @@ def find_jdtls_java_home(environ: dict[str, str] | None = None) -> str | None:
             ).strip()
         except (OSError, subprocess.SubprocessError):
             out = ""
-        if out and Path(out).is_dir() and _java_home_has_suitable_version(out):
+        if out and Path(out).is_dir():
+            logger.debug("jdtls: resolved via /usr/libexec/java_home -v %d+", _MIN_JDTLS_JAVA_MAJOR)
             return out
 
     # 4. java on PATH — derive JAVA_HOME as <java>/../.. if the version is new enough.
-    java_on_path = shutil.which("java")
+    #    Pass the caller's PATH explicitly so tests and alternative environments
+    #    can control which java is found.
+    java_on_path = shutil.which("java", path=env.get("PATH"))
     if java_on_path is not None:
         major = _read_java_major_version(java_on_path)
         if major is not None and major >= _MIN_JDTLS_JAVA_MAJOR:
-            # Resolve symlinks first so the parent walk yields the real Home directory.
+            # Resolve symlinks first so the parent walk yields the real Home directory
+            # (e.g., /usr/bin/java → /opt/jdk21/bin/java → JAVA_HOME=/opt/jdk21).
             resolved = Path(java_on_path).resolve()
             derived_home = resolved.parent.parent
-            if (derived_home / "bin" / "java").is_file():
+            # Reject system-root prefixes: a bare /usr/bin/java would otherwise
+            # yield JAVA_HOME=/usr which jdtls cannot use.
+            if _is_system_root_prefix(derived_home):
+                logger.debug(
+                    "jdtls: PATH java at %s resolves to system prefix %s; skipping",
+                    java_on_path,
+                    derived_home,
+                )
+            elif (derived_home / "bin" / "java").is_file():
+                logger.debug("jdtls: resolved via java on PATH")
                 return str(derived_home)
 
+    logger.debug("jdtls: no Java %d+ found in any source", _MIN_JDTLS_JAVA_MAJOR)
     return None
 
 
-def build_jdtls_env(environ: dict[str, str] | None = None) -> dict[str, str]:
+def build_jdtls_env(environ: Mapping[str, str] | None = None) -> dict[str, str]:
     """Build the environment for the jdtls subprocess.
 
-    If a Java 21+ installation is found, sets ``JAVA_HOME`` to its path.
-    Otherwise strips ``JAVA_HOME`` from the inherited env so the jdtls
-    launcher falls back to its bundled default — this handles the common
-    case where an IDE launches the LSP with ``JAVA_HOME`` inherited from
-    the project SDK (which may be Java 8/11/17 and too old for jdtls).
+    Uses an **allow-list** approach rather than copying the full parent env:
+    only variables in ``_JDTLS_ENV_ALLOWLIST`` or matching a prefix in
+    ``_JDTLS_ENV_PREFIX_ALLOWLIST`` are forwarded. This prevents secrets
+    (AWS/GitHub/Anthropic tokens) that may live in the LSP parent-process
+    env from leaking into a third-party subprocess.
+
+    ``JAVA_HOME`` handling:
+
+    - If a Java 21+ installation is found (via ``find_jdtls_java_home``),
+      ``JAVA_HOME`` is set to its path in the returned env.
+    - Otherwise ``JAVA_HOME`` is omitted so the jdtls launcher falls back
+      to its own bundled default — this handles the common case where an
+      IDE launches the LSP with ``JAVA_HOME`` inherited from a project SDK
+      too old for jdtls.
 
     Pass ``environ`` to override the base environment (used by tests);
     when None, starts from ``os.environ``.
     """
-    base = dict(environ) if environ is not None else os.environ.copy()
-    suitable = find_jdtls_java_home(base)
-    if suitable is not None:
-        base["JAVA_HOME"] = suitable
-        logger.info("jdtls: using JAVA_HOME=%s", suitable)
-        return base
+    source = environ if environ is not None else os.environ
+    # Detection runs against the full source env so find_jdtls_java_home
+    # can inspect JDTLS_JAVA_HOME / JAVA_HOME / PATH before we filter.
+    suitable = find_jdtls_java_home(source)
 
-    stripped = base.pop("JAVA_HOME", None)
-    if stripped is not None:
+    # Build the filtered env. dict(...) produces an independent copy so
+    # callers of build_jdtls_env cannot mutate the source mapping by
+    # mutating the returned dict.
+    filtered: dict[str, str] = {
+        key: value
+        for key, value in source.items()
+        if key in _JDTLS_ENV_ALLOWLIST or key.startswith(_JDTLS_ENV_PREFIX_ALLOWLIST)
+    }
+
+    if suitable is not None:
+        filtered["JAVA_HOME"] = suitable
+        logger.info("jdtls: using JAVA_HOME=%s", _redact_path(suitable))
+    elif "JAVA_HOME" in filtered:
+        stripped = filtered.pop("JAVA_HOME")
         logger.warning(
-            "jdtls: no Java %d+ found (JAVA_HOME was %s); stripping JAVA_HOME so jdtls can use its bundled fallback",
+            "jdtls: no Java %d+ found (inherited JAVA_HOME=%s); stripping it so jdtls can use its bundled fallback",
             _MIN_JDTLS_JAVA_MAJOR,
-            stripped,
+            _redact_path(stripped),
         )
-    return base
+
+    return filtered
 
 
 def encode_message(body: dict[str, Any]) -> bytes:
@@ -224,7 +359,13 @@ class JdtlsProxy:
         # Java (e.g. an IDE launched us with a project SDK of Java 8). Without this,
         # jdtls 1.57+ fails with "jdtls requires at least Java 21" during its
         # Python launcher's version check.
-        jdtls_env = build_jdtls_env()
+        #
+        # build_jdtls_env() issues several blocking subprocess calls (java -version,
+        # /usr/libexec/java_home) to detect a suitable JDK. Run it in a thread pool
+        # so those calls don't block the asyncio event loop — the IDE's LSP handshake
+        # messages would otherwise stall for up to a few seconds during startup.
+        loop = asyncio.get_running_loop()
+        jdtls_env = await loop.run_in_executor(None, build_jdtls_env)
 
         try:
             self._process = await asyncio.create_subprocess_exec(
@@ -241,7 +382,7 @@ class JdtlsProxy:
                 "jdtls subprocess started (pid=%s, data=%s, JAVA_HOME=%s)",
                 self._process.pid,
                 data_dir,
-                jdtls_env.get("JAVA_HOME", "<unset>"),
+                _redact_path(jdtls_env.get("JAVA_HOME")),
             )
 
             # Start background readers for stdout (JSON-RPC) and stderr (diagnostics/errors)
