@@ -130,6 +130,37 @@ _SIDE_EFFECT_METHODS = {
 _METHOD_SCOPES = {"method_declaration", "constructor_declaration", "lambda_expression"}
 
 
+def is_side_effect_invocation(invocation: Node) -> bool:
+    """Check if a method_invocation node is a side-effect call.
+
+    Recognizes patterns like:
+    - ``System.out.println(...)`` / ``System.err.println(...)``
+    - ``logger.info(...)`` / ``log.debug(...)`` / ``LOG.warn(...)``
+    - Bare side-effect method names (e.g. ``println(...)``)
+    """
+    obj_node = invocation.child_by_field_name("object")
+    method_name = invocation.child_by_field_name("name")
+    if method_name is None:
+        return False
+
+    if obj_node is not None:
+        # System.out.println / System.err.println
+        if obj_node.type == "field_access":
+            receiver = obj_node.child_by_field_name("object")
+            if receiver is not None and receiver.text in _SIDE_EFFECT_RECEIVERS:
+                return True
+        # logger.info, log.debug, etc.
+        if obj_node.type == "identifier" and obj_node.text in _SIDE_EFFECT_RECEIVERS:
+            if method_name.text in _SIDE_EFFECT_METHODS:
+                return True
+
+    # Standalone side-effect method names
+    if method_name.text in _SIDE_EFFECT_METHODS and obj_node is None:
+        return True
+
+    return False
+
+
 class FunctionalChecker:
     """Detects frozen mutation traps, imperative null checks, and impure methods."""
 
@@ -357,25 +388,10 @@ class FunctionalChecker:
 
     @staticmethod
     def _is_side_effect_invocation(invocation: Node) -> bool:
-        """Check if a method_invocation node is a side-effect call."""
-        obj_node = invocation.child_by_field_name("object")
-        method_name = invocation.child_by_field_name("name")
-        if method_name is None:
-            return False
+        """Check if a method_invocation node is a side-effect call.
 
-        if obj_node is not None:
-            # System.out.println / System.err.println
-            if obj_node.type == "field_access":
-                receiver = obj_node.child_by_field_name("object")
-                if receiver is not None and receiver.text in _SIDE_EFFECT_RECEIVERS:
-                    return True
-            # logger.info, log.debug, etc.
-            if obj_node.type == "identifier" and obj_node.text in _SIDE_EFFECT_RECEIVERS:
-                if method_name.text in _SIDE_EFFECT_METHODS:
-                    return True
-
-        # Standalone side-effect method names
-        if method_name.text in _SIDE_EFFECT_METHODS and obj_node is None:
-            return True
-
-        return False
+        Thin delegator kept for backward compatibility; the real logic lives in
+        the module-level ``is_side_effect_invocation`` so other modules (e.g.
+        ``fixes.py``) can reuse it without importing the class.
+        """
+        return is_side_effect_invocation(invocation)

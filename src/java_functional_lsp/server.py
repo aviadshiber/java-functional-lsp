@@ -386,6 +386,7 @@ _FIX_TITLES: dict[str, str] = {
     "frozen-mutation": "Switch to Vavr Immutable Collection",
     "null-check-to-monadic": "Convert to Option monadic flow",
     "null-return": "Replace with Option.none()",
+    "try-catch-to-monadic": "Convert try/catch to Try monadic flow",
 }
 
 # Guard against title/registry mismatch at import time

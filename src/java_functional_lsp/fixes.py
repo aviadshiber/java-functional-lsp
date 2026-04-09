@@ -13,7 +13,16 @@ from typing import Any
 from lsprotocol import types as lsp
 from tree_sitter import Node, Tree
 
-from .analyzers.base import extract_null_check_var, find_ancestor, find_nodes, get_parser
+from .analyzers.base import (
+    IGNORED_CHILDREN,
+    extract_null_check_var,
+    find_ancestor,
+    find_nodes,
+    get_parser,
+    has_error_or_missing,
+    references_var,
+)
+from .analyzers.functional_checker import is_side_effect_invocation
 
 logger = logging.getLogger(__name__)
 
@@ -660,12 +669,294 @@ def fix_null_return(
     return lsp.WorkspaceEdit(changes={uri: edits})
 
 
+# --- try-catch-to-monadic ---
+
+
+def _find_try_node(tree: Tree, diag_range: lsp.Range) -> Node | None:
+    """Find the try_statement node at the given diagnostic range.
+
+    The diagnostic range typically points at the ``try`` keyword (narrow range
+    emitted by the analyzer), but editors may send a broader range that lands
+    on a descendant token. ``descendant_for_point_range`` returns the deepest
+    node containing the range; if that node is not the ``try_statement`` itself
+    we walk up via ``find_ancestor``. Unlike ``_find_method_invocation``, we do
+    not search children because the ``try_statement`` is always an ancestor of
+    any token inside a try/catch block.
+    """
+    target = tree.root_node.descendant_for_point_range(
+        (diag_range.start.line, diag_range.start.character),
+        (diag_range.end.line, diag_range.end.character),
+    )
+    if target is None:
+        return None
+    if target.type == "try_statement":
+        return target
+    return find_ancestor(target, "try_statement")
+
+
+def _first_method_invocation(stmt: Node) -> Node | None:
+    """Return the first ``method_invocation`` descendant of ``stmt``, or None.
+
+    Used by Pattern 2 logging detection to locate the side-effect call inside
+    a catch-body prior statement. For a simple statement like
+    ``logger.warn("msg", e);`` this returns the ``logger.warn`` invocation.
+
+    Limitation: if the outer expression is a non-logging call wrapping a
+    logging call (e.g. ``cache.put(k, logger.warn(...))``), this returns the
+    outer call and the caller's ``is_side_effect_invocation`` check rejects
+    it — which is the safe behaviour (no fix rather than incorrect fix).
+    """
+    for inv in find_nodes(stmt, "method_invocation"):
+        return inv
+    return None
+
+
+def _validate_and_extract_try_catch_parts(
+    try_node: Node,
+) -> tuple[Node, str, str, list[Node], Node] | None:
+    """Validate try/catch shape and extract parts needed to build the rewrite.
+
+    Returns ``(try_return_expr, catch_type_text, exc_var_name, prior_stmts, catch_return_expr)``
+    or ``None`` if the shape doesn't match.
+
+    This function re-validates the same shape as
+    ``exception_checker._matches_try_catch_monadic_shape`` as a defense in depth:
+    the fix generator must be robust when called directly (e.g. from tests, or
+    when the diagnostic is stale). Both functions must stay in sync — any shape
+    rejected by one must also be rejected by the other.
+
+    Requirements (must mirror the analyzer):
+    - No resource_specification (try-with-resources)
+    - No finally_clause
+    - Exactly one catch_clause
+    - Catch type must not be a union (``A | B``)
+    - Try body is a block with a single return_statement that has an expression
+    - Catch body ends with a return_statement with an expression; prior stmts are expression_statements
+    """
+    # Single pass over try_node.children
+    has_finally = False
+    has_resources = False
+    catches: list[Node] = []
+    for c in try_node.children:
+        if c.type == "finally_clause":
+            has_finally = True
+        elif c.type == "resource_specification":
+            has_resources = True
+        elif c.type == "catch_clause":
+            catches.append(c)
+
+    if has_finally or has_resources:
+        return None
+    if len(catches) != 1:
+        return None
+    catch = catches[0]
+
+    # Try body must be a block with a single return_statement with an expression
+    body = try_node.child_by_field_name("body")
+    if body is None or body.type != "block":
+        return None
+    try_stmts = [c for c in body.named_children if c.type not in IGNORED_CHILDREN]
+    if len(try_stmts) != 1 or try_stmts[0].type != "return_statement":
+        return None
+    try_ret_children = [c for c in try_stmts[0].named_children if c.type not in IGNORED_CHILDREN]
+    if not try_ret_children:
+        return None
+    try_return_expr = try_ret_children[0]
+
+    # Extract catch parameter: type + name
+    param = next((c for c in catch.children if c.type == "catch_formal_parameter"), None)
+    if param is None:
+        return None
+    catch_type_node = next((c for c in param.children if c.type == "catch_type"), None)
+    # The name is an identifier child of the catch_formal_parameter
+    exc_name_node = next((c for c in param.children if c.type == "identifier"), None)
+    if catch_type_node is None or exc_name_node is None:
+        return None
+    catch_type_text = catch_type_node.text.decode("utf-8") if catch_type_node.text else ""
+    exc_var_name = exc_name_node.text.decode("utf-8") if exc_name_node.text else ""
+    if not catch_type_text or not exc_var_name:
+        return None
+    # Reject union types (multi-catch): "A | B"
+    if "|" in catch_type_text:
+        return None
+
+    # Catch body: 0+ expression_statements then return_statement
+    catch_body = catch.child_by_field_name("body")
+    if catch_body is None or catch_body.type != "block":
+        return None
+    catch_stmts = [c for c in catch_body.named_children if c.type not in IGNORED_CHILDREN]
+    if not catch_stmts or catch_stmts[-1].type != "return_statement":
+        return None
+    prior_stmts = catch_stmts[:-1]
+    if any(s.type != "expression_statement" for s in prior_stmts):
+        return None
+    ret_children = [c for c in catch_stmts[-1].named_children if c.type not in IGNORED_CHILDREN]
+    if not ret_children:
+        return None
+    catch_return_expr = ret_children[0]
+
+    return (try_return_expr, catch_type_text, exc_var_name, prior_stmts, catch_return_expr)
+
+
+def _strip_trailing_semicolon(text: str) -> str:
+    """Strip exactly one trailing ';' from a statement's text (not all trailing semicolons).
+
+    ``str.rstrip(';')`` treats its argument as a **character set**, so it would
+    greedily strip any number of trailing semicolons. For a well-formed
+    ``expression_statement``, the text ends in exactly one ``;``. Use
+    ``removesuffix`` to strip at most one, preserving any semantically
+    meaningful content.
+    """
+    stripped = text.rstrip()
+    return stripped.removesuffix(";").rstrip()
+
+
+def fix_try_catch_to_monadic(
+    uri: str,
+    source: str,
+    diag_range: lsp.Range,
+    config: dict[str, Any],
+    *,
+    tree: Tree | None = None,
+    lines: list[str] | None = None,
+) -> lsp.WorkspaceEdit | None:
+    """Generate a fix for try-catch-to-monadic: rewrite try/catch to a Vavr ``Try.of()`` chain.
+
+    Supports three patterns:
+
+    - **Pattern 1** — simple catch with default:
+      ``try { return expr; } catch (E e) { return default; }``
+      → ``return Try.of(() -> expr).getOrElse(default);``
+      (eager vs lazy ``.getOrElse(...)`` via ``_is_eager``)
+
+    - **Pattern 2** — logging + default:
+      ``try { return expr; } catch (E e) { log(e); return default; }``
+      → ``return Try.of(() -> expr).onFailure(e -> log(e)).getOrElse(default);``
+      (prior statement must be a recognized side-effect invocation; otherwise
+      no fix is produced)
+
+    - **Pattern 3** — exception-dependent recovery:
+      ``try { return expr; } catch (E e) { return f(e); }``
+      → ``return Try.of(() -> expr).recover(E.class, e -> f(e)).get();``
+
+    **Semantic limitation of Pattern 3:** ``.recover(E.class, ...).get()``
+    re-throws any failure whose type is NOT ``E``. The original Java code
+    would propagate non-E exceptions through the catch unchanged — for
+    checked exceptions this is identical, but if ``risky()`` also throws
+    unchecked exceptions beyond ``E``, the original code would propagate
+    them as-is while the rewrite wraps them through Vavr's exception
+    handling machinery. In practice the behaviour is equivalent for
+    well-formed Java code where the catch type matches the method's
+    declared throws list.
+
+    **Rejected combinations:** Pattern 2 + Pattern 3 (logging + exception-
+    dependent recovery) is explicitly rejected rather than silently emitting
+    a hybrid ``.onFailure(...).recover(...)`` chain, since that combination
+    is neither tested nor documented.
+
+    Pass ``lines`` to avoid re-splitting the source when called from a context
+    that has already split it (e.g. ``on_code_action`` in server.py).
+    """
+    if lines is None:
+        lines = source.split("\n")
+    if tree is None:
+        tree = get_parser().parse(source.encode("utf-8"))
+
+    try_node = _find_try_node(tree, diag_range)
+    if try_node is None:
+        logger.debug("try-catch-to-monadic: no try_statement found at range %s", diag_range)
+        return None
+
+    # Defensive gate: refuse to rewrite subtrees with ERROR or MISSING nodes.
+    # Editors send partial trees during incremental typing; emitting edits for
+    # those would produce invalid Java.
+    if has_error_or_missing(try_node):
+        logger.debug("try-catch-to-monadic: try_statement contains ERROR/MISSING nodes, skipping")
+        return None
+
+    parts = _validate_and_extract_try_catch_parts(try_node)
+    if parts is None:
+        logger.debug("try-catch-to-monadic: shape validation failed")
+        return None
+    try_return_expr, catch_type_text, exc_var_name, prior_stmts, catch_return_expr = parts
+
+    try_body_text = try_return_expr.text.decode("utf-8") if try_return_expr.text else ""
+    catch_expr_text = catch_return_expr.text.decode("utf-8") if catch_return_expr.text else ""
+    if not try_body_text or not catch_expr_text:
+        logger.debug("try-catch-to-monadic: empty try/catch expression text")
+        return None
+
+    uses_exc = references_var(catch_return_expr, exc_var_name.encode("utf-8"))
+
+    # Pattern 2 gating: only allow a single prior statement that is a recognized
+    # side-effect call. Also reject Pattern 2 + Pattern 3 hybrid explicitly.
+    on_failure: str | None = None
+    if len(prior_stmts) > 1:
+        logger.debug("try-catch-to-monadic: too many prior statements (%d)", len(prior_stmts))
+        return None
+    if len(prior_stmts) == 1:
+        if uses_exc:
+            # Pattern 2 + Pattern 3 hybrid is out of scope for v1.
+            logger.debug("try-catch-to-monadic: Pattern 2+3 hybrid rejected")
+            return None
+        prior = prior_stmts[0]
+        invocation = _first_method_invocation(prior)
+        if invocation is None or not is_side_effect_invocation(invocation):
+            logger.debug("try-catch-to-monadic: prior statement is not a recognized side-effect call")
+            return None
+        prior_text = prior.text.decode("utf-8") if prior.text else ""
+        stmt_text = _strip_trailing_semicolon(prior_text)
+        on_failure = f".onFailure({exc_var_name} -> {stmt_text})"
+
+    # Build Try.of(() -> <try_return_expr>) [+ .onFailure(...)]
+    chain = f"Try.of(() -> {try_body_text})"
+    if on_failure is not None:
+        chain += on_failure
+
+    # Pattern 3 vs Pattern 1: does the catch-return expression reference the exception var?
+    if uses_exc:
+        # Pattern 3: .recover(Type.class, e -> expr).get()
+        chain += f".recover({catch_type_text}.class, {exc_var_name} -> {catch_expr_text}).get()"
+    elif _is_eager(catch_return_expr):
+        # Pattern 1 (eager): literal/identifier default
+        chain += f".getOrElse({catch_expr_text})"
+    else:
+        # Pattern 1 (lazy): method call or complex expression
+        chain += f".getOrElse(() -> {catch_expr_text})"
+
+    # Build edits
+    edits: list[lsp.TextEdit] = []
+    if config.get("autoImportVavr", True):
+        import_edit = ensure_import(lines, "io.vavr.control.Try")
+        if import_edit is not None:
+            edits.append(import_edit)
+
+    replace_start = lsp.Position(line=try_node.start_point[0], character=try_node.start_point[1])
+    replace_end = lsp.Position(line=try_node.end_point[0], character=try_node.end_point[1])
+    edits.append(
+        lsp.TextEdit(
+            range=lsp.Range(start=replace_start, end=replace_end),
+            new_text=f"return {chain};",
+        )
+    )
+
+    logger.debug(
+        "try-catch-to-monadic rewrite: pattern=%s, lines %d-%d",
+        "recover" if uses_exc else ("onFailure+getOrElse" if on_failure else "getOrElse"),
+        try_node.start_point[0],
+        try_node.end_point[0],
+    )
+
+    return lsp.WorkspaceEdit(changes={uri: edits})
+
+
 # --- Fix registry ---
 
 _FIX_REGISTRY: dict[str, FixGenerator] = {
     "frozen-mutation": fix_frozen_mutation,
     "null-check-to-monadic": fix_null_check_to_monadic,
     "null-return": fix_null_return,
+    "try-catch-to-monadic": fix_try_catch_to_monadic,
 }
 
 

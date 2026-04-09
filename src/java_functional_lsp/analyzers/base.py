@@ -49,6 +49,10 @@ class Analyzer(Protocol):
         ...
 
 
+#: Tree-sitter child node types that should be skipped when iterating named_children.
+#: Shared across analyzers and fix generators so comment-filtering stays consistent.
+IGNORED_CHILDREN = ("line_comment", "block_comment")
+
 _parser: Parser | None = None
 _language: Language | None = None
 
@@ -141,6 +145,54 @@ def has_ancestor(node: Node, type_names: set[str]) -> bool:
         if parent.type in type_names:
             return True
         parent = parent.parent
+    return False
+
+
+def references_var(node: Node, var_name: bytes) -> bool:
+    """Return True if any identifier descendant of ``node`` has text equal to ``var_name``.
+
+    Used to detect whether an expression references a given variable (e.g. an
+    exception variable inside a catch-return expression). Uses a TreeCursor walk
+    for performance — no recursion, no allocation per node.
+    """
+    cursor = node.walk()
+    visited_children = False
+    while True:
+        if not visited_children:
+            cur = cursor.node
+            if cur is not None and cur.type == "identifier" and cur.text == var_name:
+                return True
+            if not cursor.goto_first_child():
+                visited_children = True
+        elif cursor.goto_next_sibling():
+            visited_children = False
+        elif not cursor.goto_parent():
+            break
+    return False
+
+
+def has_error_or_missing(node: Node) -> bool:
+    """Return True if the subtree rooted at ``node`` contains any ERROR or MISSING nodes.
+
+    Used by fix generators as a defensive gate: tree-sitter's error recovery
+    produces partial trees for malformed input (common during incremental typing
+    in editors), and emitting a rewrite from such input can produce invalid edits.
+    """
+    if node.has_error or node.is_missing:
+        return True
+    cursor = node.walk()
+    visited_children = False
+    while True:
+        if not visited_children:
+            cur = cursor.node
+            if cur is not None and (cur.type == "ERROR" or cur.is_missing):
+                return True
+            if not cursor.goto_first_child():
+                visited_children = True
+        elif cursor.goto_next_sibling():
+            visited_children = False
+        elif not cursor.goto_parent():
+            break
     return False
 
 
