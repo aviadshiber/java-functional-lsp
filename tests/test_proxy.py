@@ -9,7 +9,14 @@ from unittest.mock import patch
 
 import pytest
 
-from java_functional_lsp.proxy import JdtlsProxy, encode_message, read_message
+from java_functional_lsp.proxy import (
+    JdtlsProxy,
+    _read_java_major_version,
+    build_jdtls_env,
+    encode_message,
+    find_jdtls_java_home,
+    read_message,
+)
 
 
 class TestEncodeMessage:
@@ -246,3 +253,158 @@ class TestServerHelpers:
         diags = _analyze_document("class T { String f() { return null; } }")
         codes = [d.code for d in diags]
         assert "null-return" in codes
+
+
+class TestReadJavaMajorVersion:
+    """Parsing of the ``java -version`` output."""
+
+    def test_parses_modern_java(self) -> None:
+        """Modern Java reports like ``openjdk version "21.0.10" 2026-01-20``."""
+        import java_functional_lsp.proxy as proxy_mod
+
+        with patch.object(proxy_mod.subprocess, "check_output") as mock_co:
+            mock_co.return_value = 'openjdk version "21.0.10" 2026-01-20\n'
+            assert _read_java_major_version("/fake/java") == 21
+
+    def test_parses_java_8_legacy_format(self) -> None:
+        """Legacy Java 8 reports like ``openjdk version "1.8.0_452"`` — major should be 1."""
+        import java_functional_lsp.proxy as proxy_mod
+
+        with patch.object(proxy_mod.subprocess, "check_output") as mock_co:
+            mock_co.return_value = 'openjdk version "1.8.0_452"\n'
+            assert _read_java_major_version("/fake/java") == 1
+
+    def test_parses_java_25_ea(self) -> None:
+        """Early-access releases like ``openjdk version "25-ea" ...``."""
+        import java_functional_lsp.proxy as proxy_mod
+
+        with patch.object(proxy_mod.subprocess, "check_output") as mock_co:
+            mock_co.return_value = 'openjdk version "25-ea" 2026-02-15\n'
+            assert _read_java_major_version("/fake/java") == 25
+
+    def test_returns_none_on_subprocess_error(self) -> None:
+        import java_functional_lsp.proxy as proxy_mod
+
+        with patch.object(proxy_mod.subprocess, "check_output", side_effect=OSError):
+            assert _read_java_major_version("/fake/java") is None
+
+    def test_returns_none_on_unparseable_output(self) -> None:
+        import java_functional_lsp.proxy as proxy_mod
+
+        with patch.object(proxy_mod.subprocess, "check_output") as mock_co:
+            mock_co.return_value = "not a java version string"
+            assert _read_java_major_version("/fake/java") is None
+
+
+class TestFindJdtlsJavaHome:
+    """Resolution of a Java 21+ JAVA_HOME suitable for running jdtls."""
+
+    def test_explicit_override_takes_precedence(self, tmp_path: Any) -> None:
+        """JDTLS_JAVA_HOME wins over JAVA_HOME even if JAVA_HOME is also valid."""
+        import java_functional_lsp.proxy as proxy_mod
+
+        # Create a fake JAVA_HOME layout so the file-existence check passes.
+        fake_home = tmp_path / "jdk21"
+        (fake_home / "bin").mkdir(parents=True)
+        (fake_home / "bin" / "java").touch()
+
+        with patch.object(proxy_mod, "_read_java_major_version", return_value=21):
+            result = find_jdtls_java_home({"JDTLS_JAVA_HOME": str(fake_home), "JAVA_HOME": "/other"})
+        assert result == str(fake_home)
+
+    def test_uses_java_home_when_suitable(self, tmp_path: Any) -> None:
+        """If JAVA_HOME already points at Java 21+, use it as-is."""
+        import java_functional_lsp.proxy as proxy_mod
+
+        fake_home = tmp_path / "jdk21"
+        (fake_home / "bin").mkdir(parents=True)
+        (fake_home / "bin" / "java").touch()
+
+        with patch.object(proxy_mod, "_read_java_major_version", return_value=21):
+            result = find_jdtls_java_home({"JAVA_HOME": str(fake_home)})
+        assert result == str(fake_home)
+
+    def test_ignores_old_java_home(self, tmp_path: Any) -> None:
+        """JAVA_HOME pointing at Java 8 must NOT be returned."""
+        import java_functional_lsp.proxy as proxy_mod
+
+        fake_home = tmp_path / "jdk8"
+        (fake_home / "bin").mkdir(parents=True)
+        (fake_home / "bin" / "java").touch()
+
+        # Also force macOS fallback + PATH fallback to fail so we get None.
+        with (
+            patch.object(proxy_mod, "_read_java_major_version", return_value=1),
+            patch.object(proxy_mod.platform, "system", return_value="Linux"),
+            patch.object(proxy_mod.shutil, "which", return_value=None),
+        ):
+            result = find_jdtls_java_home({"JAVA_HOME": str(fake_home)})
+        assert result is None
+
+    def test_ignores_nonexistent_java_home(self) -> None:
+        """JAVA_HOME pointing at a non-existent directory is skipped."""
+        import java_functional_lsp.proxy as proxy_mod
+
+        with (
+            patch.object(proxy_mod.platform, "system", return_value="Linux"),
+            patch.object(proxy_mod.shutil, "which", return_value=None),
+        ):
+            result = find_jdtls_java_home({"JAVA_HOME": "/definitely/not/a/real/jdk"})
+        assert result is None
+
+    def test_macos_fallback_to_java_home_cmd(self, tmp_path: Any) -> None:
+        """On macOS, falls back to /usr/libexec/java_home -v 21+ when JAVA_HOME is bad."""
+        import java_functional_lsp.proxy as proxy_mod
+
+        fake_home = tmp_path / "jdk25"
+        (fake_home / "bin").mkdir(parents=True)
+        (fake_home / "bin" / "java").touch()
+
+        with (
+            patch.object(proxy_mod.platform, "system", return_value="Darwin"),
+            patch.object(proxy_mod.subprocess, "check_output", return_value=f"{fake_home}\n"),
+            patch.object(proxy_mod, "_read_java_major_version", return_value=25),
+        ):
+            result = find_jdtls_java_home({"JAVA_HOME": "/nope"})
+        assert result == str(fake_home)
+
+    def test_returns_none_when_nothing_suitable(self) -> None:
+        """When nothing works, returns None so caller can strip JAVA_HOME."""
+        import java_functional_lsp.proxy as proxy_mod
+
+        with (
+            patch.object(proxy_mod.platform, "system", return_value="Linux"),
+            patch.object(proxy_mod.shutil, "which", return_value=None),
+        ):
+            result = find_jdtls_java_home({})
+        assert result is None
+
+
+class TestBuildJdtlsEnv:
+    """Environment construction for the jdtls subprocess."""
+
+    def test_sets_java_home_when_found(self) -> None:
+        """When find_jdtls_java_home returns a path, JAVA_HOME is set in the env."""
+        import java_functional_lsp.proxy as proxy_mod
+
+        with patch.object(proxy_mod, "find_jdtls_java_home", return_value="/opt/jdk21"):
+            env = build_jdtls_env({"PATH": "/usr/bin", "JAVA_HOME": "/old/java"})
+        assert env["JAVA_HOME"] == "/opt/jdk21"
+        assert env["PATH"] == "/usr/bin"  # other vars preserved
+
+    def test_strips_java_home_when_no_suitable_java(self) -> None:
+        """When no Java 21+ found, JAVA_HOME is removed so jdtls uses its fallback."""
+        import java_functional_lsp.proxy as proxy_mod
+
+        with patch.object(proxy_mod, "find_jdtls_java_home", return_value=None):
+            env = build_jdtls_env({"PATH": "/usr/bin", "JAVA_HOME": "/old/java"})
+        assert "JAVA_HOME" not in env
+        assert env["PATH"] == "/usr/bin"
+
+    def test_no_java_home_in_env_is_ok(self) -> None:
+        """If the base env has no JAVA_HOME, build_jdtls_env must not crash."""
+        import java_functional_lsp.proxy as proxy_mod
+
+        with patch.object(proxy_mod, "find_jdtls_java_home", return_value=None):
+            env = build_jdtls_env({"PATH": "/usr/bin"})
+        assert "JAVA_HOME" not in env

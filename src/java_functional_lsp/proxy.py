@@ -6,7 +6,11 @@ import asyncio
 import hashlib
 import json
 import logging
+import os
+import platform
+import re
 import shutil
+import subprocess
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -16,6 +20,127 @@ logger = logging.getLogger(__name__)
 REQUEST_TIMEOUT = 30.0  # seconds
 DEFAULT_JVM_MAX_HEAP = "4g"
 _STDERR_LINE_MAX = 1000
+_MIN_JDTLS_JAVA_MAJOR = 21
+_JAVA_VERSION_PATTERN = re.compile(r'version\s"(\d+)(?:\.\d+\.\d+(?:_\d+)?)?(?:-[^"]*)?"')
+_JAVA_VERSION_CHECK_TIMEOUT_SEC = 5
+
+
+def _read_java_major_version(java_executable: str) -> int | None:
+    """Return the major version of ``java_executable``, or None if unreadable.
+
+    Runs ``java -version`` and parses the first ``"<major>..."`` token.
+    Returns None on any subprocess or parse failure so callers can keep
+    probing alternative candidates without raising.
+    """
+    try:
+        out = subprocess.check_output(
+            [java_executable, "-version"],
+            stderr=subprocess.STDOUT,
+            universal_newlines=True,
+            timeout=_JAVA_VERSION_CHECK_TIMEOUT_SEC,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    match = _JAVA_VERSION_PATTERN.search(out)
+    if match is None:
+        return None
+    try:
+        return int(match.group(1))
+    except ValueError:
+        return None
+
+
+def _java_home_has_suitable_version(java_home: str) -> bool:
+    """Return True if ``java_home/bin/java`` exists and is Java 21 or later."""
+    candidate = Path(java_home) / "bin" / "java"
+    if not candidate.is_file():
+        return False
+    major = _read_java_major_version(str(candidate))
+    return major is not None and major >= _MIN_JDTLS_JAVA_MAJOR
+
+
+def find_jdtls_java_home(environ: dict[str, str] | None = None) -> str | None:
+    """Find a JAVA_HOME that points at Java 21+ suitable for running jdtls.
+
+    Checks in order:
+    1. ``JDTLS_JAVA_HOME`` env var (explicit user override)
+    2. ``JAVA_HOME`` if it points at Java 21+
+    3. macOS: ``/usr/libexec/java_home -v 21+``
+    4. ``java`` on PATH if it reports version >= 21
+
+    Returns None if no suitable Java is found — callers should strip
+    ``JAVA_HOME`` from the subprocess env so jdtls can fall back to its
+    bundled default.
+
+    Pass ``environ`` to override ``os.environ`` lookups (used by tests).
+    """
+    env = environ if environ is not None else os.environ
+
+    # 1. Explicit override takes precedence over everything.
+    override = env.get("JDTLS_JAVA_HOME")
+    if override and _java_home_has_suitable_version(override):
+        return override
+
+    # 2. Current JAVA_HOME if it's already Java 21+.
+    existing = env.get("JAVA_HOME")
+    if existing and _java_home_has_suitable_version(existing):
+        return existing
+
+    # 3. macOS: ask the OS for a Java 21+ install.
+    if platform.system() == "Darwin":
+        try:
+            out = subprocess.check_output(
+                ["/usr/libexec/java_home", "-v", f"{_MIN_JDTLS_JAVA_MAJOR}+"],
+                stderr=subprocess.DEVNULL,
+                universal_newlines=True,
+                timeout=_JAVA_VERSION_CHECK_TIMEOUT_SEC,
+            ).strip()
+        except (OSError, subprocess.SubprocessError):
+            out = ""
+        if out and Path(out).is_dir() and _java_home_has_suitable_version(out):
+            return out
+
+    # 4. java on PATH — derive JAVA_HOME as <java>/../.. if the version is new enough.
+    java_on_path = shutil.which("java")
+    if java_on_path is not None:
+        major = _read_java_major_version(java_on_path)
+        if major is not None and major >= _MIN_JDTLS_JAVA_MAJOR:
+            # Resolve symlinks first so the parent walk yields the real Home directory.
+            resolved = Path(java_on_path).resolve()
+            derived_home = resolved.parent.parent
+            if (derived_home / "bin" / "java").is_file():
+                return str(derived_home)
+
+    return None
+
+
+def build_jdtls_env(environ: dict[str, str] | None = None) -> dict[str, str]:
+    """Build the environment for the jdtls subprocess.
+
+    If a Java 21+ installation is found, sets ``JAVA_HOME`` to its path.
+    Otherwise strips ``JAVA_HOME`` from the inherited env so the jdtls
+    launcher falls back to its bundled default — this handles the common
+    case where an IDE launches the LSP with ``JAVA_HOME`` inherited from
+    the project SDK (which may be Java 8/11/17 and too old for jdtls).
+
+    Pass ``environ`` to override the base environment (used by tests);
+    when None, starts from ``os.environ``.
+    """
+    base = dict(environ) if environ is not None else os.environ.copy()
+    suitable = find_jdtls_java_home(base)
+    if suitable is not None:
+        base["JAVA_HOME"] = suitable
+        logger.info("jdtls: using JAVA_HOME=%s", suitable)
+        return base
+
+    stripped = base.pop("JAVA_HOME", None)
+    if stripped is not None:
+        logger.warning(
+            "jdtls: no Java %d+ found (JAVA_HOME was %s); stripping JAVA_HOME so jdtls can use its bundled fallback",
+            _MIN_JDTLS_JAVA_MAJOR,
+            stripped,
+        )
+    return base
 
 
 def encode_message(body: dict[str, Any]) -> bytes:
@@ -94,6 +219,13 @@ class JdtlsProxy:
         data_dir = Path.home() / ".cache" / "jdtls-data" / workspace_hash
         data_dir.mkdir(parents=True, exist_ok=True)
 
+        # Build a clean environment for jdtls: detect Java 21+ and set JAVA_HOME
+        # explicitly, or strip JAVA_HOME if the inherited value points at an older
+        # Java (e.g. an IDE launched us with a project SDK of Java 8). Without this,
+        # jdtls 1.57+ fails with "jdtls requires at least Java 21" during its
+        # Python launcher's version check.
+        jdtls_env = build_jdtls_env()
+
         try:
             self._process = await asyncio.create_subprocess_exec(
                 jdtls_path,
@@ -103,8 +235,14 @@ class JdtlsProxy:
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                env=jdtls_env,
             )
-            logger.info("jdtls subprocess started (pid=%s, data=%s)", self._process.pid, data_dir)
+            logger.info(
+                "jdtls subprocess started (pid=%s, data=%s, JAVA_HOME=%s)",
+                self._process.pid,
+                data_dir,
+                jdtls_env.get("JAVA_HOME", "<unset>"),
+            )
 
             # Start background readers for stdout (JSON-RPC) and stderr (diagnostics/errors)
             assert self._process.stdout is not None
