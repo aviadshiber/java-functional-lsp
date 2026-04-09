@@ -460,16 +460,63 @@ class TestFindJdtlsJavaHome:
         assert result is None
 
     def test_path_fallback_rejects_system_prefix(self) -> None:
-        """A direct /usr/bin/java binary (not a symlink) must not yield JAVA_HOME=/usr."""
+        """A direct /usr/bin/java binary (not a symlink) must not yield JAVA_HOME=/usr.
+
+        This reproduces the Docker-container edge case where /usr/bin/java is a
+        standalone JDK binary rather than an update-alternatives symlink. We
+        patch Path.resolve to be an identity function so the test is independent
+        of the CI host's actual filesystem — on Ubuntu CI, /usr/bin/java is a
+        real symlink to /usr/lib/jvm/... which would otherwise defeat the test.
+        """
+        from pathlib import Path
+
+        # Identity resolver: return the path unchanged instead of following symlinks.
+        # This matches the Docker-container scenario where /usr/bin/java is a real
+        # binary. The same patch also affects _is_system_root_prefix, which is fine:
+        # Path("/usr").resolve() → Path("/usr") → str == "/usr" → system prefix.
+        def identity_resolve(self: Path, strict: bool = False) -> Path:
+            del strict  # kwargs-compatible signature; Path.resolve accepts `strict`
+            return self
+
         with (
             patch.object(proxy_mod.platform, "system", return_value="Linux"),
             patch.object(proxy_mod.shutil, "which", return_value="/usr/bin/java"),
             patch.object(proxy_mod, "_read_java_major_version", return_value=21),
+            patch.object(Path, "resolve", identity_resolve),
         ):
             result = find_jdtls_java_home({})
         # /usr is a system-root prefix and must be rejected even though Java 21+ exists.
         assert result != "/usr"
         assert result is None
+
+    def test_path_fallback_follows_symlink_to_real_jdk(self, tmp_path: Any) -> None:
+        """The common Ubuntu case: /usr/bin/java is a symlink to a real JDK install.
+
+        Path.resolve follows the symlink so parent.parent yields the real JDK home
+        (e.g. /usr/lib/jvm/temurin-21-jdk-amd64), which is NOT a system prefix and
+        is correctly accepted.
+        """
+        from pathlib import Path
+
+        # Lay out a fake real JDK at tmp_path/jvm/jdk21/bin/java and create a
+        # symlink at tmp_path/usr_bin_java pointing at it.
+        real_jdk = tmp_path / "jvm" / "jdk21"
+        (real_jdk / "bin").mkdir(parents=True)
+        (real_jdk / "bin" / "java").touch()
+        symlink = tmp_path / "usr_bin_java"
+        symlink.symlink_to(real_jdk / "bin" / "java")
+
+        # Sanity: resolve() should follow the symlink to the real JDK binary.
+        assert Path(symlink).resolve() == (real_jdk / "bin" / "java").resolve()
+
+        with (
+            patch.object(proxy_mod.platform, "system", return_value="Linux"),
+            patch.object(proxy_mod.shutil, "which", return_value=str(symlink)),
+            patch.object(proxy_mod, "_read_java_major_version", return_value=21),
+        ):
+            result = find_jdtls_java_home({})
+
+        assert result == str(real_jdk.resolve())
 
     def test_path_fallback_uses_passed_environ_path(self, tmp_path: Any) -> None:
         """shutil.which must honor the passed environ's PATH, not os.environ."""
