@@ -936,3 +936,181 @@ class TestFixTryCatchToMonadic:
         # The range should start at the `try` keyword (line 2, col 8)
         assert rewrite.range.start.line == 2
         assert rewrite.range.start.character == 8
+        # The range should end at the closing brace of the try/catch block on line 6, col 9.
+        # Source has try { ... } on line 2 through line 6 (closing brace column 9).
+        assert rewrite.range.end.line == 6
+        assert rewrite.range.end.character == 9
+
+    def test_exact_equality_on_new_text(self) -> None:
+        """Pin the full rewrite output for one canonical Pattern 1 case."""
+        source = (
+            "class T {\n"
+            "    String f() {\n"
+            "        try {\n"
+            "            return risky();\n"
+            "        } catch (IOException e) {\n"
+            '            return "default";\n'
+            "        }\n"
+            "    }\n"
+            "}\n"
+        )
+        result = fix_try_catch_to_monadic("file:///test.java", source, self._TRY_RANGE, {})
+        assert result is not None
+        assert result.changes is not None
+        edits = result.changes["file:///test.java"]
+        rewrite = next(e for e in edits if "Try.of" in e.new_text)
+        assert rewrite.new_text == 'return Try.of(() -> risky()).getOrElse("default");'
+
+    def test_pattern2_with_non_e_variable_name(self) -> None:
+        """Pattern 2 must use the actual catch variable name, not hardcoded `e`."""
+        source = (
+            "class T {\n"
+            "    String f() {\n"
+            "        try {\n"
+            "            return risky();\n"
+            "        } catch (IOException ex) {\n"
+            '            logger.warn("failed", ex);\n'
+            '            return "default";\n'
+            "        }\n"
+            "    }\n"
+            "}\n"
+        )
+        result = fix_try_catch_to_monadic("file:///test.java", source, self._TRY_RANGE, {})
+        assert result is not None
+        assert result.changes is not None
+        edits = result.changes["file:///test.java"]
+        rewrite = next(e for e in edits if "Try.of" in e.new_text)
+        assert '.onFailure(ex -> logger.warn("failed", ex))' in rewrite.new_text
+        assert '.getOrElse("default")' in rewrite.new_text
+
+    def test_bare_return_in_catch_returns_none(self) -> None:
+        """A catch body ending with bare `return;` (no expression) is not rewritable."""
+        source = (
+            "class T {\n"
+            "    void f() {\n"
+            "        try {\n"
+            "            return;\n"
+            "        } catch (Exception e) {\n"
+            "            return;\n"
+            "        }\n"
+            "    }\n"
+            "}\n"
+        )
+        result = fix_try_catch_to_monadic("file:///test.java", source, self._TRY_RANGE, {})
+        assert result is None
+
+    def test_pattern2_multiple_prior_statements_returns_none(self) -> None:
+        """Two logger calls before the return exceed Pattern 2 scope → no fix."""
+        source = (
+            "class T {\n"
+            "    String f() {\n"
+            "        try {\n"
+            "            return risky();\n"
+            "        } catch (Exception e) {\n"
+            '            logger.warn("first", e);\n'
+            '            logger.warn("second", e);\n'
+            '            return "default";\n'
+            "        }\n"
+            "    }\n"
+            "}\n"
+        )
+        result = fix_try_catch_to_monadic("file:///test.java", source, self._TRY_RANGE, {})
+        assert result is None
+
+    def test_pattern2_plus_pattern3_hybrid_returns_none(self) -> None:
+        """Logging + exception-dependent recovery is explicitly rejected (untested hybrid)."""
+        source = (
+            "class T {\n"
+            "    String f() {\n"
+            "        try {\n"
+            "            return risky();\n"
+            "        } catch (IOException e) {\n"
+            '            logger.warn("failed", e);\n'
+            "            return fallback(e);\n"
+            "        }\n"
+            "    }\n"
+            "}\n"
+        )
+        result = fix_try_catch_to_monadic("file:///test.java", source, self._TRY_RANGE, {})
+        assert result is None
+
+    def test_ancestor_walk_finds_try_from_inside(self) -> None:
+        """A diagnostic range pointing inside the try body still resolves to the try_statement."""
+        source = (
+            "class T {\n"
+            "    String f() {\n"
+            "        try {\n"
+            "            return risky();\n"
+            "        } catch (Exception e) {\n"
+            "            return fallback;\n"
+            "        }\n"
+            "    }\n"
+            "}\n"
+        )
+        # Point the range at `risky` inside the return statement (line 3, cols 19-24).
+        inner_range = _range(3, 19, 3, 24)
+        result = fix_try_catch_to_monadic("file:///test.java", source, inner_range, {})
+        assert result is not None
+        assert result.changes is not None
+        edits = result.changes["file:///test.java"]
+        rewrite = next(e for e in edits if "Try.of" in e.new_text)
+        assert "Try.of(() -> risky()).getOrElse(fallback)" in rewrite.new_text
+
+    def test_import_edit_position_is_top_of_file(self) -> None:
+        """The Try import should be inserted at line 0 when there's no package or existing import."""
+        source = (
+            "class T {\n"
+            "    String f() {\n"
+            "        try { return risky(); }\n"
+            "        catch (Exception e) { return fallback; }\n"
+            "    }\n"
+            "}\n"
+        )
+        result = fix_try_catch_to_monadic("file:///test.java", source, self._TRY_RANGE, {})
+        assert result is not None
+        assert result.changes is not None
+        edits = result.changes["file:///test.java"]
+        import_edit = next(e for e in edits if "import io.vavr.control.Try;" in e.new_text)
+        assert import_edit.range.start.line == 0
+        assert import_edit.range.start.character == 0
+
+    def test_union_catch_returns_none(self) -> None:
+        """Multi-catch (A | B e) is explicitly rejected by the fix."""
+        source = (
+            "class T {\n"
+            "    String f() {\n"
+            "        try { return risky(); }\n"
+            "        catch (IOException | SQLException e) { return fallback; }\n"
+            "    }\n"
+            "}\n"
+        )
+        result = fix_try_catch_to_monadic("file:///test.java", source, self._TRY_RANGE, {})
+        assert result is None
+
+    def test_try_with_resources_returns_none(self) -> None:
+        """try-with-resources must not be rewritten — closing the resource would be lost."""
+        source = (
+            "class T {\n"
+            "    String f() {\n"
+            "        try (java.io.InputStream is = open()) {\n"
+            "            return parse(is);\n"
+            "        } catch (java.io.IOException e) {\n"
+            '            return "empty";\n'
+            "        }\n"
+            "    }\n"
+            "}\n"
+        )
+        result = fix_try_catch_to_monadic("file:///test.java", source, self._TRY_RANGE, {})
+        assert result is None
+
+    def test_strip_trailing_semicolon_helper(self) -> None:
+        """The trailing-semicolon helper strips exactly one semicolon, not greedily."""
+        from java_functional_lsp.fixes import _strip_trailing_semicolon
+
+        assert _strip_trailing_semicolon('logger.warn("x", e);') == 'logger.warn("x", e)'
+        # removesuffix strips at most one, not all
+        assert _strip_trailing_semicolon('logger.warn("x", e);;') == 'logger.warn("x", e);'
+        # Trailing whitespace is handled
+        assert _strip_trailing_semicolon('logger.warn("x", e);  ') == 'logger.warn("x", e)'
+        # No trailing semicolon → no change
+        assert _strip_trailing_semicolon('logger.warn("x", e)') == 'logger.warn("x", e)'
