@@ -31,6 +31,67 @@ jobs:
       - name: Type check
         run: uv run mypy src/
       - name: Test
-        run: uv run pytest -q
+        run: uv run pytest -q -m "not e2e"
+        env:
+          NO_COLOR: "1"
+
+  e2e-test:
+    name: End-to-End (jdtls) / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    # One Python version is enough — the e2e tests verify the jdtls request/
+    # response pipeline, not Python-version-specific behavior. The unit
+    # matrix above already exercises every Python version.
+    steps:
+      - uses: actions/checkout@v6
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Install Java 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+      - name: Install jdtls (macOS)
+        if: runner.os == 'macOS'
+        run: brew install jdtls
+      - name: Install jdtls (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          # Download the Eclipse JDT Language Server milestone build directly.
+          # Pinned version for deterministic CI runs; bump as needed.
+          JDTLS_VERSION="1.47.0"
+          JDTLS_BUILD="202509181638"
+          JDTLS_URL="https://download.eclipse.org/jdtls/milestones/${JDTLS_VERSION}/jdt-language-server-${JDTLS_VERSION}-${JDTLS_BUILD}.tar.gz"
+          JDTLS_DIR="$HOME/.local/share/jdtls"
+          BIN_DIR="$HOME/.local/bin"
+          mkdir -p "$JDTLS_DIR" "$BIN_DIR"
+          # Follow redirects to reach the actual tarball through Eclipse's mirror.
+          curl -sSL -o /tmp/jdtls.tar.gz "$JDTLS_URL"
+          tar -xzf /tmp/jdtls.tar.gz -C "$JDTLS_DIR"
+          # Create a wrapper script on PATH that invokes the bundled Python launcher.
+          cat > "$BIN_DIR/jdtls" << SHELL_EOF
+          #!/bin/bash
+          exec python3 "$JDTLS_DIR/bin/jdtls" "\$@"
+          SHELL_EOF
+          chmod +x "$BIN_DIR/jdtls"
+          echo "$BIN_DIR" >> "$GITHUB_PATH"
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+      - name: Install dependencies
+        run: uv sync
+      - name: Verify jdtls is available
+        run: |
+          which jdtls
+          jdtls --help | head -5 || true
+          java -version
+          echo "JAVA_HOME=$JAVA_HOME"
+      - name: Run e2e tests
+        run: uv run pytest -v -m e2e
         env:
           NO_COLOR: "1"
