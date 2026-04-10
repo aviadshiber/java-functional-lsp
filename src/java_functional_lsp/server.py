@@ -228,11 +228,11 @@ def on_initialize(params: lsp.InitializeParams) -> lsp.InitializeResult:
                 change=lsp.TextDocumentSyncKind.Full,
                 save=lsp.SaveOptions(include_text=True),
             ),
-            completion_provider=lsp.CompletionOptions(trigger_characters=["."]),
-            hover_provider=True,
-            definition_provider=True,
-            references_provider=True,
-            document_symbol_provider=True,
+            # Only advertise capabilities we own (custom diagnostics + code actions).
+            # jdtls-dependent features (hover, definition, references, completion,
+            # documentSymbol) are registered dynamically after jdtls starts — see
+            # on_initialized(). This prevents us from claiming hover when jdtls
+            # isn't ready, which would suppress the IDE's diagnostic tooltips.
             code_action_provider=lsp.CodeActionOptions(
                 code_action_kinds=[lsp.CodeActionKind.QuickFix],
             ),
@@ -250,8 +250,69 @@ async def on_initialized(params: lsp.InitializedParams) -> None:
     started = await server._proxy.start(server._init_params)
     if started:
         logger.info("jdtls proxy active — full Java language support enabled")
+        await _register_jdtls_capabilities()
     else:
         logger.info("jdtls proxy unavailable — running with custom rules only")
+
+
+_JAVA_SELECTOR = [lsp.TextDocumentFilterLanguage(language="java")]
+
+_JDTLS_REG_PREFIX = "jdtls-"
+
+# jdtls-dependent capabilities registered dynamically after the proxy starts.
+# Each entry: (id_suffix, LSP method, registration options class, extra kwargs).
+_JDTLS_CAPABILITIES: list[tuple[str, str, type[Any], dict[str, Any]]] = [
+    ("completion", lsp.TEXT_DOCUMENT_COMPLETION, lsp.CompletionRegistrationOptions, {"trigger_characters": ["."]}),
+    ("hover", lsp.TEXT_DOCUMENT_HOVER, lsp.HoverRegistrationOptions, {}),
+    ("definition", lsp.TEXT_DOCUMENT_DEFINITION, lsp.DefinitionRegistrationOptions, {}),
+    ("references", lsp.TEXT_DOCUMENT_REFERENCES, lsp.ReferenceRegistrationOptions, {}),
+    ("document-symbol", lsp.TEXT_DOCUMENT_DOCUMENT_SYMBOL, lsp.DocumentSymbolRegistrationOptions, {}),
+]
+
+# Maps LSP method → handler function for dynamic registration.
+_JDTLS_HANDLERS: dict[str, Any] = {}
+
+# Set after first successful registration to prevent FeatureAlreadyRegisteredError.
+_jdtls_capabilities_registered = False
+
+
+def _build_jdtls_registrations() -> list[lsp.Registration]:
+    """Build LSP Registration objects for jdtls-dependent capabilities."""
+    return [
+        lsp.Registration(
+            id=f"{_JDTLS_REG_PREFIX}{suffix}",
+            method=method,
+            register_options=_converter.unstructure(opts_cls(document_selector=_JAVA_SELECTOR, **extra)),
+        )
+        for suffix, method, opts_cls, extra in _JDTLS_CAPABILITIES
+    ]
+
+
+async def _register_jdtls_capabilities() -> None:
+    """Dynamically register jdtls-dependent capabilities after the proxy starts.
+
+    We don't advertise these in the static InitializeResult because doing so
+    would make the IDE defer hover/definition/etc to us even before jdtls is
+    ready, which suppresses the IDE's built-in diagnostic tooltips.
+
+    Idempotent: safe to call multiple times (e.g., proxy restart).
+    """
+    global _jdtls_capabilities_registered
+    if _jdtls_capabilities_registered:
+        return
+
+    try:
+        # Register handlers so pygls dispatches incoming requests to them.
+        for method, handler in _JDTLS_HANDLERS.items():
+            server.feature(method)(handler)
+
+        # Tell the client we now support these capabilities.
+        registrations = _build_jdtls_registrations()
+        await server.client_register_capability_async(lsp.RegistrationParams(registrations=registrations))
+        _jdtls_capabilities_registered = True
+        logger.info("Dynamically registered jdtls capabilities (hover, definition, references, completion, symbol)")
+    except Exception:
+        logger.warning("Failed to dynamically register jdtls capabilities", exc_info=True)
 
 
 # --- Document sync (forward to jdtls + run custom analyzers) ---
@@ -311,11 +372,15 @@ async def on_did_close(params: lsp.DidCloseTextDocumentParams) -> None:
         await server._proxy.send_notification("textDocument/didClose", _serialize_params(params))
 
 
-# --- Forwarded features (jdtls passthrough) ---
+# --- jdtls passthrough handlers (registered dynamically, NOT at module level) ---
+#
+# These are NOT decorated with @server.feature because pygls auto-advertises
+# capabilities for decorated handlers. Instead, they are collected in
+# _JDTLS_HANDLERS and registered inside _register_jdtls_capabilities() so
+# they only activate after jdtls starts.
 
 
-@server.feature(lsp.TEXT_DOCUMENT_COMPLETION)
-async def on_completion(params: lsp.CompletionParams) -> lsp.CompletionList | None:
+async def _on_completion(params: lsp.CompletionParams) -> lsp.CompletionList | None:
     """Forward completion request to jdtls."""
     if not server._proxy.is_available:
         return None
@@ -328,8 +393,7 @@ async def on_completion(params: lsp.CompletionParams) -> lsp.CompletionList | No
         return None
 
 
-@server.feature(lsp.TEXT_DOCUMENT_HOVER)
-async def on_hover(params: lsp.HoverParams) -> lsp.Hover | None:
+async def _on_hover(params: lsp.HoverParams) -> lsp.Hover | None:
     """Forward hover request to jdtls."""
     if not server._proxy.is_available:
         return None
@@ -342,8 +406,7 @@ async def on_hover(params: lsp.HoverParams) -> lsp.Hover | None:
         return None
 
 
-@server.feature(lsp.TEXT_DOCUMENT_DEFINITION)
-async def on_definition(params: lsp.DefinitionParams) -> list[lsp.Location] | None:
+async def _on_definition(params: lsp.DefinitionParams) -> list[lsp.Location] | None:
     """Forward go-to-definition request to jdtls."""
     if not server._proxy.is_available:
         return None
@@ -358,8 +421,7 @@ async def on_definition(params: lsp.DefinitionParams) -> list[lsp.Location] | No
         return None
 
 
-@server.feature(lsp.TEXT_DOCUMENT_REFERENCES)
-async def on_references(params: lsp.ReferenceParams) -> list[lsp.Location] | None:
+async def _on_references(params: lsp.ReferenceParams) -> list[lsp.Location] | None:
     """Forward find-references request to jdtls."""
     if not server._proxy.is_available:
         return None
@@ -372,8 +434,7 @@ async def on_references(params: lsp.ReferenceParams) -> list[lsp.Location] | Non
         return None
 
 
-@server.feature(lsp.TEXT_DOCUMENT_DOCUMENT_SYMBOL)
-async def on_document_symbol(params: lsp.DocumentSymbolParams) -> list[lsp.DocumentSymbol] | None:
+async def _on_document_symbol(params: lsp.DocumentSymbolParams) -> list[lsp.DocumentSymbol] | None:
     """Forward document symbol request to jdtls."""
     if not server._proxy.is_available:
         return None
@@ -384,6 +445,18 @@ async def on_document_symbol(params: lsp.DocumentSymbolParams) -> list[lsp.Docum
         return [_converter.structure(sym, lsp.DocumentSymbol) for sym in result]
     except Exception:
         return None
+
+
+# Populate handler map for dynamic registration.
+_JDTLS_HANDLERS.update(
+    {
+        lsp.TEXT_DOCUMENT_COMPLETION: _on_completion,
+        lsp.TEXT_DOCUMENT_HOVER: _on_hover,
+        lsp.TEXT_DOCUMENT_DEFINITION: _on_definition,
+        lsp.TEXT_DOCUMENT_REFERENCES: _on_references,
+        lsp.TEXT_DOCUMENT_DOCUMENT_SYMBOL: _on_document_symbol,
+    }
+)
 
 
 # --- Code actions (quick fixes) ---

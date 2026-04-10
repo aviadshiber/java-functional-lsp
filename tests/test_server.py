@@ -290,6 +290,130 @@ class TestServerInternals:
         finally:
             server.workspace.remove_text_document(uri)
 
+    def test_init_capabilities_exclude_jdtls_features(self) -> None:
+        """Static capabilities must NOT include hover/definition/references/completion/documentSymbol.
+
+        These are registered dynamically after jdtls starts, so the IDE doesn't
+        suppress diagnostic tooltips while jdtls is unavailable.
+        """
+        from java_functional_lsp.server import on_initialize
+
+        result = on_initialize(
+            lsp.InitializeParams(
+                process_id=1,
+                root_uri="file:///tmp",
+                capabilities=lsp.ClientCapabilities(),
+            )
+        )
+        caps = result.capabilities
+        assert caps.code_action_provider is not None
+        assert caps.text_document_sync is not None
+        assert caps.hover_provider is None
+        assert caps.definition_provider is None
+        assert caps.references_provider is None
+        assert caps.completion_provider is None
+        assert caps.document_symbol_provider is None
+
+    def test_build_jdtls_registrations(self) -> None:
+        """_build_jdtls_registrations returns one Registration per jdtls capability, each scoped to java files."""
+        from java_functional_lsp.server import _JDTLS_REG_PREFIX, _build_jdtls_registrations
+
+        regs = _build_jdtls_registrations()
+        assert len(regs) == 5
+        methods = {r.method for r in regs}
+        assert lsp.TEXT_DOCUMENT_HOVER in methods
+        assert lsp.TEXT_DOCUMENT_DEFINITION in methods
+        assert lsp.TEXT_DOCUMENT_REFERENCES in methods
+        assert lsp.TEXT_DOCUMENT_COMPLETION in methods
+        assert lsp.TEXT_DOCUMENT_DOCUMENT_SYMBOL in methods
+        # All IDs are unique and use the shared prefix
+        ids = {r.id for r in regs}
+        assert len(ids) == 5
+        assert all(rid.startswith(_JDTLS_REG_PREFIX) for rid in ids)
+        # All have java document selector with correct language
+        for r in regs:
+            assert r.register_options is not None
+            selectors = r.register_options["documentSelector"]
+            assert any(s.get("language") == "java" for s in selectors)
+        # Completion has triggerCharacters
+        comp = next(r for r in regs if r.method == lsp.TEXT_DOCUMENT_COMPLETION)
+        assert comp.register_options.get("triggerCharacters") == ["."]
+
+    async def test_register_jdtls_capabilities_logs_on_failure(self, caplog: Any) -> None:
+        """_register_jdtls_capabilities logs a warning when the client rejects."""
+        import logging
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        import java_functional_lsp.server as srv_mod
+        from java_functional_lsp.server import server as srv
+
+        # Patch both server.feature (to avoid FeatureAlreadyRegisteredError on
+        # the shared singleton) and client_register_capability_async (to trigger error).
+        mock_reg = AsyncMock(side_effect=Exception("no"))
+        mock_feature = MagicMock(return_value=lambda fn: fn)
+        old_flag = srv_mod._jdtls_capabilities_registered
+        srv_mod._jdtls_capabilities_registered = False
+        try:
+            with (
+                caplog.at_level(logging.WARNING, logger="java_functional_lsp.server"),
+                patch.object(srv, "client_register_capability_async", mock_reg),
+                patch.object(srv, "feature", mock_feature),
+            ):
+                await srv_mod._register_jdtls_capabilities()
+        finally:
+            srv_mod._jdtls_capabilities_registered = old_flag
+        assert any("Failed to dynamically register" in r.getMessage() for r in caplog.records)
+
+    async def test_register_jdtls_capabilities_happy_path(self, caplog: Any) -> None:
+        """On success, handlers are registered and info log is emitted."""
+        import logging
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        import java_functional_lsp.server as srv_mod
+        from java_functional_lsp.server import server as srv
+
+        mock_reg = AsyncMock(return_value=None)
+        registered_methods: list[str] = []
+        mock_feature = MagicMock(side_effect=lambda m: registered_methods.append(m) or (lambda fn: fn))
+        old_flag = srv_mod._jdtls_capabilities_registered
+        srv_mod._jdtls_capabilities_registered = False
+        try:
+            with (
+                caplog.at_level(logging.INFO, logger="java_functional_lsp.server"),
+                patch.object(srv, "client_register_capability_async", mock_reg),
+                patch.object(srv, "feature", mock_feature),
+            ):
+                await srv_mod._register_jdtls_capabilities()
+        finally:
+            srv_mod._jdtls_capabilities_registered = old_flag
+        # Handlers were registered for all 5 methods
+        assert lsp.TEXT_DOCUMENT_HOVER in registered_methods
+        assert lsp.TEXT_DOCUMENT_COMPLETION in registered_methods
+        assert lsp.TEXT_DOCUMENT_DEFINITION in registered_methods
+        assert lsp.TEXT_DOCUMENT_REFERENCES in registered_methods
+        assert lsp.TEXT_DOCUMENT_DOCUMENT_SYMBOL in registered_methods
+        # client_register_capability_async was called
+        mock_reg.assert_called_once()
+        # Success log emitted
+        assert any("Dynamically registered" in r.getMessage() for r in caplog.records)
+
+    async def test_register_jdtls_capabilities_idempotent(self) -> None:
+        """Second call is a no-op (idempotency guard)."""
+        from unittest.mock import AsyncMock, patch
+
+        import java_functional_lsp.server as srv_mod
+        from java_functional_lsp.server import server as srv
+
+        mock_reg = AsyncMock()
+        old_flag = srv_mod._jdtls_capabilities_registered
+        srv_mod._jdtls_capabilities_registered = True
+        try:
+            with patch.object(srv, "client_register_capability_async", mock_reg):
+                await srv_mod._register_jdtls_capabilities()
+        finally:
+            srv_mod._jdtls_capabilities_registered = old_flag
+        mock_reg.assert_not_called()
+
     def test_serialize_params_camelcase(self) -> None:
         from java_functional_lsp.server import _serialize_params
 
@@ -396,11 +520,22 @@ class TestLspLifecycle:
     """Full LSP lifecycle tests via real stdio transport — zero mocks."""
 
     async def test_initialize_reports_capabilities(self, lsp_client: LanguageClient) -> None:
-        """Server advertises codeActionProvider and textDocumentSync."""
+        """Server advertises codeActionProvider and textDocumentSync but NOT jdtls features.
+
+        jdtls-dependent capabilities (hover, definition, references, completion,
+        documentSymbol) are registered dynamically after jdtls starts, so they
+        should NOT appear in the static InitializeResult.
+        """
         caps = lsp_client._server_capabilities  # type: ignore[attr-defined]
         assert caps is not None
         assert caps.code_action_provider is not None
         assert caps.text_document_sync is not None
+        # jdtls features are NOT statically advertised (registered dynamically)
+        assert caps.hover_provider is None
+        assert caps.definition_provider is None
+        assert caps.references_provider is None
+        assert caps.completion_provider is None
+        assert caps.document_symbol_provider is None
 
     async def test_null_return_diagnostic_published(self, lsp_client: LanguageClient) -> None:
         """didOpen a file with ``return null`` → server publishes null-return diagnostic."""
