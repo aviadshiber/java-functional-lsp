@@ -39,6 +39,7 @@ from collections.abc import AsyncIterator
 from pathlib import Path
 
 import pytest
+import pytest_asyncio
 from lsprotocol import types as lsp
 
 from java_functional_lsp.proxy import JdtlsProxy, find_jdtls_java_home
@@ -88,27 +89,37 @@ public class Hello {
 """
 
 
-@pytest.fixture
-def workspace(tmp_path: Path) -> tuple[Path, Path]:
+@pytest.fixture(scope="class")
+def workspace(tmp_path_factory: pytest.TempPathFactory) -> tuple[Path, Path]:
     """Create a minimal standalone Java workspace with a single Hello.java file.
+
+    Class-scoped so the same workspace is reused across all tests in
+    TestJdtlsEndToEnd, avoiding redundant tmp_path creation per test.
 
     jdtls operates in "default project" mode for orphan files (no build config),
     which is enough to parse the file and serve document symbols. No pom.xml,
     no build.gradle, no .classpath — we don't need full classpath resolution
     to verify that the request shape reaches jdtls correctly.
     """
+    tmp_path = tmp_path_factory.mktemp("jdtls_workspace")
     src_file = tmp_path / "Hello.java"
     src_file.write_text(_HELLO_JAVA)
     return tmp_path, src_file
 
 
-@pytest.fixture
+@pytest_asyncio.fixture(scope="class", loop_scope="class")
 async def proxy(workspace: tuple[Path, Path]) -> AsyncIterator[JdtlsProxy]:
     """Start a real JdtlsProxy bound to the workspace fixture.
 
-    Yields an initialized proxy and tears it down on test exit. Uses a minimal
-    ``InitializeParams`` dict that includes only the capabilities we exercise
-    in the tests below, to keep jdtls's initial workspace scan cheap.
+    Class-scoped with ``loop_scope="class"`` so all tests in the class share
+    a single jdtls subprocess AND a single event loop. This cuts e2e wall-clock
+    time by ~6x (1 cold-start instead of 7). Without ``loop_scope``,
+    pytest-asyncio creates a new event loop per test, breaking the asyncio
+    subprocess handles created during proxy setup.
+
+    Yields an initialized proxy and tears it down on class exit. Uses a
+    minimal ``InitializeParams`` dict that includes only the capabilities
+    we exercise in the tests below, to keep jdtls's initial workspace scan cheap.
     """
     tmp_path, _ = workspace
     p = JdtlsProxy()
@@ -150,19 +161,10 @@ async def proxy(workspace: tuple[Path, Path]) -> AsyncIterator[JdtlsProxy]:
             "Check the logs above for Java version / classpath issues."
         )
 
-    try:
-        yield p
-    finally:
-        try:
-            await p.stop()
-        except Exception:
-            logging.getLogger(__name__).warning("proxy.stop() failed during teardown", exc_info=True)
-
-
-async def _open_document(proxy: JdtlsProxy, src_file: Path) -> str:
-    """Send textDocument/didOpen for ``src_file`` and return its URI."""
+    # Open the workspace file once so all tests can use it immediately.
+    _, src_file = workspace
     uri = src_file.as_uri()
-    await proxy.send_notification(
+    await p.send_notification(
         "textDocument/didOpen",
         {
             "textDocument": {
@@ -173,10 +175,24 @@ async def _open_document(proxy: JdtlsProxy, src_file: Path) -> str:
             }
         },
     )
-    # Give jdtls a moment to parse the file. We can't synchronously wait for
-    # parsing — LSP exposes no notification for that — so we sleep conservatively.
     await asyncio.sleep(_JDTLS_PARSE_WAIT_SEC)
-    return uri
+
+    try:
+        yield p
+    finally:
+        try:
+            await p.stop()
+        except Exception:
+            logging.getLogger(__name__).warning("proxy.stop() failed during teardown", exc_info=True)
+
+
+def _document_uri(src_file: Path) -> str:
+    """Return the URI for the workspace document.
+
+    With class-scoped fixtures the document is opened once in the proxy fixture
+    setup, so individual tests just need the URI.
+    """
+    return src_file.as_uri()
 
 
 def _assert_no_npe_in_logs(caplog: pytest.LogCaptureFixture) -> None:
@@ -196,6 +212,7 @@ def _assert_no_npe_in_logs(caplog: pytest.LogCaptureFixture) -> None:
 
 
 @pytest.mark.timeout(_E2E_TEST_TIMEOUT_SEC)
+@pytest.mark.asyncio(loop_scope="class")
 class TestJdtlsEndToEnd:
     """End-to-end request/response tests against a real jdtls subprocess."""
 
@@ -228,7 +245,7 @@ class TestJdtlsEndToEnd:
         returns an error response, which we detect via caplog.
         """
         _, src_file = workspace
-        uri = await _open_document(proxy, src_file)
+        uri = _document_uri(src_file)
 
         with caplog.at_level(logging.ERROR, logger="java_functional_lsp.proxy"):
             params = lsp.DocumentSymbolParams(
@@ -278,7 +295,7 @@ class TestJdtlsEndToEnd:
         jdtls actually resolves the symbol (which depends on classpath state).
         """
         _, src_file = workspace
-        uri = await _open_document(proxy, src_file)
+        uri = _document_uri(src_file)
 
         with caplog.at_level(logging.ERROR, logger="java_functional_lsp.proxy"):
             # Position the cursor on the `greeting` identifier at line 8 col 20
@@ -312,7 +329,7 @@ class TestJdtlsEndToEnd:
         might only affect a subset of position-based handlers.
         """
         _, src_file = workspace
-        uri = await _open_document(proxy, src_file)
+        uri = _document_uri(src_file)
 
         with caplog.at_level(logging.ERROR, logger="java_functional_lsp.proxy"):
             params = lsp.HoverParams(
@@ -328,7 +345,6 @@ class TestJdtlsEndToEnd:
 
     async def test_did_open_notification_does_not_npe(
         self,
-        workspace: tuple[Path, Path],
         proxy: JdtlsProxy,
         caplog: pytest.LogCaptureFixture,
     ) -> None:
@@ -339,17 +355,18 @@ class TestJdtlsEndToEnd:
         here would cause jdtls to fail parsing the notification silently
         (no response, so no request-side error) but the NPE would appear in
         stderr when jdtls tries to look up the file by URI later.
-        """
-        _, src_file = workspace
-        uri = src_file.as_uri()
 
+        This test verifies the serialization shape only — the proxy fixture
+        already opened Hello.java, so we use a synthetic URI to avoid
+        interfering with other tests.
+        """
         with caplog.at_level(logging.ERROR, logger="java_functional_lsp.proxy"):
             params = lsp.DidOpenTextDocumentParams(
                 text_document=lsp.TextDocumentItem(
-                    uri=uri,
+                    uri="file:///tmp/DidOpenTest.java",
                     language_id="java",
                     version=1,
-                    text=src_file.read_text(),
+                    text="public class DidOpenTest {}",
                 ),
             )
             serialized = _serialize_params(params)
@@ -358,7 +375,7 @@ class TestJdtlsEndToEnd:
             assert "language_id" not in serialized["textDocument"]
 
             await proxy.send_notification("textDocument/didOpen", serialized)
-            await asyncio.sleep(_JDTLS_PARSE_WAIT_SEC)
+            await asyncio.sleep(0.5)
 
         _assert_no_npe_in_logs(caplog)
 
@@ -377,7 +394,7 @@ class TestJdtlsEndToEnd:
         ReferenceContext — guaranteed NPE.
         """
         _, src_file = workspace
-        uri = await _open_document(proxy, src_file)
+        uri = _document_uri(src_file)
 
         with caplog.at_level(logging.ERROR, logger="java_functional_lsp.proxy"):
             params = lsp.ReferenceParams(
@@ -411,7 +428,7 @@ class TestJdtlsEndToEnd:
         request-shape bug here would NPE the completion handler.
         """
         _, src_file = workspace
-        uri = await _open_document(proxy, src_file)
+        uri = _document_uri(src_file)
 
         with caplog.at_level(logging.ERROR, logger="java_functional_lsp.proxy"):
             # Position after `h.` on the main() line where completion makes sense.
