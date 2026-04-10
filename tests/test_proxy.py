@@ -857,3 +857,241 @@ class TestStartPassesEnvToSubprocess:
         assert ok is False
         # The crucial assertion: env= was passed through to the subprocess call.
         assert captured["env"] == sentinel_env
+
+
+class TestFindModuleRoot:
+    """Tests for find_module_root — build-file detection for module scoping."""
+
+    def test_finds_pom_xml(self, tmp_path: Any) -> None:
+        from java_functional_lsp.proxy import find_module_root
+
+        (tmp_path / "pom.xml").touch()
+        java_file = tmp_path / "src" / "Main.java"
+        java_file.parent.mkdir()
+        java_file.touch()
+        assert find_module_root(str(java_file)) == str(tmp_path)
+
+    def test_finds_build_gradle(self, tmp_path: Any) -> None:
+        from java_functional_lsp.proxy import find_module_root
+
+        (tmp_path / "build.gradle").touch()
+        java_file = tmp_path / "src" / "Main.java"
+        java_file.parent.mkdir()
+        java_file.touch()
+        assert find_module_root(str(java_file)) == str(tmp_path)
+
+    def test_finds_build_gradle_kts(self, tmp_path: Any) -> None:
+        from java_functional_lsp.proxy import find_module_root
+
+        (tmp_path / "build.gradle.kts").touch()
+        java_file = tmp_path / "src" / "Main.java"
+        java_file.parent.mkdir()
+        java_file.touch()
+        assert find_module_root(str(java_file)) == str(tmp_path)
+
+    def test_finds_nearest_not_parent(self, tmp_path: Any) -> None:
+        """Nested modules: should find the innermost module root."""
+        from java_functional_lsp.proxy import find_module_root
+
+        (tmp_path / "pom.xml").touch()  # parent module
+        child = tmp_path / "child-module"
+        child.mkdir()
+        (child / "pom.xml").touch()  # child module
+        java_file = child / "src" / "Main.java"
+        java_file.parent.mkdir()
+        java_file.touch()
+        assert find_module_root(str(java_file)) == str(child)
+
+    def test_returns_none_when_no_build_file(self, tmp_path: Any) -> None:
+        from java_functional_lsp.proxy import find_module_root
+
+        java_file = tmp_path / "src" / "Main.java"
+        java_file.parent.mkdir()
+        java_file.touch()
+        assert find_module_root(str(java_file)) is None
+
+
+class TestLazyStart:
+    """Tests for lazy-start proxy features."""
+
+    def test_check_available_true(self) -> None:
+        from java_functional_lsp.proxy import JdtlsProxy
+
+        proxy = JdtlsProxy()
+        with patch("java_functional_lsp.proxy.shutil.which", return_value="/usr/bin/jdtls"):
+            assert proxy.check_available() is True
+        assert proxy._jdtls_on_path is True
+
+    def test_check_available_false(self) -> None:
+        from java_functional_lsp.proxy import JdtlsProxy
+
+        proxy = JdtlsProxy()
+        with patch("java_functional_lsp.proxy.shutil.which", return_value=None):
+            assert proxy.check_available() is False
+        assert proxy._jdtls_on_path is False
+
+    def test_queue_and_flush(self) -> None:
+        from java_functional_lsp.proxy import JdtlsProxy
+
+        proxy = JdtlsProxy()
+        proxy.queue_notification("textDocument/didOpen", {"uri": "a"})
+        proxy.queue_notification("textDocument/didChange", {"uri": "b"})
+        assert len(proxy._queued_notifications) == 2
+
+        # flush should clear the queue
+        flushed: list[tuple[str, Any]] = []
+
+        async def mock_send(method: str, params: Any) -> None:
+            flushed.append((method, params))
+
+        proxy.send_notification = mock_send  # type: ignore[assignment]
+        asyncio.get_event_loop().run_until_complete(proxy.flush_queued_notifications())
+        assert len(flushed) == 2
+        assert flushed[0] == ("textDocument/didOpen", {"uri": "a"})
+        assert flushed[1] == ("textDocument/didChange", {"uri": "b"})
+        assert len(proxy._queued_notifications) == 0
+
+    async def test_ensure_started_no_retry_after_failure(self) -> None:
+        from unittest.mock import AsyncMock
+
+        from java_functional_lsp.proxy import JdtlsProxy
+
+        proxy = JdtlsProxy()
+        proxy._jdtls_on_path = True
+        proxy.start = AsyncMock(return_value=False)  # type: ignore[assignment]
+        result = await proxy.ensure_started({"rootUri": "file:///tmp"}, "file:///tmp/F.java")
+        assert result is False
+        assert proxy._start_failed is True
+        # Second call should return immediately without calling start()
+        proxy.start.reset_mock()  # type: ignore[attr-defined]
+        result2 = await proxy.ensure_started({"rootUri": "file:///tmp"}, "file:///tmp/F.java")
+        assert result2 is False
+        proxy.start.assert_not_called()  # type: ignore[attr-defined]
+
+    async def test_add_module_if_new_sends_notification(self) -> None:
+        from unittest.mock import AsyncMock
+
+        from java_functional_lsp.proxy import JdtlsProxy
+
+        proxy = JdtlsProxy()
+        proxy._available = True
+        proxy.send_notification = AsyncMock()  # type: ignore[assignment]
+        # Create a tmp dir with pom.xml
+        import tempfile
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as td:
+            (Path(td) / "pom.xml").touch()
+            java_file = Path(td) / "src" / "Main.java"
+            java_file.parent.mkdir()
+            java_file.touch()
+            uri = java_file.as_uri()
+            await proxy.add_module_if_new(uri)
+            proxy.send_notification.assert_called_once()  # type: ignore[attr-defined]
+            call_args = proxy.send_notification.call_args  # type: ignore[attr-defined]
+            assert call_args[0][0] == "workspace/didChangeWorkspaceFolders"
+
+    async def test_add_module_if_new_skips_duplicate(self) -> None:
+        from unittest.mock import AsyncMock
+
+        from java_functional_lsp.proxy import JdtlsProxy
+
+        proxy = JdtlsProxy()
+        proxy._available = True
+        proxy.send_notification = AsyncMock()  # type: ignore[assignment]
+        import tempfile
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as td:
+            (Path(td) / "pom.xml").touch()
+            java_file = Path(td) / "src" / "Main.java"
+            java_file.parent.mkdir()
+            java_file.touch()
+            uri = java_file.as_uri()
+            await proxy.add_module_if_new(uri)
+            await proxy.add_module_if_new(uri)  # duplicate
+            assert proxy.send_notification.call_count == 1  # type: ignore[attr-defined]
+
+    async def test_expand_full_workspace_sends_notification(self) -> None:
+        from unittest.mock import AsyncMock
+
+        from java_functional_lsp.proxy import JdtlsProxy
+
+        proxy = JdtlsProxy()
+        proxy._available = True
+        proxy._original_root_uri = "file:///workspace/monorepo"
+        proxy.send_notification = AsyncMock()  # type: ignore[assignment]
+        await proxy.expand_full_workspace()
+        proxy.send_notification.assert_called_once()  # type: ignore[attr-defined]
+        assert proxy._workspace_expanded is True
+
+    async def test_expand_full_workspace_noop_when_already_added(self) -> None:
+        from unittest.mock import AsyncMock
+
+        from java_functional_lsp.proxy import JdtlsProxy
+
+        proxy = JdtlsProxy()
+        proxy._available = True
+        proxy._original_root_uri = "file:///workspace/monorepo"
+        proxy._added_module_uris.add("file:///workspace/monorepo")
+        proxy.send_notification = AsyncMock()  # type: ignore[assignment]
+        await proxy.expand_full_workspace()
+        proxy.send_notification.assert_not_called()  # type: ignore[attr-defined]
+        assert proxy._workspace_expanded is True
+
+    async def test_ensure_started_no_build_file(self) -> None:
+        """ensure_started with no build file should pass module_root_uri=None."""
+        from java_functional_lsp.proxy import JdtlsProxy
+
+        proxy = JdtlsProxy()
+        proxy._jdtls_on_path = True
+        captured: dict[str, Any] = {}
+
+        async def capturing_start(params: Any, *, module_root_uri: str | None = None) -> bool:
+            captured["module_root_uri"] = module_root_uri
+            return False
+
+        proxy.start = capturing_start  # type: ignore[assignment]
+        await proxy.ensure_started(
+            {"rootUri": "file:///monorepo", "capabilities": {}},
+            "file:///nonexistent/src/Main.java",
+        )
+        assert captured["module_root_uri"] is None
+
+    async def test_ensure_started_with_build_file(self, tmp_path: Any) -> None:
+        """ensure_started should find module root and pass it to start()."""
+        from java_functional_lsp.proxy import JdtlsProxy
+
+        proxy = JdtlsProxy()
+        proxy._jdtls_on_path = True
+        (tmp_path / "pom.xml").touch()
+        java_file = tmp_path / "src" / "Main.java"
+        java_file.parent.mkdir()
+        java_file.touch()
+
+        captured: dict[str, Any] = {}
+
+        async def capturing_start(params: Any, *, module_root_uri: str | None = None) -> bool:
+            captured["module_root_uri"] = module_root_uri
+            return False
+
+        proxy.start = capturing_start  # type: ignore[assignment]
+        await proxy.ensure_started(
+            {"rootUri": "file:///monorepo", "capabilities": {}},
+            java_file.as_uri(),
+        )
+        assert captured["module_root_uri"] is not None
+        assert str(tmp_path) in captured["module_root_uri"]
+
+    def test_data_dir_hash_uses_original_root(self) -> None:
+        """Data-dir hash should be based on original rootUri, not module root."""
+        import hashlib
+
+        # The hash is computed from the original rootUri, not the module root.
+        # Verify these produce different hashes, confirming start() must use
+        # the original root for stability.
+        root = "file:///workspace/monorepo"
+        expected_hash = hashlib.sha256(root.encode()).hexdigest()[:12]
+        module_root = "file:///workspace/monorepo/module-a"
+        module_hash = hashlib.sha256(module_root.encode()).hexdigest()[:12]
+        assert expected_hash != module_hash

@@ -17,8 +17,7 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
-REQUEST_TIMEOUT = 30.0  # seconds — per-request timeout for normal operations
-INITIALIZE_TIMEOUT = 120.0  # seconds — jdtls initialize can be slow on large monorepos
+REQUEST_TIMEOUT = 30.0  # seconds
 DEFAULT_JVM_MAX_HEAP = "4g"
 _STDERR_LINE_MAX = 1000
 
@@ -312,6 +311,26 @@ async def read_message(reader: asyncio.StreamReader) -> dict[str, Any] | None:
         return None
 
 
+_BUILD_FILES = ("pom.xml", "build.gradle", "build.gradle.kts")
+
+
+def find_module_root(file_path: str) -> str | None:
+    """Walk up from *file_path* to find the nearest directory containing a build file.
+
+    Returns the directory path, or ``None`` if no build file is found before
+    reaching the filesystem root. Used to scope jdtls initialization to a
+    single Maven/Gradle module for fast startup.
+    """
+    current = Path(file_path).parent
+    while True:
+        if any((current / bf).is_file() for bf in _BUILD_FILES):
+            return str(current)
+        parent = current.parent
+        if parent == current:
+            return None
+        current = parent
+
+
 class JdtlsProxy:
     """Manages a jdtls subprocess and provides async request/notification forwarding."""
 
@@ -325,6 +344,15 @@ class JdtlsProxy:
         self._on_diagnostics = on_diagnostics
         self._available = False
         self._jdtls_capabilities: dict[str, Any] = {}
+        # Lazy-start state
+        self._start_lock = asyncio.Lock()
+        self._starting = False
+        self._start_failed = False
+        self._jdtls_on_path = False
+        self._queued_notifications: list[tuple[str, Any]] = []
+        self._original_root_uri: str | None = None
+        self._added_module_uris: set[str] = set()
+        self._workspace_expanded = False
 
     @property
     def is_available(self) -> bool:
@@ -340,31 +368,53 @@ class JdtlsProxy:
         """Get the latest jdtls diagnostics for a URI."""
         return list(self._diagnostics_cache.get(uri, []))
 
-    async def start(self, init_params: dict[str, Any]) -> bool:
-        """Start jdtls subprocess and initialize it."""
+    def check_available(self) -> bool:
+        """Check if jdtls is on PATH (lightweight, no subprocess started)."""
+        self._jdtls_on_path = shutil.which("jdtls") is not None
+        if not self._jdtls_on_path:
+            logger.warning("jdtls not found on PATH — running in standalone mode (custom rules only)")
+        return self._jdtls_on_path
+
+    async def start(self, init_params: dict[str, Any], *, module_root_uri: str | None = None) -> bool:
+        """Start jdtls subprocess and initialize it.
+
+        If *module_root_uri* is provided, jdtls is scoped to that module for
+        fast startup. The data-directory hash is always based on the original
+        workspace root (from init_params) so the index persists across restarts.
+        """
         jdtls_path = shutil.which("jdtls")
         if not jdtls_path:
-            logger.warning("jdtls not found on PATH — running in standalone mode (custom rules only)")
             return False
 
-        # jdtls requires a -data directory for workspace metadata (index, classpath, build state).
-        # Use ~/.cache/jdtls-data/<hash> so it persists across reboots and LSP restarts.
-        # Fallback order mirrors LSP spec: rootUri → rootPath → cwd.
-        root_uri = init_params.get("rootUri") or init_params.get("rootPath") or str(Path.cwd())
-        workspace_hash = hashlib.sha256(root_uri.encode()).hexdigest()[:12]
+        # Data-dir hash based on original workspace root (stable across module changes).
+        self._original_root_uri = init_params.get("rootUri") or init_params.get("rootPath") or str(Path.cwd())
+        workspace_hash = hashlib.sha256(self._original_root_uri.encode()).hexdigest()[:12]
         data_dir = Path.home() / ".cache" / "jdtls-data" / workspace_hash
         data_dir.mkdir(parents=True, exist_ok=True)
 
-        # Build a clean environment for jdtls: detect Java 21+ and set JAVA_HOME
-        # explicitly, or strip JAVA_HOME if the inherited value points at an older
-        # Java (e.g. an IDE launched us with a project SDK of Java 8). Without this,
-        # jdtls 1.57+ fails with "jdtls requires at least Java 21" during its
-        # Python launcher's version check.
-        #
-        # build_jdtls_env() issues several blocking subprocess calls (java -version,
-        # /usr/libexec/java_home) to detect a suitable JDK. Run it in a thread pool
-        # so those calls don't block the asyncio event loop — the IDE's LSP handshake
-        # messages would otherwise stall for up to a few seconds during startup.
+        # If module_root_uri is provided, scope jdtls to that module.
+        effective_params = dict(init_params)
+        effective_root_uri = module_root_uri or self._original_root_uri
+        if module_root_uri:
+            effective_params["rootUri"] = module_root_uri
+            from pygls.uris import to_fs_path
+
+            effective_params["rootPath"] = to_fs_path(module_root_uri)
+            logger.info(
+                "jdtls: scoping to module %s (full root: %s)",
+                _redact_path(module_root_uri),
+                _redact_path(self._original_root_uri),
+            )
+
+        # Inject workspaceFolders capability for later expansion.
+        caps = effective_params.setdefault("capabilities", {})
+        ws = caps.setdefault("workspace", {})
+        ws["workspaceFolders"] = True
+
+        # Track the initial module as already loaded.
+        self._added_module_uris.add(effective_root_uri)
+
+        # Build a clean environment for jdtls.
         loop = asyncio.get_running_loop()
         jdtls_env = await loop.run_in_executor(None, build_jdtls_env)
 
@@ -386,14 +436,12 @@ class JdtlsProxy:
                 _redact_path(jdtls_env.get("JAVA_HOME")),
             )
 
-            # Start background readers for stdout (JSON-RPC) and stderr (diagnostics/errors)
             assert self._process.stdout is not None
             self._reader_task = asyncio.create_task(self._reader_loop(self._process.stdout))
             if self._process.stderr is not None:
                 self._stderr_task = asyncio.create_task(self._stderr_reader(self._process.stderr))
 
-            # Send initialize request
-            result = await self.send_request("initialize", init_params, timeout=INITIALIZE_TIMEOUT)
+            result = await self.send_request("initialize", effective_params)
             if result is None:
                 logger.error("jdtls initialize request failed or timed out")
                 await self.stop()
@@ -402,7 +450,6 @@ class JdtlsProxy:
             self._jdtls_capabilities = result.get("capabilities", {})
             logger.info("jdtls initialized (capabilities: %s)", list(self._jdtls_capabilities.keys()))
 
-            # Send initialized notification
             await self.send_notification("initialized", {})
             self._available = True
             return True
@@ -410,6 +457,86 @@ class JdtlsProxy:
         except (OSError, FileNotFoundError) as e:
             logger.error("Failed to start jdtls: %s", e)
             return False
+
+    async def ensure_started(self, init_params: dict[str, Any], file_uri: str) -> bool:
+        """Start jdtls lazily, scoped to the module containing *file_uri*.
+
+        Thread-safe: uses asyncio.Lock to prevent double-start from rapid
+        didOpen calls. Sets ``_start_failed`` on failure to prevent retries.
+        """
+        if self._available:
+            return True
+        if self._start_failed or not self._jdtls_on_path:
+            return False
+
+        async with self._start_lock:
+            if self._available:
+                return True
+
+            self._starting = True
+            try:
+                from pygls.uris import from_fs_path, to_fs_path
+
+                file_path = to_fs_path(file_uri) or file_uri
+                module_root = find_module_root(file_path)
+                module_uri = from_fs_path(module_root) if module_root else None
+
+                started = await self.start(init_params, module_root_uri=module_uri)
+                if not started:
+                    self._start_failed = True
+                    self._queued_notifications.clear()
+                return started
+            finally:
+                self._starting = False
+
+    def queue_notification(self, method: str, params: Any) -> None:
+        """Buffer a notification for replay after jdtls starts."""
+        self._queued_notifications.append((method, params))
+
+    async def flush_queued_notifications(self) -> None:
+        """Send all queued notifications to jdtls."""
+        queue, self._queued_notifications = self._queued_notifications, []
+        for method, params in queue:
+            await self.send_notification(method, params)
+
+    async def add_module_if_new(self, file_uri: str) -> None:
+        """Add the module containing *file_uri* to jdtls if not already added."""
+        if not self._available:
+            return
+        from pygls.uris import from_fs_path, to_fs_path
+
+        file_path = to_fs_path(file_uri) or file_uri
+        module_root = find_module_root(file_path)
+        if module_root is None:
+            return
+        module_uri = from_fs_path(module_root) or file_uri
+        if module_uri in self._added_module_uris:
+            return
+        self._added_module_uris.add(module_uri)
+        logger.info("jdtls: adding module %s", _redact_path(module_root))
+        await self.send_notification(
+            "workspace/didChangeWorkspaceFolders",
+            {"event": {"added": [{"uri": module_uri, "name": Path(module_root).name}], "removed": []}},
+        )
+
+    async def expand_full_workspace(self) -> None:
+        """Expand jdtls workspace to the full monorepo root (background task)."""
+        if self._workspace_expanded or not self._available or not self._original_root_uri:
+            return
+        from pygls.uris import from_fs_path, to_fs_path
+
+        root_path = to_fs_path(self._original_root_uri) or self._original_root_uri
+        root_uri = from_fs_path(root_path) or self._original_root_uri
+        if root_uri in self._added_module_uris:
+            self._workspace_expanded = True
+            return
+        self._added_module_uris.add(root_uri)
+        logger.info("jdtls: expanding to full workspace %s", _redact_path(root_path))
+        await self.send_notification(
+            "workspace/didChangeWorkspaceFolders",
+            {"event": {"added": [{"uri": root_uri, "name": Path(root_path).name}], "removed": []}},
+        )
+        self._workspace_expanded = True
 
     async def stop(self) -> None:
         """Shutdown jdtls subprocess gracefully."""

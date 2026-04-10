@@ -414,6 +414,46 @@ class TestServerInternals:
             srv_mod._jdtls_capabilities_registered = old_flag
         mock_reg.assert_not_called()
 
+    async def test_lazy_start_jdtls_success(self, caplog: Any) -> None:
+        """_lazy_start_jdtls logs success and registers capabilities."""
+        import logging
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        import java_functional_lsp.server as srv_mod
+        from java_functional_lsp.server import _lazy_start_jdtls
+        from java_functional_lsp.server import server as srv
+
+        old_flag = srv_mod._jdtls_capabilities_registered
+        srv_mod._jdtls_capabilities_registered = False
+        try:
+            with (
+                caplog.at_level(logging.INFO, logger="java_functional_lsp.server"),
+                patch.object(srv._proxy, "ensure_started", AsyncMock(return_value=True)),
+                patch.object(srv._proxy, "flush_queued_notifications", AsyncMock()),
+                patch.object(srv._proxy, "expand_full_workspace", AsyncMock()),
+                patch.object(srv, "feature", MagicMock(return_value=lambda fn: fn)),
+                patch.object(srv, "client_register_capability_async", AsyncMock()),
+            ):
+                await _lazy_start_jdtls("file:///test/F.java")
+        finally:
+            srv_mod._jdtls_capabilities_registered = old_flag
+        assert any("jdtls proxy active" in r.getMessage() for r in caplog.records)
+
+    async def test_lazy_start_jdtls_failure_logged(self, caplog: Any) -> None:
+        """_lazy_start_jdtls logs warning on failure."""
+        import logging
+        from unittest.mock import AsyncMock, patch
+
+        from java_functional_lsp.server import _lazy_start_jdtls
+        from java_functional_lsp.server import server as srv
+
+        with (
+            caplog.at_level(logging.WARNING, logger="java_functional_lsp.server"),
+            patch.object(srv._proxy, "ensure_started", AsyncMock(side_effect=Exception("boom"))),
+        ):
+            await _lazy_start_jdtls("file:///test/F.java")
+        assert any("lazy start failed" in r.getMessage() for r in caplog.records)
+
     def test_serialize_params_camelcase(self) -> None:
         from java_functional_lsp.server import _serialize_params
 

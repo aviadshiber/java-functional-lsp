@@ -77,6 +77,8 @@ server = JavaFunctionalLspServer()
 
 # Debounce state for didChange events (only affects human typing in IDEs, not agents)
 _pending: dict[str, asyncio.Task[None]] = {}
+# Background tasks (prevent GC of fire-and-forget tasks)
+_bg_tasks: set[asyncio.Task[None]] = set()
 _DEBOUNCE_SECONDS = 0.15
 
 
@@ -242,17 +244,15 @@ def on_initialize(params: lsp.InitializeParams) -> lsp.InitializeResult:
 
 @server.feature(lsp.INITIALIZED)
 async def on_initialized(params: lsp.InitializedParams) -> None:
-    """Start jdtls proxy after initialization."""
+    """Check jdtls availability; actual start deferred to first didOpen."""
     logger.info(
         "java-functional-lsp initialized (rules: %s)",
         list(server._config.get("rules", {}).keys()) or "all defaults",
     )
-    started = await server._proxy.start(server._init_params)
-    if started:
-        logger.info("jdtls proxy active — full Java language support enabled")
-        await _register_jdtls_capabilities()
+    if server._proxy.check_available():
+        logger.info("jdtls found on PATH — will start lazily on first file open")
     else:
-        logger.info("jdtls proxy unavailable — running with custom rules only")
+        logger.info("jdtls not on PATH — running with custom rules only")
 
 
 _JAVA_SELECTOR = [lsp.TextDocumentFilterLanguage(language="java")]
@@ -333,18 +333,39 @@ async def _deferred_validate(uri: str) -> None:
 
 @server.feature(lsp.TEXT_DOCUMENT_DID_OPEN)
 async def on_did_open(params: lsp.DidOpenTextDocumentParams) -> None:
-    """Forward to jdtls and analyze immediately."""
+    """Forward to jdtls (starting lazily if needed) and analyze immediately.
+
+    Custom diagnostics always publish immediately regardless of jdtls state.
+    jdtls startup is non-blocking — it runs in the background so the first
+    didOpen response isn't delayed by jdtls cold-start.
+    """
+    uri = params.text_document.uri
+    serialized = _serialize_params(params)
+
     if server._proxy.is_available:
-        await server._proxy.send_notification("textDocument/didOpen", _serialize_params(params))
-    _analyze_and_publish(params.text_document.uri)
+        # Fast path: jdtls running. Forward didOpen + add module if new.
+        await server._proxy.send_notification("textDocument/didOpen", serialized)
+        await server._proxy.add_module_if_new(uri)
+    elif server._proxy._jdtls_on_path and not server._proxy._start_failed and not server._proxy._starting:
+        # First file: kick off lazy start in background.
+        server._proxy.queue_notification("textDocument/didOpen", serialized)
+        task = asyncio.create_task(_lazy_start_jdtls(uri))
+        _bg_tasks.add(task)
+        task.add_done_callback(_bg_tasks.discard)
+
+    # Custom diagnostics always publish immediately — never blocked by jdtls.
+    _analyze_and_publish(uri)
 
 
 @server.feature(lsp.TEXT_DOCUMENT_DID_CHANGE)
 async def on_did_change(params: lsp.DidChangeTextDocumentParams) -> None:
     """Forward to jdtls and schedule debounced re-analysis."""
     uri = params.text_document.uri
+    serialized = _serialize_params(params)
     if server._proxy.is_available:
-        await server._proxy.send_notification("textDocument/didChange", _serialize_params(params))
+        await server._proxy.send_notification("textDocument/didChange", serialized)
+    elif server._proxy._starting:
+        server._proxy.queue_notification("textDocument/didChange", serialized)
     # Cancel pending validation, schedule new one (150ms debounce for IDE typing)
     if uri in _pending:
         _pending[uri].cancel()
@@ -354,8 +375,11 @@ async def on_did_change(params: lsp.DidChangeTextDocumentParams) -> None:
 @server.feature(lsp.TEXT_DOCUMENT_DID_SAVE)
 async def on_did_save(params: lsp.DidSaveTextDocumentParams) -> None:
     """Forward to jdtls and re-analyze immediately (no debounce on save)."""
+    serialized = _serialize_params(params)
     if server._proxy.is_available:
-        await server._proxy.send_notification("textDocument/didSave", _serialize_params(params))
+        await server._proxy.send_notification("textDocument/didSave", serialized)
+    elif server._proxy._starting:
+        server._proxy.queue_notification("textDocument/didSave", serialized)
     _analyze_and_publish(params.text_document.uri)
 
 
@@ -368,8 +392,43 @@ async def on_did_close(params: lsp.DidCloseTextDocumentParams) -> None:
         del _pending[uri]
     # Clear diagnostics for the closed document (LSP best practice)
     server.text_document_publish_diagnostics(lsp.PublishDiagnosticsParams(uri=uri, diagnostics=[]))
+    serialized = _serialize_params(params)
     if server._proxy.is_available:
-        await server._proxy.send_notification("textDocument/didClose", _serialize_params(params))
+        await server._proxy.send_notification("textDocument/didClose", serialized)
+    elif server._proxy._starting:
+        server._proxy.queue_notification("textDocument/didClose", serialized)
+
+
+async def _lazy_start_jdtls(file_uri: str) -> None:
+    """Background task: start jdtls scoped to the module containing *file_uri*.
+
+    Runs in the background so ``on_did_open`` returns immediately with custom
+    diagnostics. After jdtls initializes, registers capabilities, flushes
+    queued notifications, and schedules workspace expansion.
+    """
+    try:
+        started = await server._proxy.ensure_started(server._init_params, file_uri)
+        if started:
+            logger.info("jdtls proxy active — full Java language support enabled")
+            await _register_jdtls_capabilities()
+            await server._proxy.flush_queued_notifications()
+            await _expand_workspace_background()
+    except Exception:
+        logger.warning("jdtls lazy start failed", exc_info=True)
+
+
+async def _expand_workspace_background() -> None:
+    """Background task: expand jdtls workspace to full monorepo root.
+
+    Runs after jdtls finishes initializing with the first module scope.
+    The user's actively-opened modules are loaded immediately via
+    ``add_module_if_new()`` in ``on_did_open``; this adds the full root
+    so cross-module references for unopened files also work.
+    """
+    try:
+        await server._proxy.expand_full_workspace()
+    except Exception:
+        logger.warning("Failed to expand jdtls workspace", exc_info=True)
 
 
 # --- jdtls passthrough handlers (registered dynamically, NOT at module level) ---
