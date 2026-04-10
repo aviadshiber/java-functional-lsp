@@ -21,7 +21,7 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
       - name: Install uv
-        uses: astral-sh/setup-uv@v8
+        uses: astral-sh/setup-uv@v7
       - name: Install dependencies
         run: uv sync
       - name: Lint
@@ -94,7 +94,7 @@ jobs:
           chmod +x "$BIN_DIR/jdtls"
           echo "$BIN_DIR" >> "$GITHUB_PATH"
       - name: Install uv
-        uses: astral-sh/setup-uv@v8
+        uses: astral-sh/setup-uv@v7
       - name: Install dependencies
         run: uv sync
       - name: Verify jdtls is available
