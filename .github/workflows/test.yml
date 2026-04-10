@@ -35,16 +35,18 @@ jobs:
         env:
           NO_COLOR: "1"
 
-  e2e-test:
-    name: End-to-End (jdtls) / ${{ matrix.os }}
+  integration:
+    name: Integration (with jdtls) / ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
-    # One Python version is enough — the e2e tests verify the jdtls request/
-    # response pipeline, not Python-version-specific behavior. The unit
-    # matrix above already exercises every Python version.
+    # Runs the FULL test suite (unit + e2e) with jdtls installed, on one
+    # Python version per OS. This is a comprehensive sanity check that
+    # exercises: custom analyzer diagnostics, code action generation,
+    # AND jdtls request forwarding end-to-end. The unit matrix above
+    # provides fast Python-version-specific feedback without jdtls.
     steps:
       - uses: actions/checkout@v6
       - name: Set up Python 3.12
@@ -104,12 +106,7 @@ jobs:
           jdtls --help | head -5 || true
           java -version
           echo "JAVA_HOME=$JAVA_HOME"
-      - name: Run e2e tests
-        # --no-cov disables coverage reporting for this job. The e2e tests
-        # only exercise the proxy + server layers, so they cannot meet the
-        # 60% fail-under threshold enforced by pyproject.toml's default
-        # addopts. The unit matrix above already produces the authoritative
-        # coverage report.
-        run: uv run pytest -v -m e2e --no-cov
+      - name: Run full test suite (unit + e2e)
+        run: uv run pytest -v
         env:
           NO_COLOR: "1"

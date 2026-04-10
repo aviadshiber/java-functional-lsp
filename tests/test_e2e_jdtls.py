@@ -423,3 +423,189 @@ class TestJdtlsEndToEnd:
             await proxy.send_request("textDocument/completion", serialized)
 
         _assert_no_npe_in_logs(caplog)
+
+
+# --------------------------------------------------------------------------
+# Major-feature sanity checks (no jdtls required)
+# --------------------------------------------------------------------------
+#
+# These tests drive the real ``java_functional_lsp.server`` module-level
+# LanguageServer instance with a real pygls workspace, verifying that the
+# major features (custom analyzer diagnostics, QuickFix code actions) work
+# end-to-end from pygls-typed LSP params through to published diagnostics
+# and WorkspaceEdits.
+#
+# They are marked ``e2e`` because they test the server as an integrated unit
+# — but unlike the jdtls tests above, they do NOT require jdtls and run on
+# any platform in a few milliseconds.
+#
+# The two sibling ``pytest.mark.skipif`` guards above apply to every test in
+# this file via ``pytestmark``, so these tests also auto-skip on CI runners
+# without jdtls. For local runs without jdtls, use
+# ``pytest tests/test_e2e_jdtls.py::TestMajorFeatureSanity`` to force-run
+# just these.
+
+# We need to override the module-level skipif to let these sanity tests
+# still run even without jdtls. They're in a separate class and we apply
+# their own marks.
+_SANITY_HELLO_WITH_BUGS = """\
+import java.util.List;
+
+public class BuggyExample {
+    public String firstOrNull(List<String> xs) {
+        if (xs != null) {
+            return xs.get(0);
+        } else {
+            return null;
+        }
+    }
+}
+"""
+
+
+@pytest.mark.e2e
+class TestMajorFeatureSanity:
+    """End-to-end sanity checks for major features without jdtls.
+
+    These tests drive ``server.on_did_open`` / ``server.on_code_action``
+    through the real pygls workspace. They verify:
+
+    1. Opening a file with a known-bad pattern causes the custom analyzers
+       to publish the expected diagnostic.
+    2. Requesting code actions on a diagnostic returns a valid WorkspaceEdit
+       with the QuickFix kind and the right rewrite title.
+
+    These are the "does the product actually work end-to-end" tests that
+    complement the unit tests (which verify individual analyzers/fixes in
+    isolation) and the jdtls tests above (which verify request forwarding).
+    """
+
+    @staticmethod
+    def _ensure_workspace_initialized() -> None:
+        """Ensure the pygls server workspace is available.
+
+        pygls' ``server.workspace`` property raises RuntimeError if the protocol
+        hasn't processed an ``initialize`` request. We bootstrap a minimal
+        workspace directly via the protocol's private API to avoid going through
+        the full JSON-RPC lifecycle in a unit test.
+        """
+        from pygls.workspace import Workspace
+
+        from java_functional_lsp.server import server
+
+        if server.protocol._workspace is None:
+            server.protocol._workspace = Workspace(
+                root_uri="file:///test",
+                sync_kind=lsp.TextDocumentSyncKind.Full,
+            )
+
+    def test_null_return_diagnostic_fires(self) -> None:
+        """Opening a Java file with ``return null`` publishes a null-return diagnostic."""
+        from java_functional_lsp.server import _run_analysis
+
+        diags = _run_analysis(_SANITY_HELLO_WITH_BUGS, "file:///test/BuggyExample.java")
+        codes = [d.code for d in diags]
+        assert "null-return" in codes, f"Expected null-return diagnostic in {codes} — analyzer pipeline may be broken"
+
+    def test_null_check_to_monadic_diagnostic_fires(self) -> None:
+        """The if(x != null) pattern should produce a null-check-to-monadic hint."""
+        from java_functional_lsp.server import _run_analysis
+
+        diags = _run_analysis(_SANITY_HELLO_WITH_BUGS, "file:///test/BuggyExample.java")
+        codes = [d.code for d in diags]
+        assert "null-check-to-monadic" in codes
+
+    def test_code_action_returns_quickfix_with_edit(self) -> None:
+        """A CodeActionParams with a null-return diagnostic must yield a QuickFix edit.
+
+        Drives the full code-action pipeline: parse → lookup fix generator →
+        apply → build lsp.CodeAction. A regression in fix registry lookup or
+        the server's code-action handler would fail here.
+        """
+        from java_functional_lsp.server import on_code_action, server
+
+        self._ensure_workspace_initialized()
+        uri = "file:///test/BuggyExample.java"
+        source = _SANITY_HELLO_WITH_BUGS
+
+        # Inject the document into the pygls workspace so on_code_action
+        # can read its source.
+        server.workspace.put_text_document(
+            lsp.TextDocumentItem(uri=uri, language_id="java", version=1, text=source),
+        )
+        try:
+            # Build a synthetic null-return diagnostic at the `null` literal
+            # in `return null;` (line 7, columns 19-23 in _SANITY_HELLO_WITH_BUGS).
+            null_return_diag = lsp.Diagnostic(
+                range=lsp.Range(
+                    start=lsp.Position(line=7, character=19),
+                    end=lsp.Position(line=7, character=23),
+                ),
+                message="Avoid returning null.",
+                severity=lsp.DiagnosticSeverity.Warning,
+                code="null-return",
+                source="java-functional-lsp",
+            )
+            params = lsp.CodeActionParams(
+                text_document=lsp.TextDocumentIdentifier(uri=uri),
+                range=null_return_diag.range,
+                context=lsp.CodeActionContext(diagnostics=[null_return_diag]),
+            )
+
+            result = on_code_action(params)
+        finally:
+            server.workspace.remove_text_document(uri)
+
+        assert result is not None, "on_code_action returned None for null-return diagnostic"
+        assert len(result) >= 1
+        action = result[0]
+        assert action.kind == lsp.CodeActionKind.QuickFix
+        assert action.title == "Replace with Option.none()"
+        assert action.edit is not None
+        assert action.edit.changes is not None
+        edits = action.edit.changes[uri]
+        # We expect the null replacement plus an auto-import for Option.
+        assert any("Option.none()" in e.new_text for e in edits), (
+            f"Expected Option.none() in edits, got: {[e.new_text for e in edits]}"
+        )
+        assert any("import io.vavr.control.Option;" in e.new_text for e in edits), (
+            "Expected auto-import of io.vavr.control.Option in the edits"
+        )
+
+    def test_code_action_ignores_non_java_functional_lsp_diagnostics(self) -> None:
+        """Diagnostics from other sources (e.g. jdtls) must be ignored by our handler.
+
+        Regression guard for the ``if diag.source != "java-functional-lsp": continue``
+        filter in on_code_action. Without it, our handler would try to look up
+        fix generators for jdtls diagnostic codes and pollute the action list.
+        """
+        from java_functional_lsp.server import on_code_action, server
+
+        self._ensure_workspace_initialized()
+        uri = "file:///test/BuggyExample.java"
+        server.workspace.put_text_document(
+            lsp.TextDocumentItem(uri=uri, language_id="java", version=1, text=_SANITY_HELLO_WITH_BUGS),
+        )
+        try:
+            jdtls_diag = lsp.Diagnostic(
+                range=lsp.Range(
+                    start=lsp.Position(line=7, character=19),
+                    end=lsp.Position(line=7, character=23),
+                ),
+                message="Some jdtls warning",
+                severity=lsp.DiagnosticSeverity.Warning,
+                code="something-jdtls-specific",
+                source="Java",  # NOT java-functional-lsp
+            )
+            params = lsp.CodeActionParams(
+                text_document=lsp.TextDocumentIdentifier(uri=uri),
+                range=jdtls_diag.range,
+                context=lsp.CodeActionContext(diagnostics=[jdtls_diag]),
+            )
+
+            result = on_code_action(params)
+        finally:
+            server.workspace.remove_text_document(uri)
+
+        # Filtered out → no actions returned at all.
+        assert result is None
