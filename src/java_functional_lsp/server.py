@@ -331,6 +331,16 @@ async def _deferred_validate(uri: str) -> None:
     _analyze_and_publish(uri)
 
 
+def _forward_or_queue(method: str, serialized: Any) -> None:
+    """Forward a notification to jdtls if available, or queue it if starting."""
+    if server._proxy.is_available:
+        task = asyncio.create_task(server._proxy.send_notification(method, serialized))
+        _bg_tasks.add(task)
+        task.add_done_callback(_bg_tasks.discard)
+    elif server._proxy._starting:
+        server._proxy.queue_notification(method, serialized)
+
+
 @server.feature(lsp.TEXT_DOCUMENT_DID_OPEN)
 async def on_did_open(params: lsp.DidOpenTextDocumentParams) -> None:
     """Forward to jdtls (starting lazily if needed) and analyze immediately.
@@ -346,12 +356,15 @@ async def on_did_open(params: lsp.DidOpenTextDocumentParams) -> None:
         # Fast path: jdtls running. Forward didOpen + add module if new.
         await server._proxy.send_notification("textDocument/didOpen", serialized)
         await server._proxy.add_module_if_new(uri)
-    elif server._proxy._jdtls_on_path and not server._proxy._start_failed and not server._proxy._starting:
-        # First file: kick off lazy start in background.
+    elif server._proxy._jdtls_on_path and not server._proxy._start_failed:
+        # Queue the didOpen (whether this is the first file or a subsequent one during startup).
         server._proxy.queue_notification("textDocument/didOpen", serialized)
-        task = asyncio.create_task(_lazy_start_jdtls(uri))
-        _bg_tasks.add(task)
-        task.add_done_callback(_bg_tasks.discard)
+        if not server._proxy._lazy_start_fired:
+            # First file: kick off lazy start in background.
+            server._proxy._lazy_start_fired = True
+            task = asyncio.create_task(_lazy_start_jdtls(uri))
+            _bg_tasks.add(task)
+            task.add_done_callback(_bg_tasks.discard)
 
     # Custom diagnostics always publish immediately — never blocked by jdtls.
     _analyze_and_publish(uri)
@@ -361,11 +374,7 @@ async def on_did_open(params: lsp.DidOpenTextDocumentParams) -> None:
 async def on_did_change(params: lsp.DidChangeTextDocumentParams) -> None:
     """Forward to jdtls and schedule debounced re-analysis."""
     uri = params.text_document.uri
-    serialized = _serialize_params(params)
-    if server._proxy.is_available:
-        await server._proxy.send_notification("textDocument/didChange", serialized)
-    elif server._proxy._starting:
-        server._proxy.queue_notification("textDocument/didChange", serialized)
+    _forward_or_queue("textDocument/didChange", _serialize_params(params))
     # Cancel pending validation, schedule new one (150ms debounce for IDE typing)
     if uri in _pending:
         _pending[uri].cancel()
@@ -375,11 +384,7 @@ async def on_did_change(params: lsp.DidChangeTextDocumentParams) -> None:
 @server.feature(lsp.TEXT_DOCUMENT_DID_SAVE)
 async def on_did_save(params: lsp.DidSaveTextDocumentParams) -> None:
     """Forward to jdtls and re-analyze immediately (no debounce on save)."""
-    serialized = _serialize_params(params)
-    if server._proxy.is_available:
-        await server._proxy.send_notification("textDocument/didSave", serialized)
-    elif server._proxy._starting:
-        server._proxy.queue_notification("textDocument/didSave", serialized)
+    _forward_or_queue("textDocument/didSave", _serialize_params(params))
     _analyze_and_publish(params.text_document.uri)
 
 
@@ -392,11 +397,7 @@ async def on_did_close(params: lsp.DidCloseTextDocumentParams) -> None:
         del _pending[uri]
     # Clear diagnostics for the closed document (LSP best practice)
     server.text_document_publish_diagnostics(lsp.PublishDiagnosticsParams(uri=uri, diagnostics=[]))
-    serialized = _serialize_params(params)
-    if server._proxy.is_available:
-        await server._proxy.send_notification("textDocument/didClose", serialized)
-    elif server._proxy._starting:
-        server._proxy.queue_notification("textDocument/didClose", serialized)
+    _forward_or_queue("textDocument/didClose", _serialize_params(params))
 
 
 async def _lazy_start_jdtls(file_uri: str) -> None:

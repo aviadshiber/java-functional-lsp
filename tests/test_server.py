@@ -415,7 +415,7 @@ class TestServerInternals:
         mock_reg.assert_not_called()
 
     async def test_lazy_start_jdtls_success(self, caplog: Any) -> None:
-        """_lazy_start_jdtls logs success and registers capabilities."""
+        """_lazy_start_jdtls logs success, flushes queue, and expands workspace."""
         import logging
         from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -423,14 +423,16 @@ class TestServerInternals:
         from java_functional_lsp.server import _lazy_start_jdtls
         from java_functional_lsp.server import server as srv
 
+        mock_flush = AsyncMock()
+        mock_expand = AsyncMock()
         old_flag = srv_mod._jdtls_capabilities_registered
         srv_mod._jdtls_capabilities_registered = False
         try:
             with (
                 caplog.at_level(logging.INFO, logger="java_functional_lsp.server"),
                 patch.object(srv._proxy, "ensure_started", AsyncMock(return_value=True)),
-                patch.object(srv._proxy, "flush_queued_notifications", AsyncMock()),
-                patch.object(srv._proxy, "expand_full_workspace", AsyncMock()),
+                patch.object(srv._proxy, "flush_queued_notifications", mock_flush),
+                patch.object(srv._proxy, "expand_full_workspace", mock_expand),
                 patch.object(srv, "feature", MagicMock(return_value=lambda fn: fn)),
                 patch.object(srv, "client_register_capability_async", AsyncMock()),
             ):
@@ -438,9 +440,11 @@ class TestServerInternals:
         finally:
             srv_mod._jdtls_capabilities_registered = old_flag
         assert any("jdtls proxy active" in r.getMessage() for r in caplog.records)
+        mock_flush.assert_called_once()
+        mock_expand.assert_called_once()
 
     async def test_lazy_start_jdtls_failure_logged(self, caplog: Any) -> None:
-        """_lazy_start_jdtls logs warning on failure."""
+        """_lazy_start_jdtls logs warning on exception."""
         import logging
         from unittest.mock import AsyncMock, patch
 
@@ -453,6 +457,24 @@ class TestServerInternals:
         ):
             await _lazy_start_jdtls("file:///test/F.java")
         assert any("lazy start failed" in r.getMessage() for r in caplog.records)
+
+    async def test_lazy_start_jdtls_silent_failure(self) -> None:
+        """When ensure_started returns False, flush/expand are not called."""
+        from unittest.mock import AsyncMock, patch
+
+        from java_functional_lsp.server import _lazy_start_jdtls
+        from java_functional_lsp.server import server as srv
+
+        mock_flush = AsyncMock()
+        mock_expand = AsyncMock()
+        with (
+            patch.object(srv._proxy, "ensure_started", AsyncMock(return_value=False)),
+            patch.object(srv._proxy, "flush_queued_notifications", mock_flush),
+            patch.object(srv._proxy, "expand_full_workspace", mock_expand),
+        ):
+            await _lazy_start_jdtls("file:///test/F.java")
+        mock_flush.assert_not_called()
+        mock_expand.assert_not_called()
 
     def test_serialize_params_camelcase(self) -> None:
         from java_functional_lsp.server import _serialize_params

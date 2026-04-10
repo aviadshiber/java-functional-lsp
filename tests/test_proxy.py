@@ -930,7 +930,7 @@ class TestLazyStart:
             assert proxy.check_available() is False
         assert proxy._jdtls_on_path is False
 
-    def test_queue_and_flush(self) -> None:
+    async def test_queue_and_flush(self) -> None:
         from java_functional_lsp.proxy import JdtlsProxy
 
         proxy = JdtlsProxy()
@@ -938,18 +938,27 @@ class TestLazyStart:
         proxy.queue_notification("textDocument/didChange", {"uri": "b"})
         assert len(proxy._queued_notifications) == 2
 
-        # flush should clear the queue
         flushed: list[tuple[str, Any]] = []
 
         async def mock_send(method: str, params: Any) -> None:
             flushed.append((method, params))
 
         proxy.send_notification = mock_send  # type: ignore[assignment]
-        asyncio.get_event_loop().run_until_complete(proxy.flush_queued_notifications())
+        await proxy.flush_queued_notifications()
         assert len(flushed) == 2
         assert flushed[0] == ("textDocument/didOpen", {"uri": "a"})
         assert flushed[1] == ("textDocument/didChange", {"uri": "b"})
         assert len(proxy._queued_notifications) == 0
+
+    def test_queue_caps_at_max(self) -> None:
+        from java_functional_lsp.proxy import _MAX_QUEUED_NOTIFICATIONS, JdtlsProxy
+
+        proxy = JdtlsProxy()
+        for i in range(_MAX_QUEUED_NOTIFICATIONS + 50):
+            proxy.queue_notification("textDocument/didChange", {"i": i})
+        assert len(proxy._queued_notifications) == _MAX_QUEUED_NOTIFICATIONS
+        # Oldest entries dropped — last entry should be the most recent
+        assert proxy._queued_notifications[-1] == ("textDocument/didChange", {"i": _MAX_QUEUED_NOTIFICATIONS + 49})
 
     async def test_ensure_started_no_retry_after_failure(self) -> None:
         from unittest.mock import AsyncMock
@@ -958,10 +967,13 @@ class TestLazyStart:
 
         proxy = JdtlsProxy()
         proxy._jdtls_on_path = True
+        proxy.queue_notification("textDocument/didOpen", {"uri": "test"})
         proxy.start = AsyncMock(return_value=False)  # type: ignore[assignment]
         result = await proxy.ensure_started({"rootUri": "file:///tmp"}, "file:///tmp/F.java")
         assert result is False
         assert proxy._start_failed is True
+        # Queue should be cleared on failure
+        assert len(proxy._queued_notifications) == 0
         # Second call should return immediately without calling start()
         proxy.start.reset_mock()  # type: ignore[attr-defined]
         result2 = await proxy.ensure_started({"rootUri": "file:///tmp"}, "file:///tmp/F.java")
@@ -1024,6 +1036,18 @@ class TestLazyStart:
         await proxy.expand_full_workspace()
         proxy.send_notification.assert_called_once()  # type: ignore[attr-defined]
         assert proxy._workspace_expanded is True
+
+    async def test_expand_full_workspace_noop_when_not_available(self) -> None:
+        from unittest.mock import AsyncMock
+
+        from java_functional_lsp.proxy import JdtlsProxy
+
+        proxy = JdtlsProxy()
+        proxy._original_root_uri = "file:///workspace/monorepo"
+        proxy.send_notification = AsyncMock()  # type: ignore[assignment]
+        await proxy.expand_full_workspace()
+        proxy.send_notification.assert_not_called()  # type: ignore[attr-defined]
+        assert proxy._workspace_expanded is False
 
     async def test_expand_full_workspace_noop_when_already_added(self) -> None:
         from unittest.mock import AsyncMock
