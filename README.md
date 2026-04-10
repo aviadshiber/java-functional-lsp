@@ -8,7 +8,7 @@
 A Java Language Server that provides two things in one:
 
 1. **Full Java language support** — completions, hover, go-to-definition, compile errors, missing imports — by proxying [Eclipse jdtls](https://github.com/eclipse-jdtls/eclipse.jdt.ls) under the hood
-2. **15 functional programming rules** — catches anti-patterns and suggests Vavr/Lombok/Spring alternatives, all before compilation
+2. **16 functional programming rules** — catches anti-patterns and suggests Vavr/Lombok/Spring alternatives, all before compilation
 3. **Code actions (quick fixes)** — automated refactoring via LSP `textDocument/codeAction`, with machine-readable diagnostic metadata for AI agents
 
 Designed for teams using **Vavr**, **Lombok**, and **Spring** with a functional-first approach.
@@ -24,7 +24,7 @@ When [jdtls](https://github.com/eclipse-jdtls/eclipse.jdt.ls) is installed, the 
 - Type mismatches
 - Completions, hover, go-to-definition, find references
 
-Install jdtls separately: `brew install jdtls` (requires JDK 21+). Without jdtls, the server runs in standalone mode — the 12 custom rules still work, but you won't get compile errors or completions.
+Install jdtls separately: `brew install jdtls` (requires JDK 21+). The server auto-detects a Java 21+ installation even when the IDE's project SDK is older (e.g., Java 8) by probing `JDTLS_JAVA_HOME`, `JAVA_HOME`, `/usr/libexec/java_home -v 21+` (macOS), and `java` on PATH. Without jdtls, the server runs in standalone mode — the 16 custom rules still work, but you won't get compile errors or completions.
 
 ### Functional programming rules
 
@@ -44,6 +44,7 @@ Install jdtls separately: `brew install jdtls` (requires JDK 21+). Without jdtls
 | `component-annotation` | `@Component`/`@Service`/`@Repository` | `@Configuration` + `@Bean` | — |
 | `frozen-mutation` | Mutation on `List.of()`/`Collections.unmodifiable*` | `io.vavr.collection.List` | ✅ |
 | `null-check-to-monadic` | `if (x != null) { return x.foo(); }` | `Option.of(x).map(...)` | ✅ |
+| `try-catch-to-monadic` | `try { return x(); } catch (E e) { return d; }` | `Try.of(() -> x()).getOrElse(d)` | ✅ |
 | `impure-method` | Method mixing pure logic with side-effects | Extract pure logic; wrap IO in `Try` | — |
 
 ## Install
@@ -203,7 +204,7 @@ Create `.java-functional-lsp.json` in your project root to customize rules:
 - `rules` — per-rule severity: `error`, `warning` (default), `info`, `hint`, `off`
 
 **Spring-aware behavior:**
-- `throw-statement` and `catch-rethrow` are automatically suppressed inside `@Bean` methods
+- `throw-statement`, `catch-rethrow`, and `try-catch-to-monadic` are automatically suppressed inside `@Bean` methods
 - `mutable-dto` suggests `@ConstructorBinding` instead of `@Value` when the class has `@ConfigurationProperties`
 
 **Inline suppression** with `@SuppressWarnings`:
@@ -231,8 +232,9 @@ The server provides LSP code actions (`textDocument/codeAction`) that automatica
 | Rule | Code Action | What it does |
 |------|-------------|--------------|
 | `frozen-mutation` | Switch to Vavr Immutable Collection | Rewrites `List.of()` → `io.vavr.collection.List.of()`, `.add(x)` → `= list.append(x)`, adds import |
-| `null-check-to-monadic` | Convert to Option monadic flow | Rewrites `if (x != null) { return x.foo(); }` → `Option.of(x).map(...).getOrNull()`, adds import |
+| `null-check-to-monadic` | Convert to Option monadic flow | Rewrites `if (x != null) { return x.foo(); }` → `Option.of(x).map(...)`, supports chained fallbacks via `.orElse()`, adds import |
 | `null-return` | Replace with Option.none() | Rewrites `return null` → `return Option.none()`, adds import |
+| `try-catch-to-monadic` | Convert try/catch to Try monadic flow | Rewrites `try { return expr; } catch (E e) { return default; }` → `Try.of(() -> expr).getOrElse(default)`. Supports 3 patterns: simple default (eager/lazy `.getOrElse`), logging + default (`.onFailure().getOrElse`), and exception-dependent recovery (`.recover(E.class, ...).get()`). Skips try-with-resources, finally, multi-catch, and union types. Adds import. |
 
 Quick fixes automatically add the required Vavr import if it's not already present. Disable auto-import with `"autoImportVavr": false` in config.
 

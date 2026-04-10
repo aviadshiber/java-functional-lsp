@@ -48,8 +48,19 @@ uv run pytest
 4. Add a `DiagnosticData` entry to the module's `_DATA` dict with `fix_type`, `target_library`, and `rationale`
 5. Pass `data=_DATA["rule-id"]` when creating the `Diagnostic`
 6. Add tests in `tests/test_<analyzer>.py` (including a test verifying the `data` field)
-7. Optionally add a quick fix generator in `src/java_functional_lsp/fixes.py` and register it in `_FIX_REGISTRY`
+7. Optionally add a quick fix generator in `src/java_functional_lsp/fixes.py` and register it in `_FIX_REGISTRY` + add its title to `_FIX_TITLES` in `server.py` (an import-time assertion catches mismatches)
 8. Update the rules table in `README.md`
+
+## Test Architecture
+
+The project has a layered test suite:
+
+- **Unit tests** (`tests/test_*_checker.py`, `tests/test_fixes.py`, `tests/test_proxy.py`) — fast, focused, run in the main CI matrix across Python 3.10-3.13 on Ubuntu + macOS
+- **Server integration tests** (`tests/test_server.py: TestServerInternals`) — exercise the server pipeline (config loading, diagnostic conversion, code actions) in-process
+- **LSP lifecycle tests** (`tests/test_server.py: TestLspLifecycle`) — **zero mocks** — spawn the real server as a subprocess via pygls `LanguageClient`, connect over stdio, exercise the full LSP round-trip (initialize, didOpen, publishDiagnostics, codeAction, didChange)
+- **jdtls e2e tests** (`tests/test_e2e_jdtls.py`) — **zero mocks** — spawn real jdtls, exercise definition/references/hover/completion/documentSymbol forwarding. Auto-skip when jdtls is not installed. Run in a dedicated CI integration job.
+
+Coverage threshold is **80%**. Bump the version in both `pyproject.toml` and `src/java_functional_lsp/__init__.py` when making source changes (a pre-commit hook enforces this).
 
 ## Reporting Issues
 
