@@ -153,7 +153,10 @@ async def proxy(workspace: tuple[Path, Path]) -> AsyncIterator[JdtlsProxy]:
     try:
         yield p
     finally:
-        await p.stop()
+        try:
+            await p.stop()
+        except Exception:
+            logging.getLogger(__name__).warning("proxy.stop() failed during teardown", exc_info=True)
 
 
 async def _open_document(proxy: JdtlsProxy, src_file: Path) -> str:

@@ -90,10 +90,7 @@ jobs:
           tar -xzf /tmp/jdtls.tar.gz -C "$JDTLS_DIR"
           # Wrapper script on PATH that invokes the bundled Python launcher
           # with python3 (the tarball ships jdtls.py in bin/).
-          cat > "$BIN_DIR/jdtls" << SHELL_EOF
-          #!/bin/bash
-          exec python3 "$JDTLS_DIR/bin/jdtls" "\$@"
-          SHELL_EOF
+          printf '#!/bin/bash\nexec python3 "%s/bin/jdtls" "$@"\n' "$JDTLS_DIR" > "$BIN_DIR/jdtls"
           chmod +x "$BIN_DIR/jdtls"
           echo "$BIN_DIR" >> "$GITHUB_PATH"
       - name: Install uv

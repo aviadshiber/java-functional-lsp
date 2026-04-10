@@ -393,6 +393,10 @@ class TestLspConverterCamelCase:
             partial_result_token=None,
         )
         result = _serialize_params(params)
+        # Required fields must survive pruning
+        assert "textDocument" in result
+        assert "position" in result
+        # Optional None fields must be omitted
         assert "workDoneToken" not in result
         assert "partialResultToken" not in result
         # Also the snake_case equivalents should not appear

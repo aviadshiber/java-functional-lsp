@@ -98,6 +98,7 @@ async def lsp_client(tmp_path: Any) -> LanguageClient:  # type: ignore[misc]
         )
     )
     assert result.capabilities is not None
+    client._server_capabilities = result.capabilities  # type: ignore[attr-defined]
     client.initialized(lsp.InitializedParams())
 
     try:
@@ -136,8 +137,8 @@ async def _open_and_wait_for_diagnostics(
         )
     )
 
-    deadline = asyncio.get_event_loop().time() + timeout
-    while asyncio.get_event_loop().time() < deadline:
+    deadline = asyncio.get_running_loop().time() + timeout
+    while asyncio.get_running_loop().time() < deadline:
         if uri in client._published:  # type: ignore[attr-defined]
             return client._published[uri]  # type: ignore[attr-defined]
         await asyncio.sleep(0.1)
@@ -396,8 +397,10 @@ class TestLspLifecycle:
 
     async def test_initialize_reports_capabilities(self, lsp_client: LanguageClient) -> None:
         """Server advertises codeActionProvider and textDocumentSync."""
-        # The fixture already initialized — just verify the stored capabilities.
-        assert lsp_client is not None  # fixture didn't fail
+        caps = lsp_client._server_capabilities  # type: ignore[attr-defined]
+        assert caps is not None
+        assert caps.code_action_provider is not None
+        assert caps.text_document_sync is not None
 
     async def test_null_return_diagnostic_published(self, lsp_client: LanguageClient) -> None:
         """didOpen a file with ``return null`` → server publishes null-return diagnostic."""
@@ -522,11 +525,13 @@ class TestLspLifecycle:
         )
 
         # Wait for fresh diagnostics (debounced, ~150ms + processing).
-        deadline = asyncio.get_event_loop().time() + 5.0
-        while asyncio.get_event_loop().time() < deadline:
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + 5.0
+        while loop.time() < deadline:
             if uri in lsp_client._published:  # type: ignore[attr-defined]
                 break
             await asyncio.sleep(0.1)
 
-        new_diags = lsp_client._published.get(uri, diags)  # type: ignore[attr-defined]
+        assert uri in lsp_client._published, "Timed out waiting for updated diagnostics after didChange"  # type: ignore[attr-defined]
+        new_diags = lsp_client._published[uri]  # type: ignore[attr-defined]
         assert len(new_diags) == 0, f"Expected zero diagnostics after fixing, got {[d.code for d in new_diags]}"
