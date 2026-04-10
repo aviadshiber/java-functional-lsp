@@ -105,6 +105,11 @@ jobs:
           java -version
           echo "JAVA_HOME=$JAVA_HOME"
       - name: Run e2e tests
-        run: uv run pytest -v -m e2e
+        # --no-cov disables coverage reporting for this job. The e2e tests
+        # only exercise the proxy + server layers, so they cannot meet the
+        # 60% fail-under threshold enforced by pyproject.toml's default
+        # addopts. The unit matrix above already produces the authoritative
+        # coverage report.
+        run: uv run pytest -v -m e2e --no-cov
         env:
           NO_COLOR: "1"
