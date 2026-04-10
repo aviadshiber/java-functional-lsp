@@ -1,13 +1,13 @@
 ---
 name: java-functional-lsp
-description: Java LSP with full language support (completions, hover, go-to-def, compile errors) plus 15 functional programming rules with automated quick fixes. Auto-invoke when setting up Java language support or discussing Java linting configuration.
+description: Java LSP with full language support (completions, hover, go-to-def, compile errors) plus 16 functional programming rules with automated quick fixes. Auto-invoke when setting up Java language support or discussing Java linting configuration.
 allowed-tools: Bash
 disable-model-invocation: true
 ---
 
 # Java Functional LSP
 
-A Java LSP server that wraps jdtls and adds 15 functional programming rules with code actions (quick fixes). Gives you **full Java language support** (completions, hover, go-to-def, compile errors) **plus** custom diagnostics with machine-readable metadata for AI agents — all before compilation.
+A Java LSP server that wraps jdtls and adds 16 functional programming rules with code actions (quick fixes). Gives you **full Java language support** (completions, hover, go-to-def, compile errors) **plus** custom diagnostics with machine-readable metadata for AI agents — all before compilation.
 
 ## Prerequisites
 
@@ -22,7 +22,7 @@ brew install jdtls
 
 Without jdtls, the server runs in standalone mode — custom rules still work, but no completions/hover/compile errors.
 
-## Rules (15 checks)
+## Rules (16 checks)
 
 | Rule | Detects | Suggests | Quick Fix |
 |------|---------|----------|-----------|
@@ -40,6 +40,7 @@ Without jdtls, the server runs in standalone mode — custom rules still work, b
 | `component-annotation` | `@Component`/`@Service`/`@Repository` | `@Configuration` + `@Bean` | — |
 | `frozen-mutation` | Mutation on `List.of()`/`Collections.unmodifiable*` | `io.vavr.collection.List` | ✅ |
 | `null-check-to-monadic` | `if (x != null) { return x.foo(); }` | `Option.of(x).map(...)` | ✅ |
+| `try-catch-to-monadic` | `try { return x(); } catch (E e) { return d; }` | `Try.of(() -> x()).getOrElse(d)` | ✅ |
 | `impure-method` | Method mixing pure logic with side-effects | Extract pure logic; wrap IO in `Try` | — |
 
 ## Code Actions (Quick Fixes)
@@ -47,8 +48,9 @@ Without jdtls, the server runs in standalone mode — custom rules still work, b
 Rules marked ✅ provide automated `textDocument/codeAction` fixes:
 
 - **frozen-mutation** → "Switch to Vavr Immutable Collection" — rewrites type, init, and mutation call to Vavr persistent API, adds import
-- **null-check-to-monadic** → "Convert to Option monadic flow" — rewrites `if (x != null)` to `Option.of(x).map(...)`, adds import
+- **null-check-to-monadic** → "Convert to Option monadic flow" — rewrites `if (x != null)` to `Option.of(x).map(...)`, supports chained fallbacks via `.orElse()`, adds import
 - **null-return** → "Replace with Option.none()" — replaces `null` with `Option.none()`, adds import
+- **try-catch-to-monadic** → "Convert try/catch to Try monadic flow" — rewrites `try { return expr; } catch (E e) { return default; }` to `Try.of(() -> expr).getOrElse(default)`. Supports 3 patterns: simple default, logging + default (`.onFailure().getOrElse`), and exception-dependent recovery (`.recover(E.class, ...).get()`). Skips try-with-resources, finally, multi-catch, union types. Adds import.
 
 ## Agent-Ready Diagnostics
 
@@ -85,7 +87,7 @@ Create `.java-functional-lsp.json` in your project root:
 - `rules` — per-rule severity: `error`, `warning` (default), `info`, `hint`, `off`
 - `autoImportVavr` — quick fixes auto-add Vavr imports (default: `true`)
 - `strictPurity` — `impure-method` uses WARNING instead of HINT (default: `false`)
-- `throw-statement`/`catch-rethrow` auto-suppressed in `@Bean` methods
+- `throw-statement`/`catch-rethrow`/`try-catch-to-monadic` auto-suppressed in `@Bean` methods
 - `mutable-dto` suggests `@ConstructorBinding` for `@ConfigurationProperties` classes
 - Inline suppression: `@SuppressWarnings("java-functional-lsp:rule-id")` on any declaration
 

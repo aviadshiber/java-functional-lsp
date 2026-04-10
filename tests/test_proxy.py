@@ -263,6 +263,147 @@ class TestServerHelpers:
         assert "null-return" in codes
 
 
+class TestLspConverterCamelCase:
+    """Regression tests for the LSP JSON shape of request forwarding.
+
+    The LSP wire protocol uses camelCase field names (e.g. ``textDocument``).
+    pygls/lsprotocol models use snake_case attributes (``text_document``) and
+    rely on their own cattrs converter to handle the conversion. A vanilla
+    ``cattrs.Converter()`` emits snake_case literally, which causes jdtls to
+    throw ``NullPointerException`` on every ``textDocument/definition``,
+    ``textDocument/references``, ``textDocument/hover``, etc. because its
+    ``TextDocumentPositionParams.getTextDocument()`` returns null when the
+    field is named ``text_document``.
+
+    These tests pin the converter behavior so a regression to a vanilla
+    cattrs converter would be caught immediately.
+    """
+
+    def test_definition_params_unstructures_to_camelcase(self) -> None:
+        from lsprotocol import types as lsp
+
+        from java_functional_lsp.server import _serialize_params
+
+        params = lsp.DefinitionParams(
+            text_document=lsp.TextDocumentIdentifier(uri="file:///foo.java"),
+            position=lsp.Position(line=10, character=5),
+        )
+        result = _serialize_params(params)
+        assert isinstance(result, dict)
+        # jdtls requires camelCase: textDocument, NOT text_document
+        assert "textDocument" in result
+        assert "text_document" not in result
+        assert result["textDocument"]["uri"] == "file:///foo.java"
+        assert result["position"]["line"] == 10
+        assert result["position"]["character"] == 5
+
+    def test_reference_params_unstructures_to_camelcase(self) -> None:
+        from lsprotocol import types as lsp
+
+        from java_functional_lsp.server import _serialize_params
+
+        params = lsp.ReferenceParams(
+            text_document=lsp.TextDocumentIdentifier(uri="file:///bar.java"),
+            position=lsp.Position(line=3, character=7),
+            context=lsp.ReferenceContext(include_declaration=True),
+        )
+        result = _serialize_params(params)
+        assert isinstance(result, dict)
+        assert "textDocument" in result
+        assert "text_document" not in result
+        # Nested camelCase: context.includeDeclaration, NOT context.include_declaration
+        assert "context" in result
+        assert "includeDeclaration" in result["context"]
+        assert "include_declaration" not in result["context"]
+
+    def test_hover_params_unstructures_to_camelcase(self) -> None:
+        from lsprotocol import types as lsp
+
+        from java_functional_lsp.server import _serialize_params
+
+        params = lsp.HoverParams(
+            text_document=lsp.TextDocumentIdentifier(uri="file:///baz.java"),
+            position=lsp.Position(line=0, character=0),
+        )
+        result = _serialize_params(params)
+        assert "textDocument" in result
+        assert "text_document" not in result
+
+    def test_document_symbol_params_unstructures_to_camelcase(self) -> None:
+        from lsprotocol import types as lsp
+
+        from java_functional_lsp.server import _serialize_params
+
+        params = lsp.DocumentSymbolParams(
+            text_document=lsp.TextDocumentIdentifier(uri="file:///quux.java"),
+        )
+        result = _serialize_params(params)
+        assert "textDocument" in result
+        assert "text_document" not in result
+
+    def test_did_open_params_unstructures_to_camelcase(self) -> None:
+        from lsprotocol import types as lsp
+
+        from java_functional_lsp.server import _serialize_params
+
+        params = lsp.DidOpenTextDocumentParams(
+            text_document=lsp.TextDocumentItem(
+                uri="file:///open.java",
+                language_id="java",
+                version=1,
+                text="class T {}",
+            ),
+        )
+        result = _serialize_params(params)
+        assert "textDocument" in result
+        assert "text_document" not in result
+        # TextDocumentItem fields too: languageId, not language_id
+        assert "languageId" in result["textDocument"]
+        assert "language_id" not in result["textDocument"]
+
+    def test_completion_params_unstructures_to_camelcase(self) -> None:
+        from lsprotocol import types as lsp
+
+        from java_functional_lsp.server import _serialize_params
+
+        params = lsp.CompletionParams(
+            text_document=lsp.TextDocumentIdentifier(uri="file:///c.java"),
+            position=lsp.Position(line=5, character=10),
+        )
+        result = _serialize_params(params)
+        assert "textDocument" in result
+        assert "text_document" not in result
+
+    def test_none_fields_are_omitted(self) -> None:
+        """Optional fields with None values should be dropped from the JSON.
+
+        jdtls and other LSP servers treat the presence of a key with null
+        differently from the absence of the key. The LSP converter drops
+        None fields; a vanilla converter would emit ``"workDoneToken": null``
+        which could confuse strict servers.
+        """
+        from lsprotocol import types as lsp
+
+        from java_functional_lsp.server import _serialize_params
+
+        params = lsp.DefinitionParams(
+            text_document=lsp.TextDocumentIdentifier(uri="file:///foo.java"),
+            position=lsp.Position(line=0, character=0),
+            work_done_token=None,
+            partial_result_token=None,
+        )
+        result = _serialize_params(params)
+        # Required fields must survive pruning
+        assert "textDocument" in result
+        assert "position" in result
+        # Optional None fields must be omitted
+        assert "workDoneToken" not in result
+        assert "partialResultToken" not in result
+        # Also the snake_case equivalents should not appear
+        assert "work_done_token" not in result
+        assert "partial_result_token" not in result
+
+
 class TestReadJavaMajorVersion:
     """Parsing of the ``java -version`` output.
 

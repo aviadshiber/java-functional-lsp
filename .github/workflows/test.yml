@@ -31,6 +31,79 @@ jobs:
       - name: Type check
         run: uv run mypy src/
       - name: Test
-        run: uv run pytest -q
+        run: uv run pytest -q -m "not e2e"
+        env:
+          NO_COLOR: "1"
+
+  integration:
+    name: Integration (with jdtls) / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    # Runs the FULL test suite (unit + e2e) with jdtls installed, on one
+    # Python version per OS. This is a comprehensive sanity check that
+    # exercises: custom analyzer diagnostics, code action generation,
+    # AND jdtls request forwarding end-to-end. The unit matrix above
+    # provides fast Python-version-specific feedback without jdtls.
+    steps:
+      - uses: actions/checkout@v6
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Install Java 21
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "21"
+      - name: Install jdtls (macOS)
+        if: runner.os == 'macOS'
+        run: brew install jdtls
+      - name: Install jdtls (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          # Download the Eclipse JDT Language Server milestone build directly.
+          # Pinned to match the Homebrew formula so Linux + macOS exercise the
+          # same version. When bumping, update ALL THREE of JDTLS_VERSION,
+          # JDTLS_BUILD, and JDTLS_SHA256 together — the canonical source is
+          # the Homebrew formula:
+          #   https://github.com/Homebrew/homebrew-core/blob/HEAD/Formula/j/jdtls.rb
+          # It has `url "...jdt-language-server-<version>-<build>.tar.gz"`
+          # and `sha256 "<hex>"` which you can copy verbatim.
+          JDTLS_VERSION="1.57.0"
+          JDTLS_BUILD="202602261110"
+          JDTLS_SHA256="f7ffa93fe1bbbea95dac13dd97cdcd25c582d6e56db67258da0dcceb2302601e"
+          JDTLS_URL="https://www.eclipse.org/downloads/download.php?file=/jdtls/milestones/${JDTLS_VERSION}/jdt-language-server-${JDTLS_VERSION}-${JDTLS_BUILD}.tar.gz&r=1"
+          JDTLS_DIR="$HOME/.local/share/jdtls"
+          BIN_DIR="$HOME/.local/bin"
+          mkdir -p "$JDTLS_DIR" "$BIN_DIR"
+          # -L follows Eclipse's mirror redirect; -f fails loudly on 404.
+          curl -sSLf -o /tmp/jdtls.tar.gz "$JDTLS_URL"
+          # Verify the tarball integrity against the hash pinned in the
+          # Homebrew formula. This protects against mirror tampering —
+          # without it, a compromised Eclipse mirror could ship arbitrary
+          # code that our e2e tests would then execute.
+          echo "${JDTLS_SHA256}  /tmp/jdtls.tar.gz" | sha256sum -c -
+          tar -xzf /tmp/jdtls.tar.gz -C "$JDTLS_DIR"
+          # Wrapper script on PATH that invokes the bundled Python launcher
+          # with python3 (the tarball ships jdtls.py in bin/).
+          printf '#!/bin/bash\nexec python3 "%s/bin/jdtls" "$@"\n' "$JDTLS_DIR" > "$BIN_DIR/jdtls"
+          chmod +x "$BIN_DIR/jdtls"
+          echo "$BIN_DIR" >> "$GITHUB_PATH"
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+      - name: Install dependencies
+        run: uv sync
+      - name: Verify jdtls is available
+        run: |
+          which jdtls
+          jdtls --help | head -5 || true
+          java -version
+          echo "JAVA_HOME=$JAVA_HOME"
+      - name: Run full test suite (unit + e2e)
+        run: uv run pytest -v
         env:
           NO_COLOR: "1"
