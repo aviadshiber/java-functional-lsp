@@ -65,18 +65,26 @@ jobs:
           set -euo pipefail
           # Download the Eclipse JDT Language Server milestone build directly.
           # Pinned to match the Homebrew formula so Linux + macOS exercise the
-          # same version. Latest is 1.57.0 (build 202602261110); bump both
-          # JDTLS_VERSION and JDTLS_BUILD together when updating — get the
-          # current build suffix from the Homebrew formula's `url` line at
-          # https://github.com/Homebrew/homebrew-core/blob/HEAD/Formula/j/jdtls.rb
+          # same version. When bumping, update ALL THREE of JDTLS_VERSION,
+          # JDTLS_BUILD, and JDTLS_SHA256 together — the canonical source is
+          # the Homebrew formula:
+          #   https://github.com/Homebrew/homebrew-core/blob/HEAD/Formula/j/jdtls.rb
+          # It has `url "...jdt-language-server-<version>-<build>.tar.gz"`
+          # and `sha256 "<hex>"` which you can copy verbatim.
           JDTLS_VERSION="1.57.0"
           JDTLS_BUILD="202602261110"
+          JDTLS_SHA256="f7ffa93fe1bbbea95dac13dd97cdcd25c582d6e56db67258da0dcceb2302601e"
           JDTLS_URL="https://www.eclipse.org/downloads/download.php?file=/jdtls/milestones/${JDTLS_VERSION}/jdt-language-server-${JDTLS_VERSION}-${JDTLS_BUILD}.tar.gz&r=1"
           JDTLS_DIR="$HOME/.local/share/jdtls"
           BIN_DIR="$HOME/.local/bin"
           mkdir -p "$JDTLS_DIR" "$BIN_DIR"
           # -L follows Eclipse's mirror redirect; -f fails loudly on 404.
           curl -sSLf -o /tmp/jdtls.tar.gz "$JDTLS_URL"
+          # Verify the tarball integrity against the hash pinned in the
+          # Homebrew formula. This protects against mirror tampering —
+          # without it, a compromised Eclipse mirror could ship arbitrary
+          # code that our e2e tests would then execute.
+          echo "${JDTLS_SHA256}  /tmp/jdtls.tar.gz" | sha256sum -c -
           tar -xzf /tmp/jdtls.tar.gz -C "$JDTLS_DIR"
           # Wrapper script on PATH that invokes the bundled Python launcher
           # with python3 (the tarball ships jdtls.py in bin/).
