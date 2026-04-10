@@ -13,8 +13,8 @@ import sys
 from pathlib import Path
 from typing import Any
 
-import cattrs
 from lsprotocol import types as lsp
+from lsprotocol.converters import get_converter
 from pygls.lsp.server import LanguageServer
 from pygls.uris import to_fs_path
 
@@ -45,7 +45,14 @@ _ANALYZERS: list[Analyzer] = [
     FunctionalChecker(),
 ]
 
-_converter = cattrs.Converter()
+#: LSP-aware cattrs converter. Unstructures to the LSP JSON shape
+#: (camelCase field names, discriminated unions, None-field pruning) and
+#: correspondingly structures from the same shape. Using a vanilla
+#: ``cattrs.Converter()`` here emits snake_case field names (``text_document``
+#: instead of ``textDocument``), which breaks request forwarding to jdtls —
+#: jdtls then sees a null ``TextDocumentIdentifier`` and throws NPEs during
+#: go-to-definition, references, etc.
+_converter = get_converter()
 
 
 class JavaFunctionalLspServer(LanguageServer):
