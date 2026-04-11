@@ -317,6 +317,73 @@ async def read_message(reader: asyncio.StreamReader) -> dict[str, Any] | None:
 _BUILD_FILES = ("pom.xml", "build.gradle", "build.gradle.kts")
 _WORKSPACE_DID_CHANGE_FOLDERS = "workspace/didChangeWorkspaceFolders"
 _MAX_QUEUED_NOTIFICATIONS = 200
+_MODULE_READY_TIMEOUT = 30.0
+
+
+class ModuleState:
+    """Module import states — UNKNOWN → ADDED → READY."""
+
+    UNKNOWN = "unknown"
+    ADDED = "added"
+    READY = "ready"
+
+
+class ModuleRegistry:
+    """Thread-safe (asyncio) registry tracking jdtls module import states.
+
+    Uses a plain dict for O(1) hot-path lookups and per-module ``asyncio.Event``
+    for adaptive waiting — coroutines blocked on ``wait_until_ready()`` wake
+    instantly when ``mark_ready()`` is called, instead of a fixed sleep.
+
+    Safe without locks because asyncio is single-threaded: dict mutations that
+    don't span an ``await`` are atomic.
+    """
+
+    def __init__(self) -> None:
+        self._states: dict[str, str] = {}
+        self._ready_events: dict[str, asyncio.Event] = {}
+
+    def get_state(self, uri: str) -> str:
+        """O(1) state lookup. Returns ModuleState constant."""
+        return self._states.get(uri, ModuleState.UNKNOWN)
+
+    def is_ready(self, uri: str) -> bool:
+        """O(1) hot-path check — zero overhead when module is ready."""
+        return self._states.get(uri) is ModuleState.READY
+
+    def was_added(self, uri: str) -> bool:
+        """True if module was sent to jdtls (ADDED or READY)."""
+        return uri in self._states
+
+    def mark_added(self, uri: str) -> None:
+        """Mark module as sent to jdtls. Pre-creates the Event for waiters.
+
+        Must be called before any ``await`` to prevent duplicate add_module calls.
+        """
+        self._states[uri] = ModuleState.ADDED
+        self._ready_events.setdefault(uri, asyncio.Event())
+
+    def mark_ready(self, uri: str) -> None:
+        """Mark module as confirmed working. Wakes all coroutines waiting on it."""
+        self._states[uri] = ModuleState.READY
+        event = self._ready_events.get(uri)
+        if event is not None:
+            event.set()
+
+    async def wait_until_ready(self, uri: str, timeout: float = _MODULE_READY_TIMEOUT) -> bool:
+        """Suspend until the module is ready or timeout expires.
+
+        Returns True if ready, False on timeout. If already READY, returns
+        immediately without suspending.
+        """
+        event = self._ready_events.setdefault(uri, asyncio.Event())
+        if event.is_set():
+            return True
+        try:
+            await asyncio.wait_for(event.wait(), timeout=timeout)
+            return True
+        except asyncio.TimeoutError:
+            return False
 
 
 @lru_cache(maxsize=256)
@@ -380,7 +447,7 @@ class JdtlsProxy:
         self._queued_notifications: deque[tuple[str, Any]] = deque(maxlen=_MAX_QUEUED_NOTIFICATIONS)
         self._original_root_uri: str | None = None
         self._initial_module_uri: str | None = None
-        self._added_module_uris: set[str] = set()
+        self.modules = ModuleRegistry()
         self._workspace_expanded = False
 
     @property
@@ -441,9 +508,9 @@ class JdtlsProxy:
         ws = caps.setdefault("workspace", {})
         ws["workspaceFolders"] = True
 
-        # Track the initial module as already loaded.
+        # Track the initial module as already loaded (mark ADDED before await).
         self._initial_module_uri = module_root_uri
-        self._added_module_uris.add(effective_root_uri)
+        self.modules.mark_added(effective_root_uri)
 
         # Build a clean environment for jdtls.
         loop = asyncio.get_running_loop()
@@ -534,18 +601,23 @@ class JdtlsProxy:
         for method, params in queue:
             await self.send_notification(method, params)
 
-    async def add_module_if_new(self, file_uri: str) -> bool:
+    async def add_module_if_new(self, file_uri: str) -> str | None:
         """Add the module containing *file_uri* to jdtls if not already added.
 
-        Returns ``True`` if a new module was added (jdtls needs import time),
-        ``False`` if already known or unavailable.
+        Returns the module URI if a new module was added (UNKNOWN → ADDED),
+        or ``None`` if already known or unavailable. The returned URI can be
+        used with ``modules.wait_until_ready()`` for adaptive waiting.
+
+        Calls ``modules.mark_added()`` before any ``await`` to prevent
+        duplicate add calls from concurrent coroutines.
         """
         if not self._available:
-            return False
+            return None
         module_uri = _resolve_module_uri(file_uri)
-        if module_uri is None or module_uri in self._added_module_uris:
-            return False
-        self._added_module_uris.add(module_uri)
+        if module_uri is None or self.modules.was_added(module_uri):
+            return None
+        # Mark ADDED before await — atomic in asyncio, prevents duplicate sends.
+        self.modules.mark_added(module_uri)
         from pygls.uris import to_fs_path
 
         logger.info("jdtls: adding module %s", _redact_path(to_fs_path(module_uri)))
@@ -554,7 +626,7 @@ class JdtlsProxy:
             _WORKSPACE_DID_CHANGE_FOLDERS,
             {"event": {"added": [{"uri": module_uri, "name": mod_name}], "removed": []}},
         )
-        return True
+        return module_uri
 
     async def expand_full_workspace(self) -> None:
         """Expand jdtls workspace to the full monorepo root (background task).
@@ -568,10 +640,10 @@ class JdtlsProxy:
 
         root_path = to_fs_path(self._original_root_uri) or self._original_root_uri
         root_uri = from_fs_path(root_path) or self._original_root_uri
-        if root_uri in self._added_module_uris:
+        if self.modules.was_added(root_uri):
             self._workspace_expanded = True
             return
-        self._added_module_uris.add(root_uri)
+        self.modules.mark_added(root_uri)
 
         # Remove initial module folder to avoid double-indexing.
         removed: list[dict[str, str]] = []

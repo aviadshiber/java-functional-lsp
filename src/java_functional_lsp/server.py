@@ -26,7 +26,7 @@ from .analyzers.mutation_checker import MutationChecker
 from .analyzers.null_checker import NullChecker
 from .analyzers.spring_checker import SpringChecker
 from .fixes import get_fix, get_fix_registry_keys
-from .proxy import JdtlsProxy
+from .proxy import JdtlsProxy, _resolve_module_uri
 
 logger = logging.getLogger(__name__)
 
@@ -439,23 +439,48 @@ async def _expand_workspace_background() -> None:
 # _JDTLS_HANDLERS and registered inside _register_jdtls_capabilities() so
 # they only activate after jdtls starts.
 
-_MODULE_IMPORT_WAIT_SEC = 3.0
-
 
 async def _ensure_module_and_forward(method: str, params: Any, file_uri: str) -> Any | None:
     """Forward a request to jdtls, ensuring the file's module is loaded.
 
-    If the module was just added and jdtls returns null, retries once after
-    a brief wait to give jdtls time to import the newly-added module.
+    Uses ``ModuleRegistry`` for adaptive waiting:
+    - **READY**: forward immediately (zero overhead on hot path)
+    - **UNKNOWN**: add module, wait until ready (adaptive, not fixed sleep)
+    - **ADDED**: module sent but not confirmed — wait until ready
+
+    When a request succeeds, marks the module as READY so subsequent
+    requests skip the wait entirely.
     """
-    if not server._proxy.is_available:
+    proxy = server._proxy
+    if not proxy.is_available:
         return None
-    module_is_new = await server._proxy.add_module_if_new(file_uri)
+
+    module_uri = _resolve_module_uri(file_uri)
+
+    # Hot path: module already confirmed working.
+    if module_uri and proxy.modules.is_ready(module_uri):
+        return await proxy.send_request(method, _serialize_params(params))
+
+    # Cold path: add module if unknown, then wait for ready.
+    new_module_uri = await proxy.add_module_if_new(file_uri)
+
     serialized = _serialize_params(params)
-    result = await server._proxy.send_request(method, serialized)
-    if result is None and module_is_new:
-        await asyncio.sleep(_MODULE_IMPORT_WAIT_SEC)
-        result = await server._proxy.send_request(method, serialized)
+    result = await proxy.send_request(method, serialized)
+
+    if result is not None:
+        # Success — mark module as ready so future requests are instant.
+        if module_uri:
+            proxy.modules.mark_ready(module_uri)
+        return result
+
+    # Null result and module is not yet ready — wait adaptively.
+    wait_uri = new_module_uri or module_uri
+    if wait_uri and not proxy.modules.is_ready(wait_uri):
+        ready = await proxy.modules.wait_until_ready(wait_uri)
+        if ready:
+            result = await proxy.send_request(method, serialized)
+            if result is not None and module_uri:
+                proxy.modules.mark_ready(module_uri)
     return result
 
 

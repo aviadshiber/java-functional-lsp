@@ -1007,10 +1007,12 @@ class TestLazyStart:
             java_file.touch()
             uri = java_file.as_uri()
             result = await proxy.add_module_if_new(uri)
-            assert result is True
+            assert result is not None  # Returns module URI string
             proxy.send_notification.assert_called_once()  # type: ignore[attr-defined]
             call_args = proxy.send_notification.call_args  # type: ignore[attr-defined]
             assert call_args[0][0] == "workspace/didChangeWorkspaceFolders"
+            # Module should be marked ADDED in registry
+            assert proxy.modules.was_added(result)
 
     async def test_add_module_if_new_skips_duplicate(self) -> None:
         from unittest.mock import AsyncMock
@@ -1031,8 +1033,8 @@ class TestLazyStart:
             uri = java_file.as_uri()
             result1 = await proxy.add_module_if_new(uri)
             result2 = await proxy.add_module_if_new(uri)  # duplicate
-            assert result1 is True
-            assert result2 is False
+            assert result1 is not None  # New module URI
+            assert result2 is None  # Already known
             assert proxy.send_notification.call_count == 1  # type: ignore[attr-defined]
 
     async def test_expand_full_workspace_sends_notification(self) -> None:
@@ -1087,7 +1089,7 @@ class TestLazyStart:
         proxy = JdtlsProxy()
         proxy._available = True
         proxy._original_root_uri = "file:///workspace/monorepo"
-        proxy._added_module_uris.add("file:///workspace/monorepo")
+        proxy.modules.mark_added("file:///workspace/monorepo")
         proxy.send_notification = AsyncMock()  # type: ignore[assignment]
         await proxy.expand_full_workspace()
         proxy.send_notification.assert_not_called()  # type: ignore[attr-defined]
