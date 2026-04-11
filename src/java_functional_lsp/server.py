@@ -67,6 +67,8 @@ class JavaFunctionalLspServer(LanguageServer):
 
     def _on_jdtls_diagnostics(self, uri: str, diagnostics: list[Any]) -> None:
         """Called when jdtls publishes diagnostics — merge with custom and re-publish."""
+        if not uri.endswith(".java"):
+            return
         try:
             _analyze_and_publish(uri)
         except Exception as e:
