@@ -349,7 +349,7 @@ class ModuleRegistry:
 
     def is_ready(self, uri: str) -> bool:
         """O(1) hot-path check — zero overhead when module is ready."""
-        return self._states.get(uri) is ModuleState.READY
+        return self._states.get(uri) == ModuleState.READY
 
     def was_added(self, uri: str) -> bool:
         """True if module was sent to jdtls (ADDED or READY)."""
@@ -366,9 +366,14 @@ class ModuleRegistry:
     def mark_ready(self, uri: str) -> None:
         """Mark module as confirmed working. Wakes all coroutines waiting on it."""
         self._states[uri] = ModuleState.READY
-        event = self._ready_events.get(uri)
+        event = self._ready_events.pop(uri, None)
         if event is not None:
             event.set()
+
+    def clear(self) -> None:
+        """Reset all state. Used by tests."""
+        self._states.clear()
+        self._ready_events.clear()
 
     async def wait_until_ready(self, uri: str, timeout: float = _MODULE_READY_TIMEOUT) -> bool:
         """Suspend until the module is ready or timeout expires.

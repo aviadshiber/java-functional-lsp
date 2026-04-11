@@ -473,14 +473,16 @@ async def _ensure_module_and_forward(method: str, params: Any, file_uri: str) ->
             proxy.modules.mark_ready(module_uri)
         return result
 
-    # Null result and module is not yet ready — wait adaptively.
+    # Null result and module is not yet ready — wait then retry once.
+    # Use a short timeout (5s) so single-caller case doesn't block for 30s.
+    # If a concurrent request succeeds, Event.set() wakes us early.
     wait_uri = new_module_uri or module_uri
     if wait_uri and not proxy.modules.is_ready(wait_uri):
-        ready = await proxy.modules.wait_until_ready(wait_uri)
-        if ready:
-            result = await proxy.send_request(method, serialized)
-            if result is not None and module_uri:
-                proxy.modules.mark_ready(module_uri)
+        await proxy.modules.wait_until_ready(wait_uri, timeout=5.0)
+    # Always retry once after waiting — even on timeout the module may be ready.
+    result = await proxy.send_request(method, serialized)
+    if result is not None and module_uri:
+        proxy.modules.mark_ready(module_uri)
     return result
 
 

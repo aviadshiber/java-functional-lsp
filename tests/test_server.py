@@ -494,8 +494,7 @@ class TestServerInternals:
             ):
                 result = await _ensure_module_and_forward("textDocument/hover", {}, "file:///mod/F.java")
         finally:
-            srv._proxy.modules._states.clear()
-            srv._proxy.modules._ready_events.clear()
+            srv._proxy.modules.clear()
         assert result == {"result": "ok"}
         assert mock_send.call_count == 1
 
@@ -523,8 +522,7 @@ class TestServerInternals:
             ):
                 result = await _ensure_module_and_forward("textDocument/hover", {}, "file:///mod/F.java")
         finally:
-            srv._proxy.modules._states.clear()
-            srv._proxy.modules._ready_events.clear()
+            srv._proxy.modules.clear()
         assert result == {"result": "ok"}
         assert mock_send.call_count == 2
 
@@ -548,8 +546,7 @@ class TestServerInternals:
                 await _ensure_module_and_forward("textDocument/hover", {}, "file:///mod/F.java")
             assert srv._proxy.modules.get_state("file:///mod") == ModuleState.READY
         finally:
-            srv._proxy.modules._states.clear()
-            srv._proxy.modules._ready_events.clear()
+            srv._proxy.modules.clear()
 
     def test_serialize_params_camelcase(self) -> None:
         from java_functional_lsp.server import _serialize_params
