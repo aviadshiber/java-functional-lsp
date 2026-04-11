@@ -480,19 +480,22 @@ class TestServerInternals:
         """When add_module_if_new returns True and first request returns None, retry once."""
         from unittest.mock import AsyncMock, patch
 
-        from java_functional_lsp.server import _ensure_module_and_forward
+        from java_functional_lsp.server import _MODULE_IMPORT_WAIT_SEC, _ensure_module_and_forward
         from java_functional_lsp.server import server as srv
 
         mock_add = AsyncMock(return_value=True)
         mock_send = AsyncMock(side_effect=[None, {"result": "ok"}])
+        mock_sleep = AsyncMock()
         with (
             patch.object(srv._proxy, "add_module_if_new", mock_add),
             patch.object(srv._proxy, "send_request", mock_send),
             patch.object(srv._proxy, "_available", True),
+            patch("java_functional_lsp.server.asyncio.sleep", mock_sleep),
         ):
             result = await _ensure_module_and_forward("textDocument/hover", {}, "file:///test/F.java")
         assert result == {"result": "ok"}
         assert mock_send.call_count == 2
+        mock_sleep.assert_called_once_with(_MODULE_IMPORT_WAIT_SEC)
 
     async def test_ensure_module_and_forward_no_retry_on_known_module(self) -> None:
         """When add_module_if_new returns False and request returns None, no retry."""

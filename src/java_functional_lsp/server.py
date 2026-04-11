@@ -337,7 +337,7 @@ def _forward_or_queue(method: str, serialized: Any) -> None:
         task = asyncio.create_task(server._proxy.send_notification(method, serialized))
         _bg_tasks.add(task)
         task.add_done_callback(_bg_tasks.discard)
-    elif server._proxy._starting:
+    elif server._proxy._lazy_start_fired and not server._proxy._start_failed:
         server._proxy.queue_notification(method, serialized)
 
 

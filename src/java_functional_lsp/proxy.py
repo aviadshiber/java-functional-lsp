@@ -12,6 +12,7 @@ import platform
 import re
 import shutil
 import subprocess
+from collections import deque
 from collections.abc import Callable, Mapping
 from functools import lru_cache
 from pathlib import Path
@@ -336,6 +337,9 @@ def find_module_root(file_path: str) -> str | None:
 
     Returns the directory path, or ``None`` if no build file is found before
     reaching the filesystem root. Results are cached by parent directory.
+
+    **Note:** cache entries are never invalidated. Build files added after the
+    first lookup for a given directory will not be detected until process restart.
     """
     return _cached_module_root(str(Path(file_path).parent))
 
@@ -373,7 +377,7 @@ class JdtlsProxy:
         self._start_failed = False
         self._jdtls_on_path = False
         self._lazy_start_fired = False
-        self._queued_notifications: list[tuple[str, Any]] = []
+        self._queued_notifications: deque[tuple[str, Any]] = deque(maxlen=_MAX_QUEUED_NOTIFICATIONS)
         self._original_root_uri: str | None = None
         self._initial_module_uri: str | None = None
         self._added_module_uris: set[str] = set()
@@ -508,22 +512,25 @@ class JdtlsProxy:
                     self._start_failed = True
                     self._queued_notifications.clear()
                 return started
+            except Exception:
+                self._start_failed = True
+                self._queued_notifications.clear()
+                raise
             finally:
                 self._starting = False
 
     def queue_notification(self, method: str, params: Any) -> None:
         """Buffer a notification for replay after jdtls starts.
 
-        Capped at ``_MAX_QUEUED_NOTIFICATIONS`` to prevent unbounded memory
-        growth during long jdtls startup. Oldest entries are dropped on overflow.
+        Uses a ``deque(maxlen=200)`` so oldest entries are dropped in O(1)
+        when the queue overflows during long jdtls startup.
         """
-        if len(self._queued_notifications) >= _MAX_QUEUED_NOTIFICATIONS:
-            self._queued_notifications.pop(0)
         self._queued_notifications.append((method, params))
 
     async def flush_queued_notifications(self) -> None:
         """Send all queued notifications to jdtls."""
-        queue, self._queued_notifications = self._queued_notifications, []
+        queue = list(self._queued_notifications)
+        self._queued_notifications.clear()
         for method, params in queue:
             await self.send_notification(method, params)
 
