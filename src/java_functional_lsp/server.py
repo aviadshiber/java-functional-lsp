@@ -66,9 +66,17 @@ class JavaFunctionalLspServer(LanguageServer):
         self._proxy = JdtlsProxy(on_diagnostics=self._on_jdtls_diagnostics)
 
     def _on_jdtls_diagnostics(self, uri: str, diagnostics: list[Any]) -> None:
-        """Called when jdtls publishes diagnostics — merge with custom and re-publish."""
+        """Called when jdtls publishes diagnostics — merge with custom and re-publish.
+
+        Also marks the file's module as READY, since receiving diagnostics from
+        jdtls is a reliable signal that the module has been indexed (more reliable
+        than a first non-None response which may be semantically empty).
+        """
         if not uri.endswith(".java"):
             return
+        module_uri = _resolve_module_uri(uri)
+        if module_uri:
+            self._proxy.modules.mark_ready(module_uri)
         try:
             _analyze_and_publish(uri)
         except Exception as e:
@@ -406,8 +414,9 @@ async def _lazy_start_jdtls(file_uri: str) -> None:
     """Background task: start jdtls scoped to the module containing *file_uri*.
 
     Runs in the background so ``on_did_open`` returns immediately with custom
-    diagnostics. After jdtls initializes, registers capabilities, flushes
-    queued notifications, and schedules workspace expansion.
+    diagnostics. After jdtls initializes, registers capabilities and flushes
+    queued notifications. Workspace expansion is NOT done eagerly — modules
+    are loaded on-demand via ``add_module_if_new()`` as files are opened.
     """
     try:
         started = await server._proxy.ensure_started(server._init_params, file_uri)
@@ -415,7 +424,6 @@ async def _lazy_start_jdtls(file_uri: str) -> None:
             logger.info("jdtls proxy active — full Java language support enabled")
             await _register_jdtls_capabilities()
             await server._proxy.flush_queued_notifications()
-            await _expand_workspace_background()
     except Exception:
         logger.warning("jdtls lazy start failed", exc_info=True)
 
