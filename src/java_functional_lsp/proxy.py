@@ -12,6 +12,7 @@ import platform
 import re
 import shutil
 import subprocess
+import time
 from collections import deque
 from collections.abc import Callable, Mapping
 from functools import lru_cache
@@ -22,6 +23,7 @@ logger = logging.getLogger(__name__)
 
 REQUEST_TIMEOUT = 30.0  # seconds — per-request timeout for normal operations
 _INITIALIZE_TIMEOUT = 120.0  # seconds — module-scoped init can still be slow (Maven classpath resolution)
+_START_RETRY_COOLDOWN = 300.0  # seconds — retry jdtls startup after transient failure
 DEFAULT_JVM_MAX_HEAP = "4g"
 _STDERR_LINE_MAX = 1000
 
@@ -448,6 +450,7 @@ class JdtlsProxy:
         self._start_lock = asyncio.Lock()
         self._starting = False
         self._start_failed = False
+        self._start_failed_at: float | None = None
         self._jdtls_on_path = False
         self._lazy_start_fired = False
         self._queued_notifications: deque[tuple[str, Any]] = deque(maxlen=_MAX_QUEUED_NOTIFICATIONS)
@@ -566,12 +569,21 @@ class JdtlsProxy:
         """Start jdtls lazily, scoped to the module containing *file_uri*.
 
         Thread-safe: uses asyncio.Lock to prevent double-start from rapid
-        didOpen calls. Sets ``_start_failed`` on failure to prevent retries.
+        didOpen calls. Sets ``_start_failed`` on failure to prevent retries,
+        but allows retry after a cooldown period (5 minutes) so transient
+        failures (Maven Central timeout, JVM OOM) don't permanently disable jdtls.
         """
         if self._available:
             return True
-        if self._start_failed or not self._jdtls_on_path:
+        if not self._jdtls_on_path:
             return False
+        if self._start_failed:
+            if self._start_failed_at and (time.monotonic() - self._start_failed_at > _START_RETRY_COOLDOWN):
+                self._start_failed = False
+                self._start_failed_at = None
+                logger.info("jdtls: retrying after previous failure (cooldown elapsed)")
+            else:
+                return False
 
         async with self._start_lock:
             if self._available:
@@ -583,10 +595,12 @@ class JdtlsProxy:
                 started = await self.start(init_params, module_root_uri=module_uri)
                 if not started:
                     self._start_failed = True
+                    self._start_failed_at = time.monotonic()
                     self._queued_notifications.clear()
                 return started
             except Exception:
                 self._start_failed = True
+                self._start_failed_at = time.monotonic()
                 self._queued_notifications.clear()
                 raise
             finally:
