@@ -20,7 +20,8 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
-REQUEST_TIMEOUT = 30.0  # seconds
+REQUEST_TIMEOUT = 30.0  # seconds — per-request timeout for normal operations
+_INITIALIZE_TIMEOUT = 120.0  # seconds — module-scoped init can still be slow (Maven classpath resolution)
 DEFAULT_JVM_MAX_HEAP = "4g"
 _STDERR_LINE_MAX = 1000
 
@@ -544,7 +545,7 @@ class JdtlsProxy:
             if self._process.stderr is not None:
                 self._stderr_task = asyncio.create_task(self._stderr_reader(self._process.stderr))
 
-            result = await self.send_request("initialize", effective_params)
+            result = await self.send_request("initialize", effective_params, timeout=_INITIALIZE_TIMEOUT)
             if result is None:
                 logger.error("jdtls initialize request failed or timed out")
                 await self.stop()
