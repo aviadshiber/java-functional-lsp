@@ -476,6 +476,60 @@ class TestServerInternals:
         mock_flush.assert_not_called()
         mock_expand.assert_not_called()
 
+    async def test_ensure_module_and_forward_retries_on_new_module(self) -> None:
+        """When add_module_if_new returns True and first request returns None, retry once."""
+        from unittest.mock import AsyncMock, patch
+
+        from java_functional_lsp.server import _ensure_module_and_forward
+        from java_functional_lsp.server import server as srv
+
+        mock_add = AsyncMock(return_value=True)
+        mock_send = AsyncMock(side_effect=[None, {"result": "ok"}])
+        with (
+            patch.object(srv._proxy, "add_module_if_new", mock_add),
+            patch.object(srv._proxy, "send_request", mock_send),
+            patch.object(srv._proxy, "_available", True),
+        ):
+            result = await _ensure_module_and_forward("textDocument/hover", {}, "file:///test/F.java")
+        assert result == {"result": "ok"}
+        assert mock_send.call_count == 2
+
+    async def test_ensure_module_and_forward_no_retry_on_known_module(self) -> None:
+        """When add_module_if_new returns False and request returns None, no retry."""
+        from unittest.mock import AsyncMock, patch
+
+        from java_functional_lsp.server import _ensure_module_and_forward
+        from java_functional_lsp.server import server as srv
+
+        mock_add = AsyncMock(return_value=False)
+        mock_send = AsyncMock(return_value=None)
+        with (
+            patch.object(srv._proxy, "add_module_if_new", mock_add),
+            patch.object(srv._proxy, "send_request", mock_send),
+            patch.object(srv._proxy, "_available", True),
+        ):
+            result = await _ensure_module_and_forward("textDocument/hover", {}, "file:///test/F.java")
+        assert result is None
+        assert mock_send.call_count == 1
+
+    async def test_ensure_module_and_forward_no_retry_on_success(self) -> None:
+        """When first request succeeds, no retry regardless of module status."""
+        from unittest.mock import AsyncMock, patch
+
+        from java_functional_lsp.server import _ensure_module_and_forward
+        from java_functional_lsp.server import server as srv
+
+        mock_add = AsyncMock(return_value=True)
+        mock_send = AsyncMock(return_value={"result": "ok"})
+        with (
+            patch.object(srv._proxy, "add_module_if_new", mock_add),
+            patch.object(srv._proxy, "send_request", mock_send),
+            patch.object(srv._proxy, "_available", True),
+        ):
+            result = await _ensure_module_and_forward("textDocument/hover", {}, "file:///test/F.java")
+        assert result == {"result": "ok"}
+        assert mock_send.call_count == 1
+
     def test_serialize_params_camelcase(self) -> None:
         from java_functional_lsp.server import _serialize_params
 

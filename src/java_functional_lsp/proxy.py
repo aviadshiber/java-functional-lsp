@@ -527,13 +527,17 @@ class JdtlsProxy:
         for method, params in queue:
             await self.send_notification(method, params)
 
-    async def add_module_if_new(self, file_uri: str) -> None:
-        """Add the module containing *file_uri* to jdtls if not already added."""
+    async def add_module_if_new(self, file_uri: str) -> bool:
+        """Add the module containing *file_uri* to jdtls if not already added.
+
+        Returns ``True`` if a new module was added (jdtls needs import time),
+        ``False`` if already known or unavailable.
+        """
         if not self._available:
-            return
+            return False
         module_uri = _resolve_module_uri(file_uri)
         if module_uri is None or module_uri in self._added_module_uris:
-            return
+            return False
         self._added_module_uris.add(module_uri)
         from pygls.uris import to_fs_path
 
@@ -543,6 +547,7 @@ class JdtlsProxy:
             _WORKSPACE_DID_CHANGE_FOLDERS,
             {"event": {"added": [{"uri": module_uri, "name": mod_name}], "removed": []}},
         )
+        return True
 
     async def expand_full_workspace(self) -> None:
         """Expand jdtls workspace to the full monorepo root (background task).

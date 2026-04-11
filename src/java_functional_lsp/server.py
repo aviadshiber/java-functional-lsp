@@ -439,12 +439,29 @@ async def _expand_workspace_background() -> None:
 # _JDTLS_HANDLERS and registered inside _register_jdtls_capabilities() so
 # they only activate after jdtls starts.
 
+_MODULE_IMPORT_WAIT_SEC = 3.0
+
+
+async def _ensure_module_and_forward(method: str, params: Any, file_uri: str) -> Any | None:
+    """Forward a request to jdtls, ensuring the file's module is loaded.
+
+    If the module was just added and jdtls returns null, retries once after
+    a brief wait to give jdtls time to import the newly-added module.
+    """
+    if not server._proxy.is_available:
+        return None
+    module_is_new = await server._proxy.add_module_if_new(file_uri)
+    serialized = _serialize_params(params)
+    result = await server._proxy.send_request(method, serialized)
+    if result is None and module_is_new:
+        await asyncio.sleep(_MODULE_IMPORT_WAIT_SEC)
+        result = await server._proxy.send_request(method, serialized)
+    return result
+
 
 async def _on_completion(params: lsp.CompletionParams) -> lsp.CompletionList | None:
     """Forward completion request to jdtls."""
-    if not server._proxy.is_available:
-        return None
-    result = await server._proxy.send_request("textDocument/completion", _serialize_params(params))
+    result = await _ensure_module_and_forward("textDocument/completion", params, params.text_document.uri)
     if result is None:
         return None
     try:
@@ -455,9 +472,7 @@ async def _on_completion(params: lsp.CompletionParams) -> lsp.CompletionList | N
 
 async def _on_hover(params: lsp.HoverParams) -> lsp.Hover | None:
     """Forward hover request to jdtls."""
-    if not server._proxy.is_available:
-        return None
-    result = await server._proxy.send_request("textDocument/hover", _serialize_params(params))
+    result = await _ensure_module_and_forward("textDocument/hover", params, params.text_document.uri)
     if result is None:
         return None
     try:
@@ -468,9 +483,7 @@ async def _on_hover(params: lsp.HoverParams) -> lsp.Hover | None:
 
 async def _on_definition(params: lsp.DefinitionParams) -> list[lsp.Location] | None:
     """Forward go-to-definition request to jdtls."""
-    if not server._proxy.is_available:
-        return None
-    result = await server._proxy.send_request("textDocument/definition", _serialize_params(params))
+    result = await _ensure_module_and_forward("textDocument/definition", params, params.text_document.uri)
     if result is None:
         return None
     try:
@@ -483,9 +496,7 @@ async def _on_definition(params: lsp.DefinitionParams) -> list[lsp.Location] | N
 
 async def _on_references(params: lsp.ReferenceParams) -> list[lsp.Location] | None:
     """Forward find-references request to jdtls."""
-    if not server._proxy.is_available:
-        return None
-    result = await server._proxy.send_request("textDocument/references", _serialize_params(params))
+    result = await _ensure_module_and_forward("textDocument/references", params, params.text_document.uri)
     if result is None:
         return None
     try:
@@ -496,9 +507,7 @@ async def _on_references(params: lsp.ReferenceParams) -> list[lsp.Location] | No
 
 async def _on_document_symbol(params: lsp.DocumentSymbolParams) -> list[lsp.DocumentSymbol] | None:
     """Forward document symbol request to jdtls."""
-    if not server._proxy.is_available:
-        return None
-    result = await server._proxy.send_request("textDocument/documentSymbol", _serialize_params(params))
+    result = await _ensure_module_and_forward("textDocument/documentSymbol", params, params.text_document.uri)
     if result is None:
         return None
     try:
