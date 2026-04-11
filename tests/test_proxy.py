@@ -862,6 +862,12 @@ class TestStartPassesEnvToSubprocess:
 class TestFindModuleRoot:
     """Tests for find_module_root — build-file detection for module scoping."""
 
+    @pytest.fixture(autouse=True)
+    def _clear_cache(self) -> None:
+        from java_functional_lsp.proxy import _cached_module_root
+
+        _cached_module_root.cache_clear()
+
     def test_finds_pom_xml(self, tmp_path: Any) -> None:
         from java_functional_lsp.proxy import find_module_root
 
@@ -957,7 +963,9 @@ class TestLazyStart:
         for i in range(_MAX_QUEUED_NOTIFICATIONS + 50):
             proxy.queue_notification("textDocument/didChange", {"i": i})
         assert len(proxy._queued_notifications) == _MAX_QUEUED_NOTIFICATIONS
-        # Oldest entries dropped — last entry should be the most recent
+        # Oldest entries dropped — first surviving entry is i=50
+        assert proxy._queued_notifications[0] == ("textDocument/didChange", {"i": 50})
+        # Last entry is the most recent
         assert proxy._queued_notifications[-1] == ("textDocument/didChange", {"i": _MAX_QUEUED_NOTIFICATIONS + 49})
 
     async def test_ensure_started_no_retry_after_failure(self) -> None:
@@ -998,10 +1006,13 @@ class TestLazyStart:
             java_file.parent.mkdir()
             java_file.touch()
             uri = java_file.as_uri()
-            await proxy.add_module_if_new(uri)
+            result = await proxy.add_module_if_new(uri)
+            assert result is not None  # Returns module URI string
             proxy.send_notification.assert_called_once()  # type: ignore[attr-defined]
             call_args = proxy.send_notification.call_args  # type: ignore[attr-defined]
             assert call_args[0][0] == "workspace/didChangeWorkspaceFolders"
+            # Module should be marked ADDED in registry
+            assert proxy.modules.was_added(result)
 
     async def test_add_module_if_new_skips_duplicate(self) -> None:
         from unittest.mock import AsyncMock
@@ -1020,8 +1031,10 @@ class TestLazyStart:
             java_file.parent.mkdir()
             java_file.touch()
             uri = java_file.as_uri()
-            await proxy.add_module_if_new(uri)
-            await proxy.add_module_if_new(uri)  # duplicate
+            result1 = await proxy.add_module_if_new(uri)
+            result2 = await proxy.add_module_if_new(uri)  # duplicate
+            assert result1 is not None  # New module URI
+            assert result2 is None  # Already known
             assert proxy.send_notification.call_count == 1  # type: ignore[attr-defined]
 
     async def test_expand_full_workspace_sends_notification(self) -> None:
@@ -1036,6 +1049,25 @@ class TestLazyStart:
         await proxy.expand_full_workspace()
         proxy.send_notification.assert_called_once()  # type: ignore[attr-defined]
         assert proxy._workspace_expanded is True
+
+    async def test_expand_full_workspace_removes_initial_module(self) -> None:
+        """When _initial_module_uri differs from root, it should be in the removed list."""
+        from unittest.mock import AsyncMock
+
+        from java_functional_lsp.proxy import JdtlsProxy
+
+        proxy = JdtlsProxy()
+        proxy._available = True
+        proxy._original_root_uri = "file:///workspace/monorepo"
+        proxy._initial_module_uri = "file:///workspace/monorepo/module-a"
+        proxy.send_notification = AsyncMock()  # type: ignore[assignment]
+        await proxy.expand_full_workspace()
+        proxy.send_notification.assert_called_once()  # type: ignore[attr-defined]
+        call_args = proxy.send_notification.call_args[0]  # type: ignore[attr-defined]
+        event = call_args[1]["event"]
+        assert len(event["removed"]) == 1
+        assert event["removed"][0]["uri"] == "file:///workspace/monorepo/module-a"
+        assert event["added"][0]["uri"] == "file:///workspace/monorepo"
 
     async def test_expand_full_workspace_noop_when_not_available(self) -> None:
         from unittest.mock import AsyncMock
@@ -1057,7 +1089,7 @@ class TestLazyStart:
         proxy = JdtlsProxy()
         proxy._available = True
         proxy._original_root_uri = "file:///workspace/monorepo"
-        proxy._added_module_uris.add("file:///workspace/monorepo")
+        proxy.modules.mark_added("file:///workspace/monorepo")
         proxy.send_notification = AsyncMock()  # type: ignore[assignment]
         await proxy.expand_full_workspace()
         proxy.send_notification.assert_not_called()  # type: ignore[attr-defined]

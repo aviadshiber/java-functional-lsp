@@ -26,7 +26,7 @@ from .analyzers.mutation_checker import MutationChecker
 from .analyzers.null_checker import NullChecker
 from .analyzers.spring_checker import SpringChecker
 from .fixes import get_fix, get_fix_registry_keys
-from .proxy import JdtlsProxy
+from .proxy import JdtlsProxy, _resolve_module_uri
 
 logger = logging.getLogger(__name__)
 
@@ -337,7 +337,7 @@ def _forward_or_queue(method: str, serialized: Any) -> None:
         task = asyncio.create_task(server._proxy.send_notification(method, serialized))
         _bg_tasks.add(task)
         task.add_done_callback(_bg_tasks.discard)
-    elif server._proxy._starting:
+    elif server._proxy._lazy_start_fired and not server._proxy._start_failed:
         server._proxy.queue_notification(method, serialized)
 
 
@@ -440,11 +440,55 @@ async def _expand_workspace_background() -> None:
 # they only activate after jdtls starts.
 
 
+async def _ensure_module_and_forward(method: str, params: Any, file_uri: str) -> Any | None:
+    """Forward a request to jdtls, ensuring the file's module is loaded.
+
+    Uses ``ModuleRegistry`` for adaptive waiting:
+    - **READY**: forward immediately (zero overhead on hot path)
+    - **UNKNOWN**: add module, wait until ready (adaptive, not fixed sleep)
+    - **ADDED**: module sent but not confirmed — wait until ready
+
+    When a request succeeds, marks the module as READY so subsequent
+    requests skip the wait entirely.
+    """
+    proxy = server._proxy
+    if not proxy.is_available:
+        return None
+
+    module_uri = _resolve_module_uri(file_uri)
+
+    # Hot path: module already confirmed working.
+    if module_uri and proxy.modules.is_ready(module_uri):
+        return await proxy.send_request(method, _serialize_params(params))
+
+    # Cold path: add module if unknown, then wait for ready.
+    new_module_uri = await proxy.add_module_if_new(file_uri)
+
+    serialized = _serialize_params(params)
+    result = await proxy.send_request(method, serialized)
+
+    if result is not None:
+        # Success — mark module as ready so future requests are instant.
+        if module_uri:
+            proxy.modules.mark_ready(module_uri)
+        return result
+
+    # Null result and module is not yet ready — wait then retry once.
+    # Use a short timeout (5s) so single-caller case doesn't block for 30s.
+    # If a concurrent request succeeds, Event.set() wakes us early.
+    wait_uri = new_module_uri or module_uri
+    if wait_uri and not proxy.modules.is_ready(wait_uri):
+        await proxy.modules.wait_until_ready(wait_uri, timeout=5.0)
+    # Always retry once after waiting — even on timeout the module may be ready.
+    result = await proxy.send_request(method, serialized)
+    if result is not None and module_uri:
+        proxy.modules.mark_ready(module_uri)
+    return result
+
+
 async def _on_completion(params: lsp.CompletionParams) -> lsp.CompletionList | None:
     """Forward completion request to jdtls."""
-    if not server._proxy.is_available:
-        return None
-    result = await server._proxy.send_request("textDocument/completion", _serialize_params(params))
+    result = await _ensure_module_and_forward("textDocument/completion", params, params.text_document.uri)
     if result is None:
         return None
     try:
@@ -455,9 +499,7 @@ async def _on_completion(params: lsp.CompletionParams) -> lsp.CompletionList | N
 
 async def _on_hover(params: lsp.HoverParams) -> lsp.Hover | None:
     """Forward hover request to jdtls."""
-    if not server._proxy.is_available:
-        return None
-    result = await server._proxy.send_request("textDocument/hover", _serialize_params(params))
+    result = await _ensure_module_and_forward("textDocument/hover", params, params.text_document.uri)
     if result is None:
         return None
     try:
@@ -468,9 +510,7 @@ async def _on_hover(params: lsp.HoverParams) -> lsp.Hover | None:
 
 async def _on_definition(params: lsp.DefinitionParams) -> list[lsp.Location] | None:
     """Forward go-to-definition request to jdtls."""
-    if not server._proxy.is_available:
-        return None
-    result = await server._proxy.send_request("textDocument/definition", _serialize_params(params))
+    result = await _ensure_module_and_forward("textDocument/definition", params, params.text_document.uri)
     if result is None:
         return None
     try:
@@ -483,9 +523,7 @@ async def _on_definition(params: lsp.DefinitionParams) -> list[lsp.Location] | N
 
 async def _on_references(params: lsp.ReferenceParams) -> list[lsp.Location] | None:
     """Forward find-references request to jdtls."""
-    if not server._proxy.is_available:
-        return None
-    result = await server._proxy.send_request("textDocument/references", _serialize_params(params))
+    result = await _ensure_module_and_forward("textDocument/references", params, params.text_document.uri)
     if result is None:
         return None
     try:
@@ -496,9 +534,7 @@ async def _on_references(params: lsp.ReferenceParams) -> list[lsp.Location] | No
 
 async def _on_document_symbol(params: lsp.DocumentSymbolParams) -> list[lsp.DocumentSymbol] | None:
     """Forward document symbol request to jdtls."""
-    if not server._proxy.is_available:
-        return None
-    result = await server._proxy.send_request("textDocument/documentSymbol", _serialize_params(params))
+    result = await _ensure_module_and_forward("textDocument/documentSymbol", params, params.text_document.uri)
     if result is None:
         return None
     try:
