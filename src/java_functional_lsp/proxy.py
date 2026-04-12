@@ -484,18 +484,22 @@ class JdtlsProxy:
         """Start jdtls subprocess and initialize it.
 
         If *module_root_uri* is provided, jdtls is scoped to that module for
-        fast startup. The data-directory hash is always based on the original
-        workspace root (from init_params) so the index persists across restarts.
+        fast startup and the data-dir hash is based on the module URI (so each
+        module gets its own isolated index). Otherwise the workspace root is used.
         """
         jdtls_path = shutil.which("jdtls")
         if not jdtls_path:
             return False
 
-        # Data-dir hash based on original workspace root (stable across module changes).
+        # Data-dir hash: use module URI when scoped so each module gets its own
+        # clean jdtls state. This avoids loading a 2.5GB monorepo index when only
+        # one module is needed. Without expansion, each session is module-scoped,
+        # so the data-dir should match that scope.
         original_root: str = init_params.get("rootUri") or init_params.get("rootPath") or str(Path.cwd())
         self._original_root_uri = original_root
-        workspace_hash = hashlib.sha256(original_root.encode()).hexdigest()[:12]
-        data_dir = Path.home() / ".cache" / "jdtls-data" / workspace_hash
+        hash_source = module_root_uri or original_root
+        data_hash = hashlib.sha256(hash_source.encode()).hexdigest()[:12]
+        data_dir = Path.home() / ".cache" / "jdtls-data" / data_hash
         data_dir.mkdir(parents=True, exist_ok=True)
 
         # Deep copy to avoid mutating server._init_params.
