@@ -293,7 +293,7 @@ def on_initialize(params: lsp.InitializeParams) -> lsp.InitializeResult:
     server._skip_jdtls_registration = False
     _jdtls_capabilities_registered = False
 
-    jdtls_override = os.environ.get("JAVA_FUNCTIONAL_LSP_JDTLS", "").lower()
+    jdtls_override = os.environ.get("JAVA_FUNCTIONAL_LSP_JDTLS", "").strip().lower()
     if jdtls_override == "off":
         server._skip_jdtls = True
         logger.info("jdtls proxy disabled via JAVA_FUNCTIONAL_LSP_JDTLS=off")

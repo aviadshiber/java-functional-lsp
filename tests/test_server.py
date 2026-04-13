@@ -761,94 +761,65 @@ class TestJdtlsSkipDetection:
             client_info=lsp.ClientInfo(name=client_name) if client_name else None,
         )
 
-    def test_intellij_client_info_skips_jdtls(self) -> None:
+    def _run_init(self, monkeypatch: Any, client_name: str | None, env_value: str | None = None) -> None:
+        """Run on_initialize with controlled env and client_info."""
+        from java_functional_lsp.server import on_initialize, server
+
+        server._skip_jdtls = False
+        server._skip_jdtls_registration = False
+        if env_value is not None:
+            monkeypatch.setenv("JAVA_FUNCTIONAL_LSP_JDTLS", env_value)
+        else:
+            monkeypatch.delenv("JAVA_FUNCTIONAL_LSP_JDTLS", raising=False)
+        on_initialize(self._make_init_params(client_name))
+
+    def test_intellij_client_info_skips_jdtls(self, monkeypatch: Any) -> None:
         """IntelliJ IDEA detected → _skip_jdtls = True."""
-        from unittest.mock import patch
+        from java_functional_lsp.server import server
 
-        from java_functional_lsp.server import on_initialize, server
-
-        server._skip_jdtls = False
-        server._skip_jdtls_registration = False
-        params = self._make_init_params("IntelliJ IDEA")
-        with patch.dict("os.environ", {}, clear=False):
-            os.environ.pop("JAVA_FUNCTIONAL_LSP_JDTLS", None)
-            on_initialize(params)
+        self._run_init(monkeypatch, "IntelliJ IDEA")
         assert server._skip_jdtls is True
 
-    def test_jetbrains_product_skips_jdtls(self) -> None:
+    def test_jetbrains_product_skips_jdtls(self, monkeypatch: Any) -> None:
         """Any JetBrains product detected → _skip_jdtls = True."""
-        from unittest.mock import patch
+        from java_functional_lsp.server import server
 
-        from java_functional_lsp.server import on_initialize, server
-
-        server._skip_jdtls = False
-        params = self._make_init_params("JetBrains Rider 2025.2")
-        with patch.dict("os.environ", {}, clear=False):
-            os.environ.pop("JAVA_FUNCTIONAL_LSP_JDTLS", None)
-            on_initialize(params)
+        self._run_init(monkeypatch, "JetBrains Rider 2025.2")
         assert server._skip_jdtls is True
 
-    def test_vscode_allows_jdtls(self) -> None:
+    def test_vscode_allows_jdtls(self, monkeypatch: Any) -> None:
         """VS Code → _skip_jdtls = False (jdtls needed)."""
-        from unittest.mock import patch
+        from java_functional_lsp.server import server
 
-        from java_functional_lsp.server import on_initialize, server
-
-        server._skip_jdtls = False
-        params = self._make_init_params("Visual Studio Code")
-        with patch.dict("os.environ", {}, clear=False):
-            os.environ.pop("JAVA_FUNCTIONAL_LSP_JDTLS", None)
-            on_initialize(params)
+        self._run_init(monkeypatch, "Visual Studio Code")
         assert server._skip_jdtls is False
 
-    def test_no_client_info_allows_jdtls(self) -> None:
+    def test_no_client_info_allows_jdtls(self, monkeypatch: Any) -> None:
         """No client_info → _skip_jdtls = False (safe default)."""
-        from unittest.mock import patch
+        from java_functional_lsp.server import server
 
-        from java_functional_lsp.server import on_initialize, server
-
-        server._skip_jdtls = False
-        params = self._make_init_params(None)
-        with patch.dict("os.environ", {}, clear=False):
-            os.environ.pop("JAVA_FUNCTIONAL_LSP_JDTLS", None)
-            on_initialize(params)
+        self._run_init(monkeypatch, None)
         assert server._skip_jdtls is False
 
-    def test_env_var_off_overrides_detection(self) -> None:
+    def test_env_var_off_overrides_detection(self, monkeypatch: Any) -> None:
         """JAVA_FUNCTIONAL_LSP_JDTLS=off disables jdtls even for non-JetBrains client."""
-        from unittest.mock import patch
+        from java_functional_lsp.server import server
 
-        from java_functional_lsp.server import on_initialize, server
-
-        server._skip_jdtls = False
-        params = self._make_init_params("Visual Studio Code")
-        with patch.dict("os.environ", {"JAVA_FUNCTIONAL_LSP_JDTLS": "off"}):
-            on_initialize(params)
+        self._run_init(monkeypatch, "Visual Studio Code", env_value="off")
         assert server._skip_jdtls is True
 
-    def test_env_var_on_overrides_intellij_detection(self) -> None:
+    def test_env_var_on_overrides_intellij_detection(self, monkeypatch: Any) -> None:
         """JAVA_FUNCTIONAL_LSP_JDTLS=on force-enables jdtls even for IntelliJ."""
-        from unittest.mock import patch
+        from java_functional_lsp.server import server
 
-        from java_functional_lsp.server import on_initialize, server
-
-        server._skip_jdtls = True  # Pre-set to True
-        params = self._make_init_params("IntelliJ IDEA")
-        with patch.dict("os.environ", {"JAVA_FUNCTIONAL_LSP_JDTLS": "on"}):
-            on_initialize(params)
+        self._run_init(monkeypatch, "IntelliJ IDEA", env_value="on")
         assert server._skip_jdtls is False
 
-    def test_env_var_no_register(self) -> None:
+    def test_env_var_no_register(self, monkeypatch: Any) -> None:
         """JAVA_FUNCTIONAL_LSP_JDTLS=no-register keeps jdtls but skips registration."""
-        from unittest.mock import patch
+        from java_functional_lsp.server import server
 
-        from java_functional_lsp.server import on_initialize, server
-
-        server._skip_jdtls = False
-        server._skip_jdtls_registration = False
-        params = self._make_init_params("Visual Studio Code")
-        with patch.dict("os.environ", {"JAVA_FUNCTIONAL_LSP_JDTLS": "no-register"}):
-            on_initialize(params)
+        self._run_init(monkeypatch, "Visual Studio Code", env_value="no-register")
         assert server._skip_jdtls is False
         assert server._skip_jdtls_registration is True
 
