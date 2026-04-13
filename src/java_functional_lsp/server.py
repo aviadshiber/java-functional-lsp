@@ -288,8 +288,10 @@ def on_initialize(params: lsp.InitializeParams) -> lsp.InitializeResult:
     logger.info("LSP client: %s", client_name or "(unknown)")
 
     # Reset flags so re-initialization (non-standard but defensive) starts clean.
+    global _jdtls_capabilities_registered
     server._skip_jdtls = False
     server._skip_jdtls_registration = False
+    _jdtls_capabilities_registered = False
 
     jdtls_override = os.environ.get("JAVA_FUNCTIONAL_LSP_JDTLS", "").lower()
     if jdtls_override == "off":
@@ -515,10 +517,10 @@ async def _lazy_start_jdtls(file_uri: str) -> None:
         started = await server._proxy.ensure_started(server._init_params, file_uri, config=server._config)
         if started:
             logger.info("jdtls proxy active — full Java language support enabled")
-            if not server._skip_jdtls_registration:
-                await _register_jdtls_capabilities()
-            else:
+            if server._skip_jdtls_registration:
                 logger.info("Skipping dynamic capability registration (no-register mode)")
+            else:
+                await _register_jdtls_capabilities()
             await server._proxy.flush_queued_notifications()
     except Exception:
         logger.warning("jdtls lazy start failed", exc_info=True)
