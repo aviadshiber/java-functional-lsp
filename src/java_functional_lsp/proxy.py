@@ -575,18 +575,25 @@ class JdtlsProxy:
 
         original_root: str = init_params.get("rootUri") or init_params.get("rootPath") or str(Path.cwd())
         self._original_root_uri = original_root
+        effective_root_uri = module_root_uri or original_root
 
-        # Discover Lombok jar and build jdtls env (blocking I/O in executor).
+        # Mark ADDED before any await to prevent duplicate module additions
+        # from concurrent coroutines during the executor yield below.
+        self._initial_module_uri = module_root_uri
+        self.modules.mark_added(effective_root_uri)
+
+        # All blocking startup I/O in a single executor call: cache version check
+        # (may rmtree on upgrade), Lombok discovery, and jdtls env build.
+        cache_root = Path.home() / ".cache" / "jdtls-data"
+
+        def _blocking_startup() -> tuple[dict[str, str], str | None]:
+            _clear_cache_on_version_change(cache_root)
+            return build_jdtls_env(), _find_lombok_jar(config)
+
         loop = asyncio.get_running_loop()
-        jdtls_env, lombok_jar = await loop.run_in_executor(None, lambda: (build_jdtls_env(), _find_lombok_jar(config)))
+        jdtls_env, lombok_jar = await loop.run_in_executor(None, _blocking_startup)
         if lombok_jar:
             logger.info("jdtls: using Lombok agent from %s", _redact_path(lombok_jar))
-
-        # Clear stale jdtls caches when the server version changes (e.g.,
-        # Lombok agent added, jdtls config changed). A version marker file
-        # tracks this — mismatch wipes the whole cache for a clean reindex.
-        cache_root = Path.home() / ".cache" / "jdtls-data"
-        _clear_cache_on_version_change(cache_root)
 
         hash_source = module_root_uri or original_root
         data_hash = hashlib.sha256(hash_source.encode()).hexdigest()[:12]
@@ -595,7 +602,6 @@ class JdtlsProxy:
 
         # Deep copy to avoid mutating server._init_params.
         effective_params = copy.deepcopy(init_params)
-        effective_root_uri = module_root_uri or original_root
         if module_root_uri:
             effective_params["rootUri"] = module_root_uri
             from pygls.uris import to_fs_path
@@ -611,10 +617,6 @@ class JdtlsProxy:
         caps = effective_params.setdefault("capabilities", {})
         ws = caps.setdefault("workspace", {})
         ws["workspaceFolders"] = True
-
-        # Track the initial module as already loaded.
-        self._initial_module_uri = module_root_uri
-        self.modules.mark_added(effective_root_uri)
 
         jdtls_cmd: list[str] = [
             jdtls_path,
