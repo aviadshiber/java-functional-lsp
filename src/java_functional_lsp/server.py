@@ -199,23 +199,6 @@ def _jdtls_raw_to_lsp_diagnostics(raw_diagnostics: list[Any]) -> list[lsp.Diagno
     return result
 
 
-# Built-in patterns for Lombok annotation-processor false positives.
-# Always applied — when the Lombok agent IS loaded and working, these methods
-# resolve correctly so the patterns simply never match. When the agent isn't
-# loaded (or only covers the initial module), these suppress the noise.
-_BUILTIN_AP_PATTERNS = re.compile(
-    r"(?:"
-    r"The method builder\(\) is undefined|"  # @Builder
-    r"The method toBuilder\(\) is undefined|"  # @Builder(toBuilder=true)
-    r"The method of\(\) is undefined|"  # @Value(staticConstructor = "of")
-    r"The method create\(\) is undefined|"  # @Value(staticConstructor = "create")
-    r"log cannot be resolved|"  # @Slf4j, @Log
-    r"\w+Builder cannot be resolved to a type|"  # @Builder inner class
-    r"The blank final field \w+ may not have been initialized"  # @Value final fields
-    r")"
-)
-
-
 def _compile_user_patterns(config: dict[str, Any]) -> list[re.Pattern[str]]:
     """Compile user-defined suppressJdtlsPatterns from config."""
     raw = config.get("suppressJdtlsPatterns", [])
@@ -233,16 +216,16 @@ def _compile_user_patterns(config: dict[str, Any]) -> list[re.Pattern[str]]:
     return patterns
 
 
-def _is_jdtls_false_positive(diag: dict[str, Any], user_patterns: list[re.Pattern[str]]) -> bool:
-    """Check if a jdtls diagnostic is a known annotation-processor false positive.
+def _is_jdtls_suppressed(diag: dict[str, Any], user_patterns: list[re.Pattern[str]]) -> bool:
+    """Check if a jdtls diagnostic matches a user-configured suppress pattern.
 
-    Matches built-in Lombok patterns and any user-configured suppressJdtlsPatterns.
-    Always safe to apply: when the Lombok agent is loaded, Lombok-generated methods
-    resolve correctly so built-in patterns simply never match.
+    No built-in patterns — the root cause (stale jdtls caches) is fixed by
+    clearing the cache on version change. Users can still suppress specific
+    jdtls messages via suppressJdtlsPatterns in .java-functional-lsp.json.
     """
+    if not user_patterns:
+        return False
     msg = diag.get("message", "")
-    if _BUILTIN_AP_PATTERNS.search(msg):
-        return True
     for pat in user_patterns:
         if pat.search(msg):
             return True
@@ -260,7 +243,7 @@ def _run_analysis(source: str, uri: str) -> list[lsp.Diagnostic]:
     if server._proxy.is_available:
         try:
             raw = server._proxy.get_cached_diagnostics(uri)
-            raw = [d for d in raw if not _is_jdtls_false_positive(d, server._user_suppress_patterns)]
+            raw = [d for d in raw if not _is_jdtls_suppressed(d, server._user_suppress_patterns)]
             jdtls_diags = _jdtls_raw_to_lsp_diagnostics(raw)
         except Exception as e:
             logger.warning("jdtls diagnostic processing failed for %s: %s", uri, e)

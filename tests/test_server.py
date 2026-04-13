@@ -647,100 +647,29 @@ class TestServerInternals:
 # --------------------------------------------------------------------------
 
 
-class TestJdtlsFalsePositive:
-    """Tests for _is_jdtls_false_positive() — built-in patterns."""
-
-    def test_matches_builder_undefined(self) -> None:
-        from java_functional_lsp.server import _is_jdtls_false_positive
-
-        diag = {"code": "67108964", "message": "The method builder() is undefined for the type Foo"}
-        assert _is_jdtls_false_positive(diag, []) is True
-
-    def test_matches_log_unresolved(self) -> None:
-        from java_functional_lsp.server import _is_jdtls_false_positive
-
-        diag = {"code": "570425394", "message": "log cannot be resolved"}
-        assert _is_jdtls_false_positive(diag, []) is True
-
-    def test_matches_builder_type_unresolved(self) -> None:
-        from java_functional_lsp.server import _is_jdtls_false_positive
-
-        diag = {"code": "16777218", "message": "FooBuilder cannot be resolved to a type"}
-        assert _is_jdtls_false_positive(diag, []) is True
-
-    def test_does_not_match_real_undefined_method(self) -> None:
-        from java_functional_lsp.server import _is_jdtls_false_positive
-
-        diag = {"code": "67108964", "message": "The method foo() is undefined for the type String"}
-        assert _is_jdtls_false_positive(diag, []) is False
-
-    def test_does_not_match_real_unresolved_type(self) -> None:
-        from java_functional_lsp.server import _is_jdtls_false_positive
-
-        diag = {"code": "16777218", "message": "SomeClass cannot be resolved to a type"}
-        assert _is_jdtls_false_positive(diag, []) is False
-
-    def test_empty_message(self) -> None:
-        from java_functional_lsp.server import _is_jdtls_false_positive
-
-        diag = {"code": "67108964", "message": ""}
-        assert _is_jdtls_false_positive(diag, []) is False
-
-    def test_missing_fields(self) -> None:
-        from java_functional_lsp.server import _is_jdtls_false_positive
-
-        assert _is_jdtls_false_positive({}, []) is False
-
-    def test_matches_blank_final_field(self) -> None:
-        from java_functional_lsp.server import _is_jdtls_false_positive
-
-        diag = {"code": "33554513", "message": "The blank final field name may not have been initialized"}
-        assert _is_jdtls_false_positive(diag, []) is True
-
-    def test_matches_static_constructor_of(self) -> None:
-        from java_functional_lsp.server import _is_jdtls_false_positive
-
-        diag = {"code": "67108964", "message": "The method of() is undefined for the type ExternalFailureError"}
-        assert _is_jdtls_false_positive(diag, []) is True
-
-    def test_matches_static_constructor_create(self) -> None:
-        from java_functional_lsp.server import _is_jdtls_false_positive
-
-        diag = {"code": "67108964", "message": "The method create() is undefined for the type Config"}
-        assert _is_jdtls_false_positive(diag, []) is True
-
-    def test_does_not_match_of_without_undefined(self) -> None:
-        """Ensure 'of()' only matches in 'is undefined' context, not arbitrary messages."""
-        from java_functional_lsp.server import _is_jdtls_false_positive
-
-        diag = {"message": "The method of() has wrong return type"}
-        assert _is_jdtls_false_positive(diag, []) is False
-
-
 class TestUserSuppressPatterns:
     """Tests for configurable suppressJdtlsPatterns."""
 
     def test_user_pattern_matches(self) -> None:
-        """User pattern matches a message NOT covered by built-in patterns."""
-        from java_functional_lsp.server import _compile_user_patterns, _is_jdtls_false_positive
+        from java_functional_lsp.server import _compile_user_patterns, _is_jdtls_suppressed
 
         patterns = _compile_user_patterns({"suppressJdtlsPatterns": [r"The method generateReport\(\) is undefined"]})
         diag = {"message": "The method generateReport() is undefined for the type InternalService"}
-        assert _is_jdtls_false_positive(diag, patterns) is True
+        assert _is_jdtls_suppressed(diag, patterns) is True
 
     def test_user_pattern_does_not_match_unrelated(self) -> None:
-        from java_functional_lsp.server import _compile_user_patterns, _is_jdtls_false_positive
+        from java_functional_lsp.server import _compile_user_patterns, _is_jdtls_suppressed
 
         patterns = _compile_user_patterns({"suppressJdtlsPatterns": [r"The method generateReport\(\) is undefined"]})
         diag = {"message": "The method foo() is undefined for the type String"}
-        assert _is_jdtls_false_positive(diag, patterns) is False
+        assert _is_jdtls_suppressed(diag, patterns) is False
 
-    def test_user_pattern_without_builtins(self) -> None:
-        """With empty user patterns and a non-Lombok message, returns False."""
-        from java_functional_lsp.server import _is_jdtls_false_positive
+    def test_no_patterns_passes_everything(self) -> None:
+        """With no user patterns, nothing is suppressed."""
+        from java_functional_lsp.server import _is_jdtls_suppressed
 
-        diag = {"message": "The method generateReport() is undefined for the type InternalService"}
-        assert _is_jdtls_false_positive(diag, []) is False
+        diag = {"message": "The method builder() is undefined for the type Foo"}
+        assert _is_jdtls_suppressed(diag, []) is False
 
     def test_invalid_regex_skipped(self) -> None:
         from java_functional_lsp.server import _compile_user_patterns

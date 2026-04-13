@@ -240,13 +240,11 @@ The server auto-discovers `lombok.jar` from these locations (first match wins):
 3. **Maven cache** — auto-discovered from `~/.m2/repository/org/projectlombok/lombok/`
 4. **Dedicated directory** — `~/.jdtls-libs/lombok.jar`
 
-If Lombok is used in your project but the jar isn't found, the server automatically filters common Lombok false-positive errors (like "builder() is undefined") so they don't clutter your diagnostics.
+If Lombok is used in your project but the jar isn't found, the server logs a warning. The jdtls cache is automatically cleared on version upgrade, so adding Lombok support takes effect immediately after `brew upgrade`.
 
-### Suppressing jdtls false positives
+### Suppressing jdtls diagnostics
 
-In large monorepos, jdtls may report false "method undefined" errors for Lombok-generated methods (e.g., `@Value(staticConstructor = "of")`) in modules it hasn't fully indexed. The server automatically filters common Lombok patterns (`builder()`, `toBuilder()`, `of()`, `create()`, `log`, `*Builder` types, blank final fields).
-
-For project-specific patterns (e.g., MapStruct mappers, other annotation processors), use `suppressJdtlsPatterns` to add custom regex filters:
+For project-specific jdtls false positives (e.g., annotation processor methods, MapStruct mappers), use `suppressJdtlsPatterns` to add custom regex filters:
 
 ```json
 {
