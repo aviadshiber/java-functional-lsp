@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import re
 import sys
 from pathlib import Path
@@ -46,6 +47,10 @@ _ANALYZERS: list[Analyzer] = [
     FunctionalChecker(),
 ]
 
+# JetBrains IDE detection — all products contain one of these substrings in clientInfo.name.
+# When detected, jdtls is skipped because IntelliJ provides native Java language support.
+_JDTLS_SKIP_CLIENTS = ("IntelliJ", "JetBrains")
+
 #: LSP-aware cattrs converter. Unstructures to the LSP JSON shape
 #: (camelCase field names, discriminated unions, None-field pruning) and
 #: correspondingly structures from the same shape. Using a vanilla
@@ -66,6 +71,8 @@ class JavaFunctionalLspServer(LanguageServer):
         self._init_params: dict[str, Any] = {}
         self._proxy = JdtlsProxy(on_diagnostics=self._on_jdtls_diagnostics)
         self._user_suppress_patterns: list[re.Pattern[str]] = []
+        self._skip_jdtls: bool = False
+        self._skip_jdtls_registration: bool = False
 
     def _on_jdtls_diagnostics(self, uri: str, diagnostics: list[Any]) -> None:
         """Called when jdtls publishes diagnostics — merge with custom and re-publish.
@@ -276,6 +283,28 @@ def on_initialize(params: lsp.InitializeParams) -> lsp.InitializeResult:
     server._config = _load_config(root)
     server._user_suppress_patterns = _compile_user_patterns(server._config)
 
+    # Determine jdtls mode: env var takes priority, then auto-detect JetBrains IDEs.
+    client_name = (params.client_info.name if params.client_info else None) or ""
+    logger.info("LSP client: %s", client_name or "(unknown)")
+
+    jdtls_override = os.environ.get("JAVA_FUNCTIONAL_LSP_JDTLS", "").lower()
+    if jdtls_override == "off":
+        server._skip_jdtls = True
+        logger.info("jdtls proxy disabled via JAVA_FUNCTIONAL_LSP_JDTLS=off")
+    elif jdtls_override == "on":
+        server._skip_jdtls = False
+        logger.info("jdtls proxy force-enabled via JAVA_FUNCTIONAL_LSP_JDTLS=on")
+    elif jdtls_override == "no-register":
+        server._skip_jdtls_registration = True
+        logger.info("jdtls dynamic registration disabled via JAVA_FUNCTIONAL_LSP_JDTLS=no-register")
+    elif any(token in client_name for token in _JDTLS_SKIP_CLIENTS):
+        server._skip_jdtls = True
+        logger.info(
+            "JetBrains IDE detected (%s) — skipping jdtls proxy "
+            "(IDE provides native Java support; override with JAVA_FUNCTIONAL_LSP_JDTLS=on)",
+            client_name,
+        )
+
     return lsp.InitializeResult(
         capabilities=lsp.ServerCapabilities(
             text_document_sync=lsp.TextDocumentSyncOptions(
@@ -302,6 +331,9 @@ async def on_initialized(params: lsp.InitializedParams) -> None:
         "java-functional-lsp initialized (rules: %s)",
         list(server._config.get("rules", {}).keys()) or "all defaults",
     )
+    if server._skip_jdtls:
+        logger.info("jdtls proxy disabled — custom rules only")
+        return
     if server._proxy.check_available():
         logger.info("jdtls found on PATH — will start lazily on first file open")
     else:
@@ -389,6 +421,8 @@ async def _deferred_validate(uri: str) -> None:
 
 def _forward_or_queue(method: str, serialized: Any) -> None:
     """Forward a notification to jdtls if available, or queue it if starting."""
+    if server._skip_jdtls:
+        return
     if server._proxy.is_available:
         task = asyncio.create_task(server._proxy.send_notification(method, serialized))
         _bg_tasks.add(task)
@@ -406,21 +440,23 @@ async def on_did_open(params: lsp.DidOpenTextDocumentParams) -> None:
     didOpen response isn't delayed by jdtls cold-start.
     """
     uri = params.text_document.uri
-    serialized = _serialize_params(params)
 
-    if server._proxy.is_available:
-        # Fast path: jdtls running. Forward didOpen + add module if new.
-        await server._proxy.send_notification("textDocument/didOpen", serialized)
-        await server._proxy.add_module_if_new(uri)
-    elif server._proxy._jdtls_on_path and not server._proxy._start_failed:
-        # Queue the didOpen (whether this is the first file or a subsequent one during startup).
-        server._proxy.queue_notification("textDocument/didOpen", serialized)
-        if not server._proxy._lazy_start_fired:
-            # First file: kick off lazy start in background.
-            server._proxy._lazy_start_fired = True
-            task = asyncio.create_task(_lazy_start_jdtls(uri))
-            _bg_tasks.add(task)
-            task.add_done_callback(_bg_tasks.discard)
+    if not server._skip_jdtls:
+        serialized = _serialize_params(params)
+
+        if server._proxy.is_available:
+            # Fast path: jdtls running. Forward didOpen + add module if new.
+            await server._proxy.send_notification("textDocument/didOpen", serialized)
+            await server._proxy.add_module_if_new(uri)
+        elif server._proxy._jdtls_on_path and not server._proxy._start_failed:
+            # Queue the didOpen (whether this is the first file or a subsequent one during startup).
+            server._proxy.queue_notification("textDocument/didOpen", serialized)
+            if not server._proxy._lazy_start_fired:
+                # First file: kick off lazy start in background.
+                server._proxy._lazy_start_fired = True
+                task = asyncio.create_task(_lazy_start_jdtls(uri))
+                _bg_tasks.add(task)
+                task.add_done_callback(_bg_tasks.discard)
 
     # Custom diagnostics always publish immediately — never blocked by jdtls.
     try:
@@ -474,7 +510,10 @@ async def _lazy_start_jdtls(file_uri: str) -> None:
         started = await server._proxy.ensure_started(server._init_params, file_uri, config=server._config)
         if started:
             logger.info("jdtls proxy active — full Java language support enabled")
-            await _register_jdtls_capabilities()
+            if not server._skip_jdtls_registration:
+                await _register_jdtls_capabilities()
+            else:
+                logger.info("Skipping dynamic capability registration (no-register mode)")
             await server._proxy.flush_queued_notifications()
     except Exception:
         logger.warning("jdtls lazy start failed", exc_info=True)

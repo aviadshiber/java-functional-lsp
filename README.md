@@ -100,6 +100,8 @@ Use the [LSP4IJ](https://github.com/redhat-developer/lsp4ij) plugin (works on Co
 2. **Settings** → **Languages & Frameworks** → **Language Servers** → **`+`**
 3. Set **Command**: `java-functional-lsp`, then in **Mappings** → **File name patterns** add `*.java` with Language Id `java`
 
+The server automatically detects JetBrains IDEs and disables the jdtls proxy (IntelliJ provides native Java support). To force-enable jdtls, set `JAVA_FUNCTIONAL_LSP_JDTLS=on` in the server command environment.
+
 See [editors/intellij/README.md](editors/intellij/README.md) for detailed instructions.
 
 ### Claude Code

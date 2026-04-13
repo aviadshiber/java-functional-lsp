@@ -750,6 +750,129 @@ class TestJdtlsIsolation:
         # If we get here without exception, the handler caught it correctly
 
 
+class TestJdtlsSkipDetection:
+    """Tests for auto-detecting JetBrains IDEs and skipping jdtls."""
+
+    def _make_init_params(self, client_name: str | None = None) -> Any:
+        """Create minimal InitializeParams with optional client_info."""
+        return lsp.InitializeParams(
+            capabilities=lsp.ClientCapabilities(),
+            root_uri="file:///tmp/test",
+            client_info=lsp.ClientInfo(name=client_name) if client_name else None,
+        )
+
+    def test_intellij_client_info_skips_jdtls(self) -> None:
+        """IntelliJ IDEA detected → _skip_jdtls = True."""
+        from unittest.mock import patch
+
+        from java_functional_lsp.server import on_initialize, server
+
+        server._skip_jdtls = False
+        server._skip_jdtls_registration = False
+        params = self._make_init_params("IntelliJ IDEA")
+        with patch.dict("os.environ", {}, clear=False):
+            os.environ.pop("JAVA_FUNCTIONAL_LSP_JDTLS", None)
+            on_initialize(params)
+        assert server._skip_jdtls is True
+
+    def test_jetbrains_product_skips_jdtls(self) -> None:
+        """Any JetBrains product detected → _skip_jdtls = True."""
+        from unittest.mock import patch
+
+        from java_functional_lsp.server import on_initialize, server
+
+        server._skip_jdtls = False
+        params = self._make_init_params("JetBrains Rider 2025.2")
+        with patch.dict("os.environ", {}, clear=False):
+            os.environ.pop("JAVA_FUNCTIONAL_LSP_JDTLS", None)
+            on_initialize(params)
+        assert server._skip_jdtls is True
+
+    def test_vscode_allows_jdtls(self) -> None:
+        """VS Code → _skip_jdtls = False (jdtls needed)."""
+        from unittest.mock import patch
+
+        from java_functional_lsp.server import on_initialize, server
+
+        server._skip_jdtls = False
+        params = self._make_init_params("Visual Studio Code")
+        with patch.dict("os.environ", {}, clear=False):
+            os.environ.pop("JAVA_FUNCTIONAL_LSP_JDTLS", None)
+            on_initialize(params)
+        assert server._skip_jdtls is False
+
+    def test_no_client_info_allows_jdtls(self) -> None:
+        """No client_info → _skip_jdtls = False (safe default)."""
+        from unittest.mock import patch
+
+        from java_functional_lsp.server import on_initialize, server
+
+        server._skip_jdtls = False
+        params = self._make_init_params(None)
+        with patch.dict("os.environ", {}, clear=False):
+            os.environ.pop("JAVA_FUNCTIONAL_LSP_JDTLS", None)
+            on_initialize(params)
+        assert server._skip_jdtls is False
+
+    def test_env_var_off_overrides_detection(self) -> None:
+        """JAVA_FUNCTIONAL_LSP_JDTLS=off disables jdtls even for non-JetBrains client."""
+        from unittest.mock import patch
+
+        from java_functional_lsp.server import on_initialize, server
+
+        server._skip_jdtls = False
+        params = self._make_init_params("Visual Studio Code")
+        with patch.dict("os.environ", {"JAVA_FUNCTIONAL_LSP_JDTLS": "off"}):
+            on_initialize(params)
+        assert server._skip_jdtls is True
+
+    def test_env_var_on_overrides_intellij_detection(self) -> None:
+        """JAVA_FUNCTIONAL_LSP_JDTLS=on force-enables jdtls even for IntelliJ."""
+        from unittest.mock import patch
+
+        from java_functional_lsp.server import on_initialize, server
+
+        server._skip_jdtls = True  # Pre-set to True
+        params = self._make_init_params("IntelliJ IDEA")
+        with patch.dict("os.environ", {"JAVA_FUNCTIONAL_LSP_JDTLS": "on"}):
+            on_initialize(params)
+        assert server._skip_jdtls is False
+
+    def test_env_var_no_register(self) -> None:
+        """JAVA_FUNCTIONAL_LSP_JDTLS=no-register keeps jdtls but skips registration."""
+        from unittest.mock import patch
+
+        from java_functional_lsp.server import on_initialize, server
+
+        server._skip_jdtls = False
+        server._skip_jdtls_registration = False
+        params = self._make_init_params("Visual Studio Code")
+        with patch.dict("os.environ", {"JAVA_FUNCTIONAL_LSP_JDTLS": "no-register"}):
+            on_initialize(params)
+        assert server._skip_jdtls is False
+        assert server._skip_jdtls_registration is True
+
+    def test_custom_diagnostics_publish_when_jdtls_skipped(self) -> None:
+        """Tree-sitter analysis works normally when jdtls is skipped."""
+        from unittest.mock import patch
+
+        from java_functional_lsp.server import _run_analysis
+
+        java_source = "public class Foo { public String bar() { return null; } }"
+
+        with patch("java_functional_lsp.server.server") as mock_server:
+            mock_server._proxy.is_available = False
+            mock_server._skip_jdtls = True
+            mock_server._config = {}
+            mock_server._parser = __import__("java_functional_lsp.analyzers.base", fromlist=["get_parser"]).get_parser()
+
+            result = _run_analysis(java_source, "file:///test/Foo.java")
+
+        custom_diags = [d for d in result if d.source == "java-functional-lsp"]
+        assert len(custom_diags) > 0, "Custom diagnostics should publish when jdtls is skipped"
+        assert any(d.code == "null-return" for d in custom_diags), "null-return diagnostic expected"
+
+
 class TestFindLombokJar:
     """Tests for _find_lombok_jar()."""
 
