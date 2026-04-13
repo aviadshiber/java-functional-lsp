@@ -550,13 +550,22 @@ class JdtlsProxy:
         if not jdtls_path:
             return False
 
-        # Data-dir hash: use module URI when scoped so each module gets its own
-        # clean jdtls state. This avoids loading a 2.5GB monorepo index when only
-        # one module is needed. Without expansion, each session is module-scoped,
-        # so the data-dir should match that scope.
         original_root: str = init_params.get("rootUri") or init_params.get("rootPath") or str(Path.cwd())
         self._original_root_uri = original_root
+
+        # Discover Lombok jar and build jdtls env BEFORE computing the data-dir
+        # hash, so that adding/changing the Lombok agent invalidates stale indexes.
+        loop = asyncio.get_running_loop()
+        jdtls_env, lombok_jar = await loop.run_in_executor(None, lambda: (build_jdtls_env(), _find_lombok_jar(config)))
+        if lombok_jar:
+            logger.info("jdtls: using Lombok agent from %s", _redact_path(lombok_jar))
+
+        # Data-dir hash: includes module URI + Lombok jar path so that changing
+        # either gives jdtls a fresh index (avoids stale caches that cause
+        # AssertionFailedExceptions and silently break annotation processing).
         hash_source = module_root_uri or original_root
+        if lombok_jar:
+            hash_source += f"|lombok={lombok_jar}"
         data_hash = hashlib.sha256(hash_source.encode()).hexdigest()[:12]
         data_dir = Path.home() / ".cache" / "jdtls-data" / data_hash
         data_dir.mkdir(parents=True, exist_ok=True)
@@ -583,12 +592,6 @@ class JdtlsProxy:
         # Track the initial module as already loaded (mark ADDED before await).
         self._initial_module_uri = module_root_uri
         self.modules.mark_added(effective_root_uri)
-
-        # Build a clean environment and find Lombok jar (both do blocking I/O).
-        loop = asyncio.get_running_loop()
-        jdtls_env, lombok_jar = await loop.run_in_executor(None, lambda: (build_jdtls_env(), _find_lombok_jar(config)))
-        if lombok_jar:
-            logger.info("jdtls: using Lombok agent from %s", _redact_path(lombok_jar))
 
         jdtls_cmd: list[str] = [
             jdtls_path,
