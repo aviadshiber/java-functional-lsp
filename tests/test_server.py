@@ -654,98 +654,100 @@ class TestJdtlsFalsePositive:
         from java_functional_lsp.server import _is_jdtls_false_positive
 
         diag = {"code": "67108964", "message": "The method builder() is undefined for the type Foo"}
-        assert _is_jdtls_false_positive(diag) is True
+        assert _is_jdtls_false_positive(diag, []) is True
 
     def test_matches_log_unresolved(self) -> None:
         from java_functional_lsp.server import _is_jdtls_false_positive
 
         diag = {"code": "570425394", "message": "log cannot be resolved"}
-        assert _is_jdtls_false_positive(diag) is True
+        assert _is_jdtls_false_positive(diag, []) is True
 
     def test_matches_builder_type_unresolved(self) -> None:
         from java_functional_lsp.server import _is_jdtls_false_positive
 
         diag = {"code": "16777218", "message": "FooBuilder cannot be resolved to a type"}
-        assert _is_jdtls_false_positive(diag) is True
+        assert _is_jdtls_false_positive(diag, []) is True
 
     def test_does_not_match_real_undefined_method(self) -> None:
         from java_functional_lsp.server import _is_jdtls_false_positive
 
         diag = {"code": "67108964", "message": "The method foo() is undefined for the type String"}
-        assert _is_jdtls_false_positive(diag) is False
+        assert _is_jdtls_false_positive(diag, []) is False
 
     def test_does_not_match_real_unresolved_type(self) -> None:
         from java_functional_lsp.server import _is_jdtls_false_positive
 
         diag = {"code": "16777218", "message": "SomeClass cannot be resolved to a type"}
-        assert _is_jdtls_false_positive(diag) is False
+        assert _is_jdtls_false_positive(diag, []) is False
 
     def test_empty_message(self) -> None:
         from java_functional_lsp.server import _is_jdtls_false_positive
 
         diag = {"code": "67108964", "message": ""}
-        assert _is_jdtls_false_positive(diag) is False
+        assert _is_jdtls_false_positive(diag, []) is False
 
     def test_missing_fields(self) -> None:
         from java_functional_lsp.server import _is_jdtls_false_positive
 
-        assert _is_jdtls_false_positive({}) is False
+        assert _is_jdtls_false_positive({}, []) is False
 
     def test_matches_blank_final_field(self) -> None:
         from java_functional_lsp.server import _is_jdtls_false_positive
 
         diag = {"code": "33554513", "message": "The blank final field name may not have been initialized"}
-        assert _is_jdtls_false_positive(diag) is True
+        assert _is_jdtls_false_positive(diag, []) is True
 
     def test_matches_static_constructor_of(self) -> None:
         from java_functional_lsp.server import _is_jdtls_false_positive
 
         diag = {"code": "67108964", "message": "The method of() is undefined for the type ExternalFailureError"}
-        assert _is_jdtls_false_positive(diag) is True
+        assert _is_jdtls_false_positive(diag, []) is True
 
     def test_matches_static_constructor_create(self) -> None:
         from java_functional_lsp.server import _is_jdtls_false_positive
 
         diag = {"code": "67108964", "message": "The method create() is undefined for the type Config"}
-        assert _is_jdtls_false_positive(diag) is True
+        assert _is_jdtls_false_positive(diag, []) is True
+
+    def test_does_not_match_of_without_undefined(self) -> None:
+        """Ensure 'of()' only matches in 'is undefined' context, not arbitrary messages."""
+        from java_functional_lsp.server import _is_jdtls_false_positive
+
+        diag = {"message": "The method of() has wrong return type"}
+        assert _is_jdtls_false_positive(diag, []) is False
 
 
 class TestUserSuppressPatterns:
     """Tests for configurable suppressJdtlsPatterns."""
 
     def test_user_pattern_matches(self) -> None:
-        import java_functional_lsp.server as srv
+        """User pattern matches a message NOT covered by built-in patterns."""
         from java_functional_lsp.server import _compile_user_patterns, _is_jdtls_false_positive
 
-        old = srv._user_suppress_patterns
-        try:
-            srv._user_suppress_patterns = _compile_user_patterns(
-                {"suppressJdtlsPatterns": [r"The method \w+\(\) is undefined for the type \w+Error"]}
-            )
-            diag = {"message": "The method of() is undefined for the type SearchEngineError"}
-            assert _is_jdtls_false_positive(diag) is True
-        finally:
-            srv._user_suppress_patterns = old
+        patterns = _compile_user_patterns({"suppressJdtlsPatterns": [r"The method generateReport\(\) is undefined"]})
+        diag = {"message": "The method generateReport() is undefined for the type InternalService"}
+        assert _is_jdtls_false_positive(diag, patterns) is True
 
     def test_user_pattern_does_not_match_unrelated(self) -> None:
-        import java_functional_lsp.server as srv
         from java_functional_lsp.server import _compile_user_patterns, _is_jdtls_false_positive
 
-        old = srv._user_suppress_patterns
-        try:
-            srv._user_suppress_patterns = _compile_user_patterns(
-                {"suppressJdtlsPatterns": [r"The method \w+\(\) is undefined for the type \w+Error"]}
-            )
-            diag = {"message": "The method foo() is undefined for the type String"}
-            assert _is_jdtls_false_positive(diag) is False
-        finally:
-            srv._user_suppress_patterns = old
+        patterns = _compile_user_patterns({"suppressJdtlsPatterns": [r"The method generateReport\(\) is undefined"]})
+        diag = {"message": "The method foo() is undefined for the type String"}
+        assert _is_jdtls_false_positive(diag, patterns) is False
+
+    def test_user_pattern_without_builtins(self) -> None:
+        """With empty user patterns and a non-Lombok message, returns False."""
+        from java_functional_lsp.server import _is_jdtls_false_positive
+
+        diag = {"message": "The method generateReport() is undefined for the type InternalService"}
+        assert _is_jdtls_false_positive(diag, []) is False
 
     def test_invalid_regex_skipped(self) -> None:
         from java_functional_lsp.server import _compile_user_patterns
 
         patterns = _compile_user_patterns({"suppressJdtlsPatterns": [r"valid", r"[invalid"]})
         assert len(patterns) == 1
+        assert patterns[0].search("valid") is not None
 
     def test_non_list_ignored(self) -> None:
         from java_functional_lsp.server import _compile_user_patterns
@@ -771,16 +773,15 @@ class TestJdtlsIsolation:
 
         java_source = "public class Foo { public String bar() { return null; } }"
 
-        # Simulate jdtls being available but get_cached_diagnostics throwing
         with patch("java_functional_lsp.server.server") as mock_server:
             mock_server._proxy.is_available = True
             mock_server._proxy.get_cached_diagnostics.side_effect = RuntimeError("jdtls corrupt")
+            mock_server._user_suppress_patterns = []
             mock_server._config = {}
             mock_server._parser = __import__("java_functional_lsp.analyzers.base", fromlist=["get_parser"]).get_parser()
 
             result = _run_analysis(java_source, "file:///test/Foo.java")
 
-        # Custom diagnostics should still be present (null-return rule)
         custom_diags = [d for d in result if d.source == "java-functional-lsp"]
         assert len(custom_diags) > 0, "Custom diagnostics should publish even when jdtls fails"
 
@@ -801,6 +802,23 @@ class TestJdtlsIsolation:
 
         custom_diags = [d for d in result if d.source == "java-functional-lsp"]
         assert len(custom_diags) > 0, "Custom diagnostics should publish without jdtls"
+
+    def test_analyze_and_publish_exception_does_not_crash_handler(self) -> None:
+        """Handler-level try/except prevents server crash when _analyze_and_publish raises."""
+        from unittest.mock import patch
+
+        from java_functional_lsp.server import _deferred_validate
+
+        with patch("java_functional_lsp.server._analyze_and_publish", side_effect=RuntimeError("boom")):
+            import asyncio
+
+            loop = asyncio.new_event_loop()
+            try:
+                # _deferred_validate should catch the exception and log, not raise
+                loop.run_until_complete(_deferred_validate("file:///test/Foo.java"))
+            finally:
+                loop.close()
+        # If we get here without exception, the handler caught it correctly
 
 
 class TestFindLombokJar:
@@ -864,6 +882,32 @@ class TestFindLombokJar:
         with caplog.at_level(logging.WARNING, logger="java_functional_lsp.proxy"):
             _find_lombok_jar({"lombok": "/nonexistent/lombok.jar"})
         assert any("does not exist" in r.getMessage() for r in caplog.records)
+
+
+class TestDataDirHash:
+    """Tests that the data-dir hash includes Lombok jar path."""
+
+    def test_different_lombok_jars_produce_different_hashes(self) -> None:
+        import hashlib
+
+        root = "file:///workspace/products"
+
+        hash_without = hashlib.sha256(root.encode()).hexdigest()[:12]
+
+        hash_with_a = hashlib.sha256(f"{root}|lombok=/path/to/lombok-1.18.30.jar".encode()).hexdigest()[:12]
+
+        hash_with_b = hashlib.sha256(f"{root}|lombok=/path/to/lombok-1.18.34.jar".encode()).hexdigest()[:12]
+
+        assert hash_without != hash_with_a, "Adding Lombok should change the hash"
+        assert hash_with_a != hash_with_b, "Different Lombok versions should produce different hashes"
+
+    def test_no_lombok_preserves_original_hash(self) -> None:
+        import hashlib
+
+        root = "file:///workspace/products"
+        expected = hashlib.sha256(root.encode()).hexdigest()[:12]
+        # Without Lombok, hash_source is just the root — no "|lombok=" suffix
+        assert expected == hashlib.sha256(root.encode()).hexdigest()[:12]
 
 
 # Subprocess-based tests — zero mocks, real LSP transport

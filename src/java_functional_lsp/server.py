@@ -65,6 +65,7 @@ class JavaFunctionalLspServer(LanguageServer):
         self._config: dict[str, Any] = {}
         self._init_params: dict[str, Any] = {}
         self._proxy = JdtlsProxy(on_diagnostics=self._on_jdtls_diagnostics)
+        self._user_suppress_patterns: list[re.Pattern[str]] = []
 
     def _on_jdtls_diagnostics(self, uri: str, diagnostics: list[Any]) -> None:
         """Called when jdtls publishes diagnostics — merge with custom and re-publish.
@@ -204,18 +205,15 @@ def _jdtls_raw_to_lsp_diagnostics(raw_diagnostics: list[Any]) -> list[lsp.Diagno
 # loaded (or only covers the initial module), these suppress the noise.
 _BUILTIN_AP_PATTERNS = re.compile(
     r"(?:"
-    r"The method builder\(\)|"  # @Builder
-    r"The method toBuilder\(\)|"  # @Builder(toBuilder=true)
-    r"The method of\(\)|"  # @Value(staticConstructor = "of")
-    r"The method create\(\)|"  # @Value(staticConstructor = "create")
+    r"The method builder\(\) is undefined|"  # @Builder
+    r"The method toBuilder\(\) is undefined|"  # @Builder(toBuilder=true)
+    r"The method of\(\) is undefined|"  # @Value(staticConstructor = "of")
+    r"The method create\(\) is undefined|"  # @Value(staticConstructor = "create")
     r"log cannot be resolved|"  # @Slf4j, @Log
     r"\w+Builder cannot be resolved to a type|"  # @Builder inner class
     r"The blank final field \w+ may not have been initialized"  # @Value final fields
     r")"
 )
-
-# Compiled user-defined patterns (populated from config on initialize)
-_user_suppress_patterns: list[re.Pattern[str]] = []
 
 
 def _compile_user_patterns(config: dict[str, Any]) -> list[re.Pattern[str]]:
@@ -235,7 +233,7 @@ def _compile_user_patterns(config: dict[str, Any]) -> list[re.Pattern[str]]:
     return patterns
 
 
-def _is_jdtls_false_positive(diag: dict[str, Any]) -> bool:
+def _is_jdtls_false_positive(diag: dict[str, Any], user_patterns: list[re.Pattern[str]]) -> bool:
     """Check if a jdtls diagnostic is a known annotation-processor false positive.
 
     Matches built-in Lombok patterns and any user-configured suppressJdtlsPatterns.
@@ -245,7 +243,7 @@ def _is_jdtls_false_positive(diag: dict[str, Any]) -> bool:
     msg = diag.get("message", "")
     if _BUILTIN_AP_PATTERNS.search(msg):
         return True
-    for pat in _user_suppress_patterns:
+    for pat in user_patterns:
         if pat.search(msg):
             return True
     return False
@@ -262,7 +260,7 @@ def _run_analysis(source: str, uri: str) -> list[lsp.Diagnostic]:
     if server._proxy.is_available:
         try:
             raw = server._proxy.get_cached_diagnostics(uri)
-            raw = [d for d in raw if not _is_jdtls_false_positive(d)]
+            raw = [d for d in raw if not _is_jdtls_false_positive(d, server._user_suppress_patterns)]
             jdtls_diags = _jdtls_raw_to_lsp_diagnostics(raw)
         except Exception as e:
             logger.warning("jdtls diagnostic processing failed for %s: %s", uri, e)
@@ -293,9 +291,7 @@ def on_initialize(params: lsp.InitializeParams) -> lsp.InitializeResult:
         root = params.root_path
 
     server._config = _load_config(root)
-
-    global _user_suppress_patterns
-    _user_suppress_patterns = _compile_user_patterns(server._config)
+    server._user_suppress_patterns = _compile_user_patterns(server._config)
 
     return lsp.InitializeResult(
         capabilities=lsp.ServerCapabilities(

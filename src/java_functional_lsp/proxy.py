@@ -589,7 +589,7 @@ class JdtlsProxy:
         ws = caps.setdefault("workspace", {})
         ws["workspaceFolders"] = True
 
-        # Track the initial module as already loaded (mark ADDED before await).
+        # Track the initial module as already loaded.
         self._initial_module_uri = module_root_uri
         self.modules.mark_added(effective_root_uri)
 
