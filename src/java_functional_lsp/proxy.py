@@ -444,6 +444,29 @@ def _version_key(name: str) -> tuple[int, ...]:
     return tuple(parts)
 
 
+def _clear_cache_on_version_change(cache_root: Path) -> None:
+    """Clear jdtls data cache when the server version changes.
+
+    Stores a ``.version`` marker in the cache root. On version mismatch
+    (e.g., Lombok agent added, jdtls config changed), wipes the entire
+    cache so jdtls re-indexes from scratch with the current configuration.
+    """
+    from . import __version__
+
+    marker = cache_root / ".version"
+    try:
+        if marker.exists() and marker.read_text().strip() == __version__:
+            return
+        # Version changed or first run — clear stale caches.
+        if cache_root.exists():
+            shutil.rmtree(cache_root)
+            logger.info("jdtls: cleared stale cache (version changed to %s)", __version__)
+        cache_root.mkdir(parents=True, exist_ok=True)
+        marker.write_text(__version__)
+    except OSError as e:
+        logger.warning("jdtls: failed to manage cache version marker: %s", e)
+
+
 def _find_lombok_jar(config: Mapping[str, Any] | None = None) -> str | None:
     """Find lombok.jar from configurable and auto-discovered locations.
 
@@ -553,21 +576,21 @@ class JdtlsProxy:
         original_root: str = init_params.get("rootUri") or init_params.get("rootPath") or str(Path.cwd())
         self._original_root_uri = original_root
 
-        # Discover Lombok jar and build jdtls env BEFORE computing the data-dir
-        # hash, so that adding/changing the Lombok agent invalidates stale indexes.
+        # Discover Lombok jar and build jdtls env (blocking I/O in executor).
         loop = asyncio.get_running_loop()
         jdtls_env, lombok_jar = await loop.run_in_executor(None, lambda: (build_jdtls_env(), _find_lombok_jar(config)))
         if lombok_jar:
             logger.info("jdtls: using Lombok agent from %s", _redact_path(lombok_jar))
 
-        # Data-dir hash: includes module URI + Lombok jar path so that changing
-        # either gives jdtls a fresh index (avoids stale caches that cause
-        # AssertionFailedExceptions and silently break annotation processing).
+        # Clear stale jdtls caches when the server version changes (e.g.,
+        # Lombok agent added, jdtls config changed). A version marker file
+        # tracks this — mismatch wipes the whole cache for a clean reindex.
+        cache_root = Path.home() / ".cache" / "jdtls-data"
+        _clear_cache_on_version_change(cache_root)
+
         hash_source = module_root_uri or original_root
-        if lombok_jar:
-            hash_source += f"|lombok={lombok_jar}"
         data_hash = hashlib.sha256(hash_source.encode()).hexdigest()[:12]
-        data_dir = Path.home() / ".cache" / "jdtls-data" / data_hash
+        data_dir = cache_root / data_hash
         data_dir.mkdir(parents=True, exist_ok=True)
 
         # Deep copy to avoid mutating server._init_params.

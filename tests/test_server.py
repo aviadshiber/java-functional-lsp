@@ -884,30 +884,49 @@ class TestFindLombokJar:
         assert any("does not exist" in r.getMessage() for r in caplog.records)
 
 
-class TestDataDirHash:
-    """Tests that the data-dir hash includes Lombok jar path."""
+class TestCacheClear:
+    """Tests for _clear_cache_on_version_change()."""
 
-    def test_different_lombok_jars_produce_different_hashes(self) -> None:
-        import hashlib
+    def test_clears_on_version_mismatch(self, tmp_path: Any) -> None:
+        from java_functional_lsp.proxy import _clear_cache_on_version_change
 
-        root = "file:///workspace/products"
+        cache = tmp_path / "jdtls-data"
+        cache.mkdir()
+        stale_dir = cache / "abc123"
+        stale_dir.mkdir()
+        (cache / ".version").write_text("0.7.9")
 
-        hash_without = hashlib.sha256(root.encode()).hexdigest()[:12]
+        _clear_cache_on_version_change(cache)
 
-        hash_with_a = hashlib.sha256(f"{root}|lombok=/path/to/lombok-1.18.30.jar".encode()).hexdigest()[:12]
+        assert not stale_dir.exists(), "Stale data-dir should be cleared"
+        assert cache.exists(), "Cache root should be recreated"
+        from java_functional_lsp import __version__
 
-        hash_with_b = hashlib.sha256(f"{root}|lombok=/path/to/lombok-1.18.34.jar".encode()).hexdigest()[:12]
+        assert (cache / ".version").read_text() == __version__
 
-        assert hash_without != hash_with_a, "Adding Lombok should change the hash"
-        assert hash_with_a != hash_with_b, "Different Lombok versions should produce different hashes"
+    def test_keeps_cache_on_same_version(self, tmp_path: Any) -> None:
+        from java_functional_lsp import __version__
+        from java_functional_lsp.proxy import _clear_cache_on_version_change
 
-    def test_no_lombok_preserves_original_hash(self) -> None:
-        import hashlib
+        cache = tmp_path / "jdtls-data"
+        cache.mkdir()
+        existing_dir = cache / "abc123"
+        existing_dir.mkdir()
+        (cache / ".version").write_text(__version__)
 
-        root = "file:///workspace/products"
-        expected = hashlib.sha256(root.encode()).hexdigest()[:12]
-        # Without Lombok, hash_source is just the root — no "|lombok=" suffix
-        assert expected == hashlib.sha256(root.encode()).hexdigest()[:12]
+        _clear_cache_on_version_change(cache)
+
+        assert existing_dir.exists(), "Existing data-dir should be preserved"
+
+    def test_creates_marker_on_first_run(self, tmp_path: Any) -> None:
+        from java_functional_lsp.proxy import _clear_cache_on_version_change
+
+        cache = tmp_path / "jdtls-data"
+        _clear_cache_on_version_change(cache)
+
+        from java_functional_lsp import __version__
+
+        assert (cache / ".version").read_text() == __version__
 
 
 # Subprocess-based tests — zero mocks, real LSP transport
