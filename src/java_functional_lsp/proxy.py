@@ -433,6 +433,58 @@ def _resolve_module_uri(file_uri: str) -> str | None:
     return module_uri or None
 
 
+def _version_key(name: str) -> tuple[int, ...]:
+    """Parse a version string into a tuple for semantic comparison."""
+    parts: list[int] = []
+    for segment in re.split(r"[.\-]", name):
+        try:
+            parts.append(int(segment))
+        except ValueError:
+            break
+    return tuple(parts)
+
+
+def _find_lombok_jar(config: Mapping[str, Any] | None = None) -> str | None:
+    """Find lombok.jar from configurable and auto-discovered locations.
+
+    Search order (first match wins):
+    1. Project config (.java-functional-lsp.json): ``{"lombok": "/path/to/lombok.jar"}``
+    2. Environment variable: ``LOMBOK_JAR``
+    3. Maven cache: ``~/.m2/repository/org/projectlombok/lombok/*/lombok-*.jar``
+    4. Dedicated directory: ``~/.jdtls-libs/lombok.jar``
+    """
+    # 1. Project config
+    if config and config.get("lombok"):
+        p = Path(config["lombok"]).expanduser()
+        if p.is_file():
+            return str(p)
+        logger.warning("Lombok path from config does not exist: %s", _redact_path(str(p)))
+
+    # 2. Environment variable
+    env_path = os.environ.get("LOMBOK_JAR")
+    if env_path:
+        p = Path(env_path).expanduser()
+        if p.is_file():
+            return str(p)
+        logger.warning("LOMBOK_JAR does not exist: %s", _redact_path(env_path))
+
+    # 3. Maven cache (latest version, semantic sort)
+    m2_lombok = Path.home() / ".m2" / "repository" / "org" / "projectlombok" / "lombok"
+    if m2_lombok.is_dir():
+        version_dirs = [d for d in m2_lombok.iterdir() if d.is_dir()]
+        for version_dir in sorted(version_dirs, key=lambda d: _version_key(d.name), reverse=True):
+            jar = version_dir / f"lombok-{version_dir.name}.jar"
+            if jar.is_file():
+                return str(jar)
+
+    # 4. Dedicated directory
+    fallback = Path.home() / ".jdtls-libs" / "lombok.jar"
+    if fallback.is_file():
+        return str(fallback)
+
+    return None
+
+
 class JdtlsProxy:
     """Manages a jdtls subprocess and provides async request/notification forwarding."""
 
@@ -457,6 +509,7 @@ class JdtlsProxy:
         self._original_root_uri: str | None = None
         self._initial_module_uri: str | None = None
         self.modules = ModuleRegistry()
+        self.has_lombok = False
         self._workspace_expanded = False
 
     @property
@@ -480,7 +533,13 @@ class JdtlsProxy:
             logger.warning("jdtls not found on PATH — running in standalone mode (custom rules only)")
         return self._jdtls_on_path
 
-    async def start(self, init_params: dict[str, Any], *, module_root_uri: str | None = None) -> bool:
+    async def start(
+        self,
+        init_params: dict[str, Any],
+        *,
+        module_root_uri: str | None = None,
+        config: Mapping[str, Any] | None = None,
+    ) -> bool:
         """Start jdtls subprocess and initialize it.
 
         If *module_root_uri* is provided, jdtls is scoped to that module for
@@ -525,16 +584,24 @@ class JdtlsProxy:
         self._initial_module_uri = module_root_uri
         self.modules.mark_added(effective_root_uri)
 
-        # Build a clean environment for jdtls.
+        # Build a clean environment and find Lombok jar (both do blocking I/O).
         loop = asyncio.get_running_loop()
-        jdtls_env = await loop.run_in_executor(None, build_jdtls_env)
+        jdtls_env, lombok_jar = await loop.run_in_executor(None, lambda: (build_jdtls_env(), _find_lombok_jar(config)))
+        if lombok_jar:
+            logger.info("jdtls: using Lombok agent from %s", _redact_path(lombok_jar))
+
+        jdtls_cmd: list[str] = [
+            jdtls_path,
+            "-data",
+            str(data_dir),
+            f"--jvm-arg=-Xmx{DEFAULT_JVM_MAX_HEAP}",
+        ]
+        if lombok_jar:
+            jdtls_cmd.append(f"--jvm-arg=-javaagent:{lombok_jar}")
 
         try:
             self._process = await asyncio.create_subprocess_exec(
-                jdtls_path,
-                "-data",
-                str(data_dir),
-                f"--jvm-arg=-Xmx{DEFAULT_JVM_MAX_HEAP}",
+                *jdtls_cmd,
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
@@ -563,13 +630,19 @@ class JdtlsProxy:
 
             await self.send_notification("initialized", {})
             self._available = True
+            self.has_lombok = lombok_jar is not None
             return True
 
         except (OSError, FileNotFoundError) as e:
             logger.error("Failed to start jdtls: %s", e)
             return False
 
-    async def ensure_started(self, init_params: dict[str, Any], file_uri: str) -> bool:
+    async def ensure_started(
+        self,
+        init_params: dict[str, Any],
+        file_uri: str,
+        config: Mapping[str, Any] | None = None,
+    ) -> bool:
         """Start jdtls lazily, scoped to the module containing *file_uri*.
 
         Thread-safe: uses asyncio.Lock to prevent double-start from rapid
@@ -596,7 +669,7 @@ class JdtlsProxy:
             self._starting = True
             try:
                 module_uri = _resolve_module_uri(file_uri)
-                started = await self.start(init_params, module_root_uri=module_uri)
+                started = await self.start(init_params, module_root_uri=module_uri, config=config)
                 if not started:
                     self._start_failed = True
                     self._start_failed_at = time.monotonic()
