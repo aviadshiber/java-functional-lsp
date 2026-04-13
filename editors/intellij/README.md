@@ -73,7 +73,7 @@ Project-level rules are configured via `.java-functional-lsp.json` in your proje
 
 ## Coexistence with IntelliJ's Java Support
 
-LSP4IJ is designed to **supplement** IntelliJ's native Java support, not replace it. Your custom functional programming diagnostics appear alongside IntelliJ's built-in inspections. No conflicts.
+The server automatically detects JetBrains IDEs and disables the jdtls proxy — IntelliJ provides its own Java language features (completions, hover, go-to-definition, compile errors). Only the 16 custom functional programming rules run, and they appear alongside IntelliJ's built-in inspections.
 
 ## Troubleshooting
 
@@ -85,6 +85,7 @@ LSP4IJ is designed to **supplement** IntelliJ's native Java support, not replace
 - Ensure the file mapping is set to Language: `Java`, Language ID: `java`
 - Check that `.java-functional-lsp.json` doesn't have rules set to `"off"`
 - Try restarting the language server: **Tools** → **Language Servers** → **Restart**
+- If diagnostics worked before but stopped, the jdtls proxy may be interfering. Set `JAVA_FUNCTIONAL_LSP_JDTLS=off` in the server command environment to force-disable jdtls. The server auto-detects JetBrains IDEs and disables jdtls by default (since IntelliJ provides native Java support), but this can be overridden with `JAVA_FUNCTIONAL_LSP_JDTLS=on`.
 
 ### PATH not found
 - IntelliJ may not inherit your shell's PATH. Use the full absolute path to the binary in the server command.

@@ -750,6 +750,100 @@ class TestJdtlsIsolation:
         # If we get here without exception, the handler caught it correctly
 
 
+class TestJdtlsSkipDetection:
+    """Tests for auto-detecting JetBrains IDEs and skipping jdtls."""
+
+    def _make_init_params(self, client_name: str | None = None) -> Any:
+        """Create minimal InitializeParams with optional client_info."""
+        return lsp.InitializeParams(
+            capabilities=lsp.ClientCapabilities(),
+            root_uri="file:///tmp/test",
+            client_info=lsp.ClientInfo(name=client_name) if client_name else None,
+        )
+
+    def _run_init(self, monkeypatch: Any, client_name: str | None, env_value: str | None = None) -> None:
+        """Run on_initialize with controlled env and client_info."""
+        from java_functional_lsp.server import on_initialize, server
+
+        server._skip_jdtls = False
+        server._skip_jdtls_registration = False
+        if env_value is not None:
+            monkeypatch.setenv("JAVA_FUNCTIONAL_LSP_JDTLS", env_value)
+        else:
+            monkeypatch.delenv("JAVA_FUNCTIONAL_LSP_JDTLS", raising=False)
+        on_initialize(self._make_init_params(client_name))
+
+    def test_intellij_client_info_skips_jdtls(self, monkeypatch: Any) -> None:
+        """IntelliJ IDEA detected → _skip_jdtls = True."""
+        from java_functional_lsp.server import server
+
+        self._run_init(monkeypatch, "IntelliJ IDEA")
+        assert server._skip_jdtls is True
+
+    def test_jetbrains_product_skips_jdtls(self, monkeypatch: Any) -> None:
+        """Any JetBrains product detected → _skip_jdtls = True."""
+        from java_functional_lsp.server import server
+
+        self._run_init(monkeypatch, "JetBrains Rider 2025.2")
+        assert server._skip_jdtls is True
+
+    def test_vscode_allows_jdtls(self, monkeypatch: Any) -> None:
+        """VS Code → _skip_jdtls = False (jdtls needed)."""
+        from java_functional_lsp.server import server
+
+        self._run_init(monkeypatch, "Visual Studio Code")
+        assert server._skip_jdtls is False
+
+    def test_no_client_info_allows_jdtls(self, monkeypatch: Any) -> None:
+        """No client_info → _skip_jdtls = False (safe default)."""
+        from java_functional_lsp.server import server
+
+        self._run_init(monkeypatch, None)
+        assert server._skip_jdtls is False
+
+    def test_env_var_off_overrides_detection(self, monkeypatch: Any) -> None:
+        """JAVA_FUNCTIONAL_LSP_JDTLS=off disables jdtls even for non-JetBrains client."""
+        from java_functional_lsp.server import server
+
+        self._run_init(monkeypatch, "Visual Studio Code", env_value="off")
+        assert server._skip_jdtls is True
+
+    def test_env_var_on_overrides_intellij_detection(self, monkeypatch: Any) -> None:
+        """JAVA_FUNCTIONAL_LSP_JDTLS=on force-enables jdtls even for IntelliJ."""
+        from java_functional_lsp.server import server
+
+        self._run_init(monkeypatch, "IntelliJ IDEA", env_value="on")
+        assert server._skip_jdtls is False
+
+    def test_env_var_no_register(self, monkeypatch: Any) -> None:
+        """JAVA_FUNCTIONAL_LSP_JDTLS=no-register keeps jdtls but skips registration."""
+        from java_functional_lsp.server import server
+
+        self._run_init(monkeypatch, "Visual Studio Code", env_value="no-register")
+        assert server._skip_jdtls is False
+        assert server._skip_jdtls_registration is True
+
+    def test_custom_diagnostics_publish_when_jdtls_skipped(self) -> None:
+        """Tree-sitter analysis works normally when jdtls is skipped."""
+        from unittest.mock import patch
+
+        from java_functional_lsp.server import _run_analysis
+
+        java_source = "public class Foo { public String bar() { return null; } }"
+
+        with patch("java_functional_lsp.server.server") as mock_server:
+            mock_server._proxy.is_available = False
+            mock_server._skip_jdtls = True
+            mock_server._config = {}
+            mock_server._parser = __import__("java_functional_lsp.analyzers.base", fromlist=["get_parser"]).get_parser()
+
+            result = _run_analysis(java_source, "file:///test/Foo.java")
+
+        custom_diags = [d for d in result if d.source == "java-functional-lsp"]
+        assert len(custom_diags) > 0, "Custom diagnostics should publish when jdtls is skipped"
+        assert any(d.code == "null-return" for d in custom_diags), "null-return diagnostic expected"
+
+
 class TestFindLombokJar:
     """Tests for _find_lombok_jar()."""
 
