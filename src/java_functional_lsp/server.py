@@ -284,19 +284,24 @@ def on_initialize(params: lsp.InitializeParams) -> lsp.InitializeResult:
     server._user_suppress_patterns = _compile_user_patterns(server._config)
 
     # Determine jdtls mode: env var takes priority, then auto-detect JetBrains IDEs.
-    client_name = (params.client_info.name if params.client_info else None) or ""
+    client_name = params.client_info.name if params.client_info else ""
     logger.info("LSP client: %s", client_name or "(unknown)")
+
+    # Reset flags so re-initialization (non-standard but defensive) starts clean.
+    server._skip_jdtls = False
+    server._skip_jdtls_registration = False
 
     jdtls_override = os.environ.get("JAVA_FUNCTIONAL_LSP_JDTLS", "").lower()
     if jdtls_override == "off":
         server._skip_jdtls = True
         logger.info("jdtls proxy disabled via JAVA_FUNCTIONAL_LSP_JDTLS=off")
     elif jdtls_override == "on":
-        server._skip_jdtls = False
         logger.info("jdtls proxy force-enabled via JAVA_FUNCTIONAL_LSP_JDTLS=on")
     elif jdtls_override == "no-register":
         server._skip_jdtls_registration = True
         logger.info("jdtls dynamic registration disabled via JAVA_FUNCTIONAL_LSP_JDTLS=no-register")
+    elif jdtls_override:
+        logger.warning("Unknown JAVA_FUNCTIONAL_LSP_JDTLS value %r; expected off/on/no-register", jdtls_override)
     elif any(token in client_name for token in _JDTLS_SKIP_CLIENTS):
         server._skip_jdtls = True
         logger.info(
