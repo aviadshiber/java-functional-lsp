@@ -225,6 +225,22 @@ public String legacyMethod() { ... }
 
 Works on classes, methods, constructors, fields, and local variables. Suppression applies to the annotated scope — a class-level annotation suppresses all methods within it.
 
+### Lombok support
+
+Projects using [Lombok](https://projectlombok.org/) need the Lombok Java agent for jdtls to process `@Builder`, `@Value`, `@Data`, `@Slf4j`, and other annotations. Without it, jdtls reports false "method undefined" errors for generated methods.
+
+The server auto-discovers `lombok.jar` from these locations (first match wins):
+
+1. **Project config** — add to `.java-functional-lsp.json`:
+   ```json
+   { "lombok": "/path/to/lombok.jar" }
+   ```
+2. **Environment variable** — `LOMBOK_JAR=/path/to/lombok.jar`
+3. **Maven cache** — auto-discovered from `~/.m2/repository/org/projectlombok/lombok/`
+4. **Dedicated directory** — `~/.jdtls-libs/lombok.jar`
+
+If Lombok is used in your project but the jar isn't found, the server automatically filters common Lombok false-positive errors (like "builder() is undefined") so they don't clutter your diagnostics.
+
 ## Code actions (quick fixes)
 
 The server provides LSP code actions (`textDocument/codeAction`) that automatically refactor code. When your editor shows a diagnostic with a lightbulb icon, clicking it applies the fix:

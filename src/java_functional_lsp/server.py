@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import sys
 from pathlib import Path
 from typing import Any
@@ -197,6 +198,28 @@ def _jdtls_raw_to_lsp_diagnostics(raw_diagnostics: list[Any]) -> list[lsp.Diagno
     return result
 
 
+# Lombok-specific patterns: only match diagnostics that are clearly Lombok-generated.
+# Intentionally narrow to avoid suppressing real compile errors.
+_LOMBOK_PATTERNS = re.compile(
+    r"(?:"
+    r"The method builder\(\)|"  # @Builder
+    r"The method toBuilder\(\)|"  # @Builder(toBuilder=true)
+    r"log cannot be resolved|"  # @Slf4j, @Log
+    r"\w+Builder cannot be resolved to a type|"  # @Builder inner class
+    r"The blank final field \w+ may not have been initialized"  # @Value final fields
+    r")"
+)
+
+
+def _is_lombok_false_positive(diag: dict[str, Any]) -> bool:
+    """Check if a jdtls diagnostic is likely a Lombok false positive.
+
+    Only matches narrow Lombok-specific patterns to avoid suppressing real errors.
+    """
+    msg = diag.get("message", "")
+    return bool(_LOMBOK_PATTERNS.search(msg))
+
+
 def _run_analysis(source: str, uri: str) -> list[lsp.Diagnostic]:
     """Run custom analyzers on source text and merge with jdtls diagnostics."""
     custom_diags = _analyze_document(source, uri)
@@ -204,6 +227,8 @@ def _run_analysis(source: str, uri: str) -> list[lsp.Diagnostic]:
     jdtls_diags: list[lsp.Diagnostic] = []
     if server._proxy.is_available:
         raw = server._proxy.get_cached_diagnostics(uri)
+        if not server._proxy.has_lombok:
+            raw = [d for d in raw if not _is_lombok_false_positive(d)]
         jdtls_diags = _jdtls_raw_to_lsp_diagnostics(raw)
 
     return jdtls_diags + custom_diags
@@ -419,7 +444,7 @@ async def _lazy_start_jdtls(file_uri: str) -> None:
     are loaded on-demand via ``add_module_if_new()`` as files are opened.
     """
     try:
-        started = await server._proxy.ensure_started(server._init_params, file_uri)
+        started = await server._proxy.ensure_started(server._init_params, file_uri, config=server._config)
         if started:
             logger.info("jdtls proxy active — full Java language support enabled")
             await _register_jdtls_capabilities()

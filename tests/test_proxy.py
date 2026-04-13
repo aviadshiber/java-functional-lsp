@@ -1103,7 +1103,7 @@ class TestLazyStart:
         proxy._jdtls_on_path = True
         captured: dict[str, Any] = {}
 
-        async def capturing_start(params: Any, *, module_root_uri: str | None = None) -> bool:
+        async def capturing_start(params: Any, *, module_root_uri: str | None = None, config: Any = None) -> bool:
             captured["module_root_uri"] = module_root_uri
             return False
 
@@ -1127,7 +1127,7 @@ class TestLazyStart:
 
         captured: dict[str, Any] = {}
 
-        async def capturing_start(params: Any, *, module_root_uri: str | None = None) -> bool:
+        async def capturing_start(params: Any, *, module_root_uri: str | None = None, config: Any = None) -> bool:
             captured["module_root_uri"] = module_root_uri
             return False
 

@@ -642,6 +642,125 @@ class TestServerInternals:
 
 
 # --------------------------------------------------------------------------
+# --------------------------------------------------------------------------
+# Lombok support tests
+# --------------------------------------------------------------------------
+
+
+class TestLombokFalsePositive:
+    """Tests for _is_lombok_false_positive()."""
+
+    def test_matches_builder_undefined(self) -> None:
+        from java_functional_lsp.server import _is_lombok_false_positive
+
+        diag = {"code": "67108964", "message": "The method builder() is undefined for the type Foo"}
+        assert _is_lombok_false_positive(diag) is True
+
+    def test_matches_log_unresolved(self) -> None:
+        from java_functional_lsp.server import _is_lombok_false_positive
+
+        diag = {"code": "570425394", "message": "log cannot be resolved"}
+        assert _is_lombok_false_positive(diag) is True
+
+    def test_matches_builder_type_unresolved(self) -> None:
+        from java_functional_lsp.server import _is_lombok_false_positive
+
+        diag = {"code": "16777218", "message": "FooBuilder cannot be resolved to a type"}
+        assert _is_lombok_false_positive(diag) is True
+
+    def test_does_not_match_real_undefined_method(self) -> None:
+        from java_functional_lsp.server import _is_lombok_false_positive
+
+        diag = {"code": "67108964", "message": "The method foo() is undefined for the type String"}
+        assert _is_lombok_false_positive(diag) is False
+
+    def test_does_not_match_real_unresolved_type(self) -> None:
+        from java_functional_lsp.server import _is_lombok_false_positive
+
+        diag = {"code": "16777218", "message": "SomeClass cannot be resolved to a type"}
+        assert _is_lombok_false_positive(diag) is False
+
+    def test_empty_message(self) -> None:
+        from java_functional_lsp.server import _is_lombok_false_positive
+
+        diag = {"code": "67108964", "message": ""}
+        assert _is_lombok_false_positive(diag) is False
+
+    def test_missing_fields(self) -> None:
+        from java_functional_lsp.server import _is_lombok_false_positive
+
+        assert _is_lombok_false_positive({}) is False
+
+    def test_matches_blank_final_field(self) -> None:
+        from java_functional_lsp.server import _is_lombok_false_positive
+
+        diag = {"code": "33554513", "message": "The blank final field name may not have been initialized"}
+        assert _is_lombok_false_positive(diag) is True
+
+
+class TestFindLombokJar:
+    """Tests for _find_lombok_jar()."""
+
+    def test_config_path_wins(self, tmp_path: Any) -> None:
+        from java_functional_lsp.proxy import _find_lombok_jar
+
+        jar = tmp_path / "lombok.jar"
+        jar.touch()
+        result = _find_lombok_jar({"lombok": str(jar)})
+        assert result == str(jar)
+
+    def test_env_var_used(self, tmp_path: Any, monkeypatch: Any) -> None:
+        from java_functional_lsp.proxy import _find_lombok_jar
+
+        jar = tmp_path / "lombok.jar"
+        jar.touch()
+        monkeypatch.setenv("LOMBOK_JAR", str(jar))
+        result = _find_lombok_jar()
+        assert result == str(jar)
+
+    def test_config_wins_over_env(self, tmp_path: Any, monkeypatch: Any) -> None:
+        from java_functional_lsp.proxy import _find_lombok_jar
+
+        config_jar = tmp_path / "config-lombok.jar"
+        config_jar.touch()
+        env_jar = tmp_path / "env-lombok.jar"
+        env_jar.touch()
+        monkeypatch.setenv("LOMBOK_JAR", str(env_jar))
+        result = _find_lombok_jar({"lombok": str(config_jar)})
+        assert result == str(config_jar)
+
+    def test_maven_cache_semantic_sort(self, tmp_path: Any, monkeypatch: Any) -> None:
+        from java_functional_lsp.proxy import _find_lombok_jar
+
+        monkeypatch.delenv("LOMBOK_JAR", raising=False)
+        m2 = tmp_path / ".m2" / "repository" / "org" / "projectlombok" / "lombok"
+        for v in ["1.18.4", "1.18.30", "1.9.2"]:
+            d = m2 / v
+            d.mkdir(parents=True)
+            (d / f"lombok-{v}.jar").touch()
+        monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+        result = _find_lombok_jar()
+        assert result is not None
+        assert "1.18.30" in result  # Semantic sort picks 1.18.30 over 1.9.2
+
+    def test_returns_none_when_nothing_found(self, tmp_path: Any, monkeypatch: Any) -> None:
+        from java_functional_lsp.proxy import _find_lombok_jar
+
+        monkeypatch.delenv("LOMBOK_JAR", raising=False)
+        monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+        result = _find_lombok_jar()
+        assert result is None
+
+    def test_warns_on_missing_config_path(self, tmp_path: Any, caplog: Any) -> None:
+        import logging
+
+        from java_functional_lsp.proxy import _find_lombok_jar
+
+        with caplog.at_level(logging.WARNING, logger="java_functional_lsp.proxy"):
+            _find_lombok_jar({"lombok": "/nonexistent/lombok.jar"})
+        assert any("does not exist" in r.getMessage() for r in caplog.records)
+
+
 # Subprocess-based tests — zero mocks, real LSP transport
 # --------------------------------------------------------------------------
 
