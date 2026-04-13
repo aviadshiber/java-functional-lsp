@@ -202,6 +202,7 @@ Create `.java-functional-lsp.json` in your project root to customize rules:
 **Options:**
 - `excludes` — glob patterns for files/directories to skip entirely (supports `**` for multi-segment wildcards)
 - `rules` — per-rule severity: `error`, `warning` (default), `info`, `hint`, `off`
+- `suppressJdtlsPatterns` — list of regex patterns to suppress jdtls diagnostics (see below)
 
 **Spring-aware behavior:**
 - `throw-statement`, `catch-rethrow`, and `try-catch-to-monadic` are automatically suppressed inside `@Bean` methods
@@ -239,7 +240,22 @@ The server auto-discovers `lombok.jar` from these locations (first match wins):
 3. **Maven cache** — auto-discovered from `~/.m2/repository/org/projectlombok/lombok/`
 4. **Dedicated directory** — `~/.jdtls-libs/lombok.jar`
 
-If Lombok is used in your project but the jar isn't found, the server automatically filters common Lombok false-positive errors (like "builder() is undefined") so they don't clutter your diagnostics.
+If Lombok is used in your project but the jar isn't found, the server logs a warning. The jdtls cache is automatically cleared on version upgrade, so adding Lombok support takes effect immediately after `brew upgrade`.
+
+### Suppressing jdtls diagnostics
+
+For project-specific jdtls false positives (e.g., annotation processor methods, MapStruct mappers), use `suppressJdtlsPatterns` to add custom regex filters:
+
+```json
+{
+  "suppressJdtlsPatterns": [
+    "The method \\w+Mapper\\(\\) is undefined",
+    "cannot be resolved to a type"
+  ]
+}
+```
+
+Each entry is a regex matched against jdtls diagnostic messages. Invalid patterns are skipped with a warning.
 
 ## Code actions (quick fixes)
 

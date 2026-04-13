@@ -444,6 +444,29 @@ def _version_key(name: str) -> tuple[int, ...]:
     return tuple(parts)
 
 
+def _clear_cache_on_version_change(cache_root: Path) -> None:
+    """Clear jdtls data cache when the server version changes.
+
+    Stores a ``.version`` marker in the cache root. On version mismatch
+    (e.g., Lombok agent added, jdtls config changed), wipes the entire
+    cache so jdtls re-indexes from scratch with the current configuration.
+    """
+    from . import __version__
+
+    marker = cache_root / ".version"
+    try:
+        if marker.exists() and marker.read_text().strip() == __version__:
+            return
+        # Version changed or first run — clear stale caches.
+        if cache_root.exists():
+            shutil.rmtree(cache_root)
+            logger.info("jdtls: cleared stale cache (version changed to %s)", __version__)
+        cache_root.mkdir(parents=True, exist_ok=True)
+        marker.write_text(__version__)
+    except OSError as e:
+        logger.warning("jdtls: failed to manage cache version marker: %s", e)
+
+
 def _find_lombok_jar(config: Mapping[str, Any] | None = None) -> str | None:
     """Find lombok.jar from configurable and auto-discovered locations.
 
@@ -550,20 +573,35 @@ class JdtlsProxy:
         if not jdtls_path:
             return False
 
-        # Data-dir hash: use module URI when scoped so each module gets its own
-        # clean jdtls state. This avoids loading a 2.5GB monorepo index when only
-        # one module is needed. Without expansion, each session is module-scoped,
-        # so the data-dir should match that scope.
         original_root: str = init_params.get("rootUri") or init_params.get("rootPath") or str(Path.cwd())
         self._original_root_uri = original_root
+        effective_root_uri = module_root_uri or original_root
+
+        # Mark ADDED before any await to prevent duplicate module additions
+        # from concurrent coroutines during the executor yield below.
+        self._initial_module_uri = module_root_uri
+        self.modules.mark_added(effective_root_uri)
+
+        # All blocking startup I/O in a single executor call: cache version check
+        # (may rmtree on upgrade), Lombok discovery, and jdtls env build.
+        cache_root = Path.home() / ".cache" / "jdtls-data"
+
+        def _blocking_startup() -> tuple[dict[str, str], str | None]:
+            _clear_cache_on_version_change(cache_root)
+            return build_jdtls_env(), _find_lombok_jar(config)
+
+        loop = asyncio.get_running_loop()
+        jdtls_env, lombok_jar = await loop.run_in_executor(None, _blocking_startup)
+        if lombok_jar:
+            logger.info("jdtls: using Lombok agent from %s", _redact_path(lombok_jar))
+
         hash_source = module_root_uri or original_root
         data_hash = hashlib.sha256(hash_source.encode()).hexdigest()[:12]
-        data_dir = Path.home() / ".cache" / "jdtls-data" / data_hash
+        data_dir = cache_root / data_hash
         data_dir.mkdir(parents=True, exist_ok=True)
 
         # Deep copy to avoid mutating server._init_params.
         effective_params = copy.deepcopy(init_params)
-        effective_root_uri = module_root_uri or original_root
         if module_root_uri:
             effective_params["rootUri"] = module_root_uri
             from pygls.uris import to_fs_path
@@ -579,16 +617,6 @@ class JdtlsProxy:
         caps = effective_params.setdefault("capabilities", {})
         ws = caps.setdefault("workspace", {})
         ws["workspaceFolders"] = True
-
-        # Track the initial module as already loaded (mark ADDED before await).
-        self._initial_module_uri = module_root_uri
-        self.modules.mark_added(effective_root_uri)
-
-        # Build a clean environment and find Lombok jar (both do blocking I/O).
-        loop = asyncio.get_running_loop()
-        jdtls_env, lombok_jar = await loop.run_in_executor(None, lambda: (build_jdtls_env(), _find_lombok_jar(config)))
-        if lombok_jar:
-            logger.info("jdtls: using Lombok agent from %s", _redact_path(lombok_jar))
 
         jdtls_cmd: list[str] = [
             jdtls_path,

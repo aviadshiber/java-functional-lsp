@@ -647,55 +647,107 @@ class TestServerInternals:
 # --------------------------------------------------------------------------
 
 
-class TestLombokFalsePositive:
-    """Tests for _is_lombok_false_positive()."""
+class TestUserSuppressPatterns:
+    """Tests for configurable suppressJdtlsPatterns."""
 
-    def test_matches_builder_undefined(self) -> None:
-        from java_functional_lsp.server import _is_lombok_false_positive
+    def test_user_pattern_matches(self) -> None:
+        from java_functional_lsp.server import _compile_user_patterns, _is_jdtls_suppressed
 
-        diag = {"code": "67108964", "message": "The method builder() is undefined for the type Foo"}
-        assert _is_lombok_false_positive(diag) is True
+        patterns = _compile_user_patterns({"suppressJdtlsPatterns": [r"The method generateReport\(\) is undefined"]})
+        diag = {"message": "The method generateReport() is undefined for the type InternalService"}
+        assert _is_jdtls_suppressed(diag, patterns) is True
 
-    def test_matches_log_unresolved(self) -> None:
-        from java_functional_lsp.server import _is_lombok_false_positive
+    def test_user_pattern_does_not_match_unrelated(self) -> None:
+        from java_functional_lsp.server import _compile_user_patterns, _is_jdtls_suppressed
 
-        diag = {"code": "570425394", "message": "log cannot be resolved"}
-        assert _is_lombok_false_positive(diag) is True
+        patterns = _compile_user_patterns({"suppressJdtlsPatterns": [r"The method generateReport\(\) is undefined"]})
+        diag = {"message": "The method foo() is undefined for the type String"}
+        assert _is_jdtls_suppressed(diag, patterns) is False
 
-    def test_matches_builder_type_unresolved(self) -> None:
-        from java_functional_lsp.server import _is_lombok_false_positive
+    def test_no_patterns_passes_everything(self) -> None:
+        """With no user patterns, nothing is suppressed."""
+        from java_functional_lsp.server import _is_jdtls_suppressed
 
-        diag = {"code": "16777218", "message": "FooBuilder cannot be resolved to a type"}
-        assert _is_lombok_false_positive(diag) is True
+        diag = {"message": "The method builder() is undefined for the type Foo"}
+        assert _is_jdtls_suppressed(diag, []) is False
 
-    def test_does_not_match_real_undefined_method(self) -> None:
-        from java_functional_lsp.server import _is_lombok_false_positive
+    def test_invalid_regex_skipped(self) -> None:
+        from java_functional_lsp.server import _compile_user_patterns
 
-        diag = {"code": "67108964", "message": "The method foo() is undefined for the type String"}
-        assert _is_lombok_false_positive(diag) is False
+        patterns = _compile_user_patterns({"suppressJdtlsPatterns": [r"valid", r"[invalid"]})
+        assert len(patterns) == 1
+        assert patterns[0].search("valid") is not None
 
-    def test_does_not_match_real_unresolved_type(self) -> None:
-        from java_functional_lsp.server import _is_lombok_false_positive
+    def test_non_list_ignored(self) -> None:
+        from java_functional_lsp.server import _compile_user_patterns
 
-        diag = {"code": "16777218", "message": "SomeClass cannot be resolved to a type"}
-        assert _is_lombok_false_positive(diag) is False
+        patterns = _compile_user_patterns({"suppressJdtlsPatterns": "not a list"})
+        assert patterns == []
 
-    def test_empty_message(self) -> None:
-        from java_functional_lsp.server import _is_lombok_false_positive
+    def test_empty_config(self) -> None:
+        from java_functional_lsp.server import _compile_user_patterns
 
-        diag = {"code": "67108964", "message": ""}
-        assert _is_lombok_false_positive(diag) is False
+        patterns = _compile_user_patterns({})
+        assert patterns == []
 
-    def test_missing_fields(self) -> None:
-        from java_functional_lsp.server import _is_lombok_false_positive
 
-        assert _is_lombok_false_positive({}) is False
+class TestJdtlsIsolation:
+    """Tests that jdtls failures don't suppress custom diagnostics."""
 
-    def test_matches_blank_final_field(self) -> None:
-        from java_functional_lsp.server import _is_lombok_false_positive
+    def test_jdtls_exception_does_not_suppress_custom_diags(self) -> None:
+        """If jdtls diagnostic processing throws, custom diagnostics still publish."""
+        from unittest.mock import patch
 
-        diag = {"code": "33554513", "message": "The blank final field name may not have been initialized"}
-        assert _is_lombok_false_positive(diag) is True
+        from java_functional_lsp.server import _run_analysis
+
+        java_source = "public class Foo { public String bar() { return null; } }"
+
+        with patch("java_functional_lsp.server.server") as mock_server:
+            mock_server._proxy.is_available = True
+            mock_server._proxy.get_cached_diagnostics.side_effect = RuntimeError("jdtls corrupt")
+            mock_server._user_suppress_patterns = []
+            mock_server._config = {}
+            mock_server._parser = __import__("java_functional_lsp.analyzers.base", fromlist=["get_parser"]).get_parser()
+
+            result = _run_analysis(java_source, "file:///test/Foo.java")
+
+        custom_diags = [d for d in result if d.source == "java-functional-lsp"]
+        assert len(custom_diags) > 0, "Custom diagnostics should publish even when jdtls fails"
+
+    def test_jdtls_unavailable_still_publishes_custom_diags(self) -> None:
+        """When jdtls is not available, custom diagnostics still publish."""
+        from unittest.mock import patch
+
+        from java_functional_lsp.server import _run_analysis
+
+        java_source = "public class Foo { public String bar() { return null; } }"
+
+        with patch("java_functional_lsp.server.server") as mock_server:
+            mock_server._proxy.is_available = False
+            mock_server._config = {}
+            mock_server._parser = __import__("java_functional_lsp.analyzers.base", fromlist=["get_parser"]).get_parser()
+
+            result = _run_analysis(java_source, "file:///test/Foo.java")
+
+        custom_diags = [d for d in result if d.source == "java-functional-lsp"]
+        assert len(custom_diags) > 0, "Custom diagnostics should publish without jdtls"
+
+    def test_analyze_and_publish_exception_does_not_crash_handler(self) -> None:
+        """Handler-level try/except prevents server crash when _analyze_and_publish raises."""
+        from unittest.mock import patch
+
+        from java_functional_lsp.server import _deferred_validate
+
+        with patch("java_functional_lsp.server._analyze_and_publish", side_effect=RuntimeError("boom")):
+            import asyncio
+
+            loop = asyncio.new_event_loop()
+            try:
+                # _deferred_validate should catch the exception and log, not raise
+                loop.run_until_complete(_deferred_validate("file:///test/Foo.java"))
+            finally:
+                loop.close()
+        # If we get here without exception, the handler caught it correctly
 
 
 class TestFindLombokJar:
@@ -759,6 +811,51 @@ class TestFindLombokJar:
         with caplog.at_level(logging.WARNING, logger="java_functional_lsp.proxy"):
             _find_lombok_jar({"lombok": "/nonexistent/lombok.jar"})
         assert any("does not exist" in r.getMessage() for r in caplog.records)
+
+
+class TestCacheClear:
+    """Tests for _clear_cache_on_version_change()."""
+
+    def test_clears_on_version_mismatch(self, tmp_path: Any) -> None:
+        from java_functional_lsp.proxy import _clear_cache_on_version_change
+
+        cache = tmp_path / "jdtls-data"
+        cache.mkdir()
+        stale_dir = cache / "abc123"
+        stale_dir.mkdir()
+        (cache / ".version").write_text("0.7.9")
+
+        _clear_cache_on_version_change(cache)
+
+        assert not stale_dir.exists(), "Stale data-dir should be cleared"
+        assert cache.exists(), "Cache root should be recreated"
+        from java_functional_lsp import __version__
+
+        assert (cache / ".version").read_text() == __version__
+
+    def test_keeps_cache_on_same_version(self, tmp_path: Any) -> None:
+        from java_functional_lsp import __version__
+        from java_functional_lsp.proxy import _clear_cache_on_version_change
+
+        cache = tmp_path / "jdtls-data"
+        cache.mkdir()
+        existing_dir = cache / "abc123"
+        existing_dir.mkdir()
+        (cache / ".version").write_text(__version__)
+
+        _clear_cache_on_version_change(cache)
+
+        assert existing_dir.exists(), "Existing data-dir should be preserved"
+
+    def test_creates_marker_on_first_run(self, tmp_path: Any) -> None:
+        from java_functional_lsp.proxy import _clear_cache_on_version_change
+
+        cache = tmp_path / "jdtls-data"
+        _clear_cache_on_version_change(cache)
+
+        from java_functional_lsp import __version__
+
+        assert (cache / ".version").read_text() == __version__
 
 
 # Subprocess-based tests — zero mocks, real LSP transport

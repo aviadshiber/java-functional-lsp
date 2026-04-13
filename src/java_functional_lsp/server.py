@@ -65,6 +65,7 @@ class JavaFunctionalLspServer(LanguageServer):
         self._config: dict[str, Any] = {}
         self._init_params: dict[str, Any] = {}
         self._proxy = JdtlsProxy(on_diagnostics=self._on_jdtls_diagnostics)
+        self._user_suppress_patterns: list[re.Pattern[str]] = []
 
     def _on_jdtls_diagnostics(self, uri: str, diagnostics: list[Any]) -> None:
         """Called when jdtls publishes diagnostics — merge with custom and re-publish.
@@ -198,38 +199,54 @@ def _jdtls_raw_to_lsp_diagnostics(raw_diagnostics: list[Any]) -> list[lsp.Diagno
     return result
 
 
-# Lombok-specific patterns: only match diagnostics that are clearly Lombok-generated.
-# Intentionally narrow to avoid suppressing real compile errors.
-_LOMBOK_PATTERNS = re.compile(
-    r"(?:"
-    r"The method builder\(\)|"  # @Builder
-    r"The method toBuilder\(\)|"  # @Builder(toBuilder=true)
-    r"log cannot be resolved|"  # @Slf4j, @Log
-    r"\w+Builder cannot be resolved to a type|"  # @Builder inner class
-    r"The blank final field \w+ may not have been initialized"  # @Value final fields
-    r")"
-)
+def _compile_user_patterns(config: dict[str, Any]) -> list[re.Pattern[str]]:
+    """Compile user-defined suppressJdtlsPatterns from config."""
+    raw = config.get("suppressJdtlsPatterns", [])
+    if not isinstance(raw, list):
+        logger.warning("suppressJdtlsPatterns must be a list of regex strings, got %s", type(raw).__name__)
+        return []
+    patterns: list[re.Pattern[str]] = []
+    for entry in raw:
+        if not isinstance(entry, str):
+            continue
+        try:
+            patterns.append(re.compile(entry))
+        except re.error as e:
+            logger.warning("Invalid suppressJdtlsPatterns regex %r: %s", entry, e)
+    return patterns
 
 
-def _is_lombok_false_positive(diag: dict[str, Any]) -> bool:
-    """Check if a jdtls diagnostic is likely a Lombok false positive.
+def _is_jdtls_suppressed(diag: dict[str, Any], user_patterns: list[re.Pattern[str]]) -> bool:
+    """Check if a jdtls diagnostic matches a user-configured suppress pattern.
 
-    Only matches narrow Lombok-specific patterns to avoid suppressing real errors.
+    No built-in patterns — the root cause (stale jdtls caches) is fixed by
+    clearing the cache on version change. Users can still suppress specific
+    jdtls messages via suppressJdtlsPatterns in .java-functional-lsp.json.
     """
+    if not user_patterns:
+        return False
     msg = diag.get("message", "")
-    return bool(_LOMBOK_PATTERNS.search(msg))
+    for pat in user_patterns:
+        if pat.search(msg):
+            return True
+    return False
 
 
 def _run_analysis(source: str, uri: str) -> list[lsp.Diagnostic]:
-    """Run custom analyzers on source text and merge with jdtls diagnostics."""
+    """Run custom analyzers on source text and merge with jdtls diagnostics.
+
+    jdtls processing is isolated: if it fails, custom diagnostics still publish.
+    """
     custom_diags = _analyze_document(source, uri)
 
     jdtls_diags: list[lsp.Diagnostic] = []
     if server._proxy.is_available:
-        raw = server._proxy.get_cached_diagnostics(uri)
-        if not server._proxy.has_lombok:
-            raw = [d for d in raw if not _is_lombok_false_positive(d)]
-        jdtls_diags = _jdtls_raw_to_lsp_diagnostics(raw)
+        try:
+            raw = server._proxy.get_cached_diagnostics(uri)
+            raw = [d for d in raw if not _is_jdtls_suppressed(d, server._user_suppress_patterns)]
+            jdtls_diags = _jdtls_raw_to_lsp_diagnostics(raw)
+        except Exception as e:
+            logger.warning("jdtls diagnostic processing failed for %s: %s", uri, e)
 
     return jdtls_diags + custom_diags
 
@@ -257,6 +274,7 @@ def on_initialize(params: lsp.InitializeParams) -> lsp.InitializeResult:
         root = params.root_path
 
     server._config = _load_config(root)
+    server._user_suppress_patterns = _compile_user_patterns(server._config)
 
     return lsp.InitializeResult(
         capabilities=lsp.ServerCapabilities(
@@ -363,7 +381,10 @@ def _analyze_and_publish(uri: str) -> None:
 async def _deferred_validate(uri: str) -> None:
     """Debounced validation — waits before analyzing to batch rapid edits."""
     await asyncio.sleep(_DEBOUNCE_SECONDS)
-    _analyze_and_publish(uri)
+    try:
+        _analyze_and_publish(uri)
+    except Exception as e:
+        logger.error("Validation failed for %s: %s", uri, e)
 
 
 def _forward_or_queue(method: str, serialized: Any) -> None:
@@ -402,7 +423,10 @@ async def on_did_open(params: lsp.DidOpenTextDocumentParams) -> None:
             task.add_done_callback(_bg_tasks.discard)
 
     # Custom diagnostics always publish immediately — never blocked by jdtls.
-    _analyze_and_publish(uri)
+    try:
+        _analyze_and_publish(uri)
+    except Exception as e:
+        logger.error("Analysis failed on open for %s: %s", uri, e)
 
 
 @server.feature(lsp.TEXT_DOCUMENT_DID_CHANGE)
@@ -420,7 +444,10 @@ async def on_did_change(params: lsp.DidChangeTextDocumentParams) -> None:
 async def on_did_save(params: lsp.DidSaveTextDocumentParams) -> None:
     """Forward to jdtls and re-analyze immediately (no debounce on save)."""
     _forward_or_queue("textDocument/didSave", _serialize_params(params))
-    _analyze_and_publish(params.text_document.uri)
+    try:
+        _analyze_and_publish(params.text_document.uri)
+    except Exception as e:
+        logger.error("Analysis failed on save for %s: %s", params.text_document.uri, e)
 
 
 @server.feature(lsp.TEXT_DOCUMENT_DID_CLOSE)
