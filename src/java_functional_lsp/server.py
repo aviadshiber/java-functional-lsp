@@ -73,6 +73,7 @@ class JavaFunctionalLspServer(LanguageServer):
         self._user_suppress_patterns: list[re.Pattern[str]] = []
         self._skip_jdtls: bool = False
         self._skip_jdtls_registration: bool = False
+        self._init_generation: int = 0
 
     def _on_jdtls_diagnostics(self, uri: str, diagnostics: list[Any]) -> None:
         """Called when jdtls publishes diagnostics — merge with custom and re-publish.
@@ -206,6 +207,9 @@ def _jdtls_raw_to_lsp_diagnostics(raw_diagnostics: list[Any]) -> list[lsp.Diagno
     return result
 
 
+_MAX_PATTERN_LENGTH = 500  # Cap regex length to mitigate ReDoS from pathological patterns
+
+
 def _compile_user_patterns(config: dict[str, Any]) -> list[re.Pattern[str]]:
     """Compile user-defined suppressJdtlsPatterns from config."""
     raw = config.get("suppressJdtlsPatterns", [])
@@ -215,6 +219,9 @@ def _compile_user_patterns(config: dict[str, Any]) -> list[re.Pattern[str]]:
     patterns: list[re.Pattern[str]] = []
     for entry in raw:
         if not isinstance(entry, str):
+            continue
+        if len(entry) > _MAX_PATTERN_LENGTH:
+            logger.warning("suppressJdtlsPatterns entry too long (%d chars, max %d)", len(entry), _MAX_PATTERN_LENGTH)
             continue
         try:
             patterns.append(re.compile(entry))
@@ -284,13 +291,16 @@ def on_initialize(params: lsp.InitializeParams) -> lsp.InitializeResult:
     server._user_suppress_patterns = _compile_user_patterns(server._config)
 
     # Determine jdtls mode: env var takes priority, then auto-detect JetBrains IDEs.
-    client_name = params.client_info.name if params.client_info else ""
+    client_name = (params.client_info.name if params.client_info else "")[:200]
     logger.info("LSP client: %s", client_name or "(unknown)")
 
     # Reset flags so re-initialization (non-standard but defensive) starts clean.
+    # Bump generation so in-flight _register_jdtls_capabilities from a prior
+    # session detects the stale context and aborts.
     global _jdtls_capabilities_registered
     server._skip_jdtls = False
     server._skip_jdtls_registration = False
+    server._init_generation += 1
     _jdtls_capabilities_registered = False
 
     jdtls_override = os.environ.get("JAVA_FUNCTIONAL_LSP_JDTLS", "").strip().lower()
@@ -388,10 +398,14 @@ async def _register_jdtls_capabilities() -> None:
     ready, which suppresses the IDE's built-in diagnostic tooltips.
 
     Idempotent: safe to call multiple times (e.g., proxy restart).
+    Uses a generation counter to detect stale registrations from a prior
+    initialize cycle (defensive against non-standard re-initialization).
     """
     global _jdtls_capabilities_registered
     if _jdtls_capabilities_registered:
         return
+
+    generation = server._init_generation
 
     try:
         # Register handlers so pygls dispatches incoming requests to them.
@@ -401,6 +415,12 @@ async def _register_jdtls_capabilities() -> None:
         # Tell the client we now support these capabilities.
         registrations = _build_jdtls_registrations()
         await server.client_register_capability_async(lsp.RegistrationParams(registrations=registrations))
+
+        # Bail if a re-initialize happened while we were awaiting.
+        if generation != server._init_generation:
+            logger.info("Discarding stale jdtls capability registration (re-initialize detected)")
+            return
+
         _jdtls_capabilities_registered = True
         logger.info("Dynamically registered jdtls capabilities (hover, definition, references, completion, symbol)")
     except Exception:
@@ -448,22 +468,24 @@ async def on_did_open(params: lsp.DidOpenTextDocumentParams) -> None:
     """
     uri = params.text_document.uri
 
-    if not server._skip_jdtls:
+    if server._skip_jdtls:
+        # Skip all jdtls forwarding — custom diagnostics only.
+        pass
+    elif server._proxy.is_available:
+        # Fast path: jdtls running. Forward didOpen + add module if new.
         serialized = _serialize_params(params)
-
-        if server._proxy.is_available:
-            # Fast path: jdtls running. Forward didOpen + add module if new.
-            await server._proxy.send_notification("textDocument/didOpen", serialized)
-            await server._proxy.add_module_if_new(uri)
-        elif server._proxy._jdtls_on_path and not server._proxy._start_failed:
-            # Queue the didOpen (whether this is the first file or a subsequent one during startup).
-            server._proxy.queue_notification("textDocument/didOpen", serialized)
-            if not server._proxy._lazy_start_fired:
-                # First file: kick off lazy start in background.
-                server._proxy._lazy_start_fired = True
-                task = asyncio.create_task(_lazy_start_jdtls(uri))
-                _bg_tasks.add(task)
-                task.add_done_callback(_bg_tasks.discard)
+        await server._proxy.send_notification("textDocument/didOpen", serialized)
+        await server._proxy.add_module_if_new(uri)
+    elif server._proxy._jdtls_on_path and not server._proxy._start_failed:
+        # Queue the didOpen (whether this is the first file or a subsequent one during startup).
+        serialized = _serialize_params(params)
+        server._proxy.queue_notification("textDocument/didOpen", serialized)
+        if not server._proxy._lazy_start_fired:
+            # First file: kick off lazy start in background.
+            server._proxy._lazy_start_fired = True
+            task = asyncio.create_task(_lazy_start_jdtls(uri))
+            _bg_tasks.add(task)
+            task.add_done_callback(_bg_tasks.discard)
 
     # Custom diagnostics always publish immediately — never blocked by jdtls.
     try:
