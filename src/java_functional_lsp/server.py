@@ -90,9 +90,12 @@ class JavaFunctionalLspServer(LanguageServer):
             return
         module_uri = _resolve_module_uri(uri)
         if module_uri:
+            already_ready = self._proxy.modules.is_ready(module_uri)
             self._proxy.modules.mark_ready(module_uri)
-            # Fire-and-forget: apply Merkle diff and save updated snapshot.
-            _fire_and_forget(_apply_module_diff(self._proxy, module_uri))
+            if not already_ready:
+                # First READY transition only — subsequent diagnostics for the same
+                # module are no-ops to avoid spawning O(files) redundant tasks.
+                _fire_and_forget(_apply_module_diff(self._proxy, module_uri))
         try:
             _analyze_and_publish(uri)
         except Exception as e:

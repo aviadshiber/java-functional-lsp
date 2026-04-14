@@ -32,10 +32,20 @@ _MAX_FILES = 20_000
 # Upper bound on entries in a persisted snapshot (sanity / DoS guard).
 _MAX_SNAPSHOT_FILES = 100_000
 
+_READ_CHUNK = 65536  # 64 KiB per read — bounds per-file memory usage during hashing
 
-def _blake2b_hex(data: bytes) -> str:
-    """Return a 64-char hex digest of *data* using BLAKE2b (256-bit output)."""
-    return hashlib.blake2b(data, digest_size=32).hexdigest()
+
+def _blake2b_file(path: Path) -> str:
+    """Return a 64-char BLAKE2b hex digest of *path*, reading in 64 KiB chunks.
+
+    Streams the file instead of loading it entirely into memory, bounding
+    per-file heap usage to ``_READ_CHUNK`` bytes regardless of file size.
+    """
+    h = hashlib.blake2b(digest_size=32)
+    with path.open("rb") as fh:
+        while chunk := fh.read(_READ_CHUNK):
+            h.update(chunk)
+    return h.hexdigest()
 
 
 @dataclass(frozen=True)
@@ -103,14 +113,15 @@ class ModuleSnapshot:
                 return None
             rel = str(file_path.relative_to(module_root))
             try:
-                content = file_path.read_bytes()
-                files[rel] = _blake2b_hex(content)
+                files[rel] = _blake2b_file(file_path)
             except OSError as exc:
                 logger.debug("merkle: could not read %s: %s", file_path, exc)
 
-        root_input = "\n".join(f"{p}:{h}" for p, h in sorted(files.items()))
-        root_hash = hashlib.blake2b(root_input.encode(), digest_size=32).hexdigest()
-        return cls(root_hash=root_hash, files=files)
+        # Build root hash incrementally — avoids allocating an O(N) intermediate string.
+        h = hashlib.blake2b(digest_size=32)
+        for p, fh in sorted(files.items()):
+            h.update(f"{p}:{fh}\n".encode())
+        return cls(root_hash=h.hexdigest(), files=files)
 
     # ------------------------------------------------------------------
     # Comparison
@@ -168,8 +179,8 @@ class ModuleSnapshot:
                 isinstance(k, str)
                 and isinstance(v, str)
                 and "\x00" not in k
-                and not Path(k).is_absolute()
-                and ".." not in Path(k).parts
+                and not (p := Path(k)).is_absolute()
+                and ".." not in p.parts
                 for k, v in files.items()
             )
             return cls(root_hash=root_hash, files=files) if valid else None

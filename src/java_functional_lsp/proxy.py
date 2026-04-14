@@ -445,6 +445,7 @@ def _version_key(name: str) -> tuple[int, ...]:
     return tuple(parts)
 
 
+@lru_cache(maxsize=256)
 def _module_snapshot_path(module_uri: str) -> Path:
     """Return the path for the persistent snapshot file for *module_uri*.
 
@@ -786,12 +787,19 @@ class JdtlsProxy:
             await self.send_notification(method, params)
 
     async def _kick_module_diff(self, module_uri: str) -> None:
-        """Background task: compute snapshot diff and stash it for later use."""
+        """Background task: compute snapshot diff and stash it for later use.
+
+        Result is stored in ``_module_diff_results`` BEFORE the task is removed
+        from ``_pending_diff_tasks`` to eliminate the TOCTOU window where
+        ``await_module_diff`` could find neither a running task nor a result.
+        """
         loop = asyncio.get_running_loop()
         result = await loop.run_in_executor(None, _compute_module_diff, module_uri)
-        self._pending_diff_tasks.pop(module_uri, None)
+        # Store result first, then remove from pending — preserves invariant that
+        # once the task is gone from _pending_diff_tasks the result is already readable.
         if result is not None:
             self._module_diff_results[module_uri] = result
+        self._pending_diff_tasks.pop(module_uri, None)
 
     def pop_module_data(self, module_uri: str) -> tuple[TreeDiff | None, ModuleSnapshot] | None:
         """Pop and return stashed ``(diff, snapshot)`` for *module_uri*, or ``None``."""
@@ -803,10 +811,16 @@ class JdtlsProxy:
         Called when the READY signal fires before ``_kick_module_diff`` has
         stored its result — awaiting the task directly avoids a time-based
         sleep and ensures the diff is never silently dropped.
+
+        Swallows ``CancelledError`` so that a ``stop()`` call during the wait
+        does not propagate and crash the caller.
         """
         task = self._pending_diff_tasks.pop(module_uri, None)
         if task is not None and not task.done():
-            await task
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass  # result storage is _kick_module_diff's responsibility
 
     async def add_module_if_new(self, file_uri: str) -> str | None:
         """Add the module containing *file_uri* to jdtls if not already added.

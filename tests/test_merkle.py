@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -117,6 +118,22 @@ class TestModuleSnapshotBuild:
         result = ModuleSnapshot.build(tmp_path)
         assert result is None
 
+    def test_returns_none_at_exact_file_count_limit(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Exactly _MAX_FILES files succeeds; _MAX_FILES+1 triggers None (boundary check)."""
+        import java_functional_lsp.merkle as merkle_mod
+
+        monkeypatch.setattr(merkle_mod, "_MAX_FILES", 2)
+        # Exactly _MAX_FILES files: should succeed (limit not yet exceeded)
+        for i in range(2):
+            write(tmp_path / f"Cls{i}.java")
+        result_at_limit = ModuleSnapshot.build(tmp_path)
+        assert result_at_limit is not None
+        assert len(result_at_limit.files) == 2
+        # One more file: should now return None
+        write(tmp_path / "Extra.java")
+        result_over_limit = ModuleSnapshot.build(tmp_path)
+        assert result_over_limit is None
+
 
 # ---------------------------------------------------------------------------
 # TreeDiff
@@ -125,11 +142,10 @@ class TestModuleSnapshotBuild:
 
 class TestTreeDiff:
     def _snap(self, files: dict[str, str]) -> ModuleSnapshot:
-        root_input = "\n".join(f"{p}:{h}" for p, h in sorted(files.items()))
-        import hashlib
-
-        root_hash = hashlib.blake2b(root_input.encode(), digest_size=32).hexdigest()
-        return ModuleSnapshot(root_hash=root_hash, files=files)
+        h = hashlib.blake2b(digest_size=32)
+        for p, fh in sorted(files.items()):
+            h.update(f"{p}:{fh}\n".encode())
+        return ModuleSnapshot(root_hash=h.hexdigest(), files=files)
 
     def test_empty_diff_when_identical(self) -> None:
         snap = self._snap({"Foo.java": "aaa"})
@@ -166,6 +182,8 @@ class TestTreeDiff:
         diff = old.diff(new)
         assert "Baz.java" in diff.all_changed
         assert "Bar.java" not in diff.all_changed  # removed, not added/modified
+        assert "Bar.java" in diff.removed
+        assert "Foo.java" in diff.removed
 
     def test_has_build_file_changes_pom(self) -> None:
         old = self._snap({"pom.xml": "v1"})
@@ -176,6 +194,12 @@ class TestTreeDiff:
     def test_has_build_file_changes_gradle(self) -> None:
         old = self._snap({"build.gradle": "v1"})
         new = self._snap({"build.gradle": "v2"})
+        diff = old.diff(new)
+        assert diff.has_build_file_changes
+
+    def test_has_build_file_changes_gradle_kts(self) -> None:
+        old = self._snap({"build.gradle.kts": "v1"})
+        new = self._snap({"build.gradle.kts": "v2"})
         diff = old.diff(new)
         assert diff.has_build_file_changes
 
