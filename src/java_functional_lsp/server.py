@@ -12,6 +12,7 @@ import logging
 import os
 import re
 import sys
+from collections.abc import Coroutine
 from pathlib import Path
 from typing import Any
 
@@ -28,7 +29,7 @@ from .analyzers.mutation_checker import MutationChecker
 from .analyzers.null_checker import NullChecker
 from .analyzers.spring_checker import SpringChecker
 from .fixes import get_fix, get_fix_registry_keys
-from .proxy import JdtlsProxy, _resolve_module_uri
+from .proxy import JdtlsProxy, _module_snapshot_path, _resolve_module_uri
 
 logger = logging.getLogger(__name__)
 
@@ -75,18 +76,26 @@ class JavaFunctionalLspServer(LanguageServer):
         self._skip_jdtls_registration: bool = False
         self._init_generation: int = 0
 
-    def _on_jdtls_diagnostics(self, uri: str, diagnostics: list[Any]) -> None:
+    def _on_jdtls_diagnostics(self, uri: str, _diagnostics: list[Any]) -> None:
         """Called when jdtls publishes diagnostics — merge with custom and re-publish.
 
         Also marks the file's module as READY, since receiving diagnostics from
         jdtls is a reliable signal that the module has been indexed (more reliable
         than a first non-None response which may be semantically empty).
+
+        When a module transitions to READY, fires ``_apply_module_diff`` to
+        notify jdtls about any externally changed files (e.g., after git pull).
         """
         if not uri.endswith(".java"):
             return
         module_uri = _resolve_module_uri(uri)
         if module_uri:
+            already_ready = self._proxy.modules.is_ready(module_uri)
             self._proxy.modules.mark_ready(module_uri)
+            if not already_ready:
+                # First READY transition only — subsequent diagnostics for the same
+                # module are no-ops to avoid spawning O(files) redundant tasks.
+                _fire_and_forget(_apply_module_diff(self._proxy, module_uri))
         try:
             _analyze_and_publish(uri)
         except Exception as e:
@@ -100,6 +109,72 @@ _pending: dict[str, asyncio.Task[None]] = {}
 # Background tasks (prevent GC of fire-and-forget tasks)
 _bg_tasks: set[asyncio.Task[None]] = set()
 _DEBOUNCE_SECONDS = 0.15
+
+
+def _fire_and_forget(coro: Coroutine[Any, Any, Any]) -> None:
+    """Schedule *coro* as a background task, preventing GC until it finishes."""
+    task = asyncio.create_task(coro)
+    _bg_tasks.add(task)
+    task.add_done_callback(_bg_tasks.discard)
+
+
+async def _apply_module_diff(proxy: JdtlsProxy, module_uri: str) -> None:
+    """Send ``workspace/didChangeWatchedFiles`` for externally changed files.
+
+    Called (fire-and-forget) when a module reaches READY state.  Pops the
+    ``(diff, snapshot)`` pair computed by ``_kick_module_diff`` during module
+    registration, notifies jdtls about changed files so it can do an
+    incremental rebuild, then persists the updated snapshot to disk.
+
+    No-ops if the diff computation is not yet finished or found no changes.
+    """
+    data = proxy.pop_module_data(module_uri)
+    if data is None:
+        # Race guard: READY may fire before _kick_module_diff finishes.
+        # Await the in-flight task directly (no arbitrary sleep).
+        await proxy.await_module_diff(module_uri)
+        data = proxy.pop_module_data(module_uri)
+    if data is None:
+        return
+    diff, current_snapshot = data
+
+    if diff is not None and not diff.is_empty:
+        from pygls.uris import from_fs_path, to_fs_path
+
+        module_fs = to_fs_path(module_uri) or ""
+        if module_fs:
+            module_path = Path(module_fs)
+            changes = (
+                [
+                    {"uri": u, "type": lsp.FileChangeType.Created}
+                    for rel in diff.added
+                    if (u := from_fs_path(str(module_path / rel)))
+                ]
+                + [
+                    {"uri": u, "type": lsp.FileChangeType.Changed}
+                    for rel in diff.modified
+                    if (u := from_fs_path(str(module_path / rel)))
+                ]
+                + [
+                    {"uri": u, "type": lsp.FileChangeType.Deleted}
+                    for rel in diff.removed
+                    if (u := from_fs_path(str(module_path / rel)))
+                ]
+            )
+            if changes:
+                await proxy.send_notification("workspace/didChangeWatchedFiles", {"changes": changes})
+                logger.info(
+                    "merkle: notified jdtls of %d externally changed file(s) in module",
+                    len(changes),
+                )
+
+    # Always persist the current snapshot so next session has an up-to-date baseline.
+    snapshot_path = _module_snapshot_path(module_uri)
+    loop = asyncio.get_running_loop()
+    try:
+        await loop.run_in_executor(None, current_snapshot.save, snapshot_path)
+    except OSError as exc:
+        logger.warning("merkle: could not save updated snapshot: %s", exc)
 
 
 def _handle_exception(exc_type: type[BaseException], exc_value: BaseException, exc_tb: Any) -> None:
@@ -342,7 +417,7 @@ def on_initialize(params: lsp.InitializeParams) -> lsp.InitializeResult:
 
 
 @server.feature(lsp.INITIALIZED)
-async def on_initialized(params: lsp.InitializedParams) -> None:
+async def on_initialized(_params: lsp.InitializedParams) -> None:
     """Check jdtls availability; actual start deferred to first didOpen."""
     logger.info(
         "java-functional-lsp initialized (rules: %s)",
@@ -451,9 +526,7 @@ def _forward_or_queue(method: str, serialized: Any) -> None:
     if server._skip_jdtls:
         return
     if server._proxy.is_available:
-        task = asyncio.create_task(server._proxy.send_notification(method, serialized))
-        _bg_tasks.add(task)
-        task.add_done_callback(_bg_tasks.discard)
+        _fire_and_forget(server._proxy.send_notification(method, serialized))
     elif server._proxy._lazy_start_fired and not server._proxy._start_failed:
         server._proxy.queue_notification(method, serialized)
 
@@ -483,9 +556,7 @@ async def on_did_open(params: lsp.DidOpenTextDocumentParams) -> None:
         if not server._proxy._lazy_start_fired:
             # First file: kick off lazy start in background.
             server._proxy._lazy_start_fired = True
-            task = asyncio.create_task(_lazy_start_jdtls(uri))
-            _bg_tasks.add(task)
-            task.add_done_callback(_bg_tasks.discard)
+            _fire_and_forget(_lazy_start_jdtls(uri))
 
     # Custom diagnostics always publish immediately — never blocked by jdtls.
     try:
@@ -546,20 +617,6 @@ async def _lazy_start_jdtls(file_uri: str) -> None:
             await server._proxy.flush_queued_notifications()
     except Exception:
         logger.warning("jdtls lazy start failed", exc_info=True)
-
-
-async def _expand_workspace_background() -> None:
-    """Background task: expand jdtls workspace to full monorepo root.
-
-    Runs after jdtls finishes initializing with the first module scope.
-    The user's actively-opened modules are loaded immediately via
-    ``add_module_if_new()`` in ``on_did_open``; this adds the full root
-    so cross-module references for unopened files also work.
-    """
-    try:
-        await server._proxy.expand_full_workspace()
-    except Exception:
-        logger.warning("Failed to expand jdtls workspace", exc_info=True)
 
 
 # --- jdtls passthrough handlers (registered dynamically, NOT at module level) ---
