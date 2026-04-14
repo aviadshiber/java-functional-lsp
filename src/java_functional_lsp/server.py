@@ -12,6 +12,7 @@ import logging
 import os
 import re
 import sys
+from collections.abc import Coroutine
 from pathlib import Path
 from typing import Any
 
@@ -91,9 +92,7 @@ class JavaFunctionalLspServer(LanguageServer):
         if module_uri:
             self._proxy.modules.mark_ready(module_uri)
             # Fire-and-forget: apply Merkle diff and save updated snapshot.
-            task = asyncio.create_task(_apply_module_diff(self._proxy, module_uri))
-            _bg_tasks.add(task)
-            task.add_done_callback(_bg_tasks.discard)
+            _fire_and_forget(_apply_module_diff(self._proxy, module_uri))
         try:
             _analyze_and_publish(uri)
         except Exception as e:
@@ -109,6 +108,13 @@ _bg_tasks: set[asyncio.Task[None]] = set()
 _DEBOUNCE_SECONDS = 0.15
 
 
+def _fire_and_forget(coro: Coroutine[Any, Any, Any]) -> None:
+    """Schedule *coro* as a background task, preventing GC until it finishes."""
+    task = asyncio.create_task(coro)
+    _bg_tasks.add(task)
+    task.add_done_callback(_bg_tasks.discard)
+
+
 async def _apply_module_diff(proxy: JdtlsProxy, module_uri: str) -> None:
     """Send ``workspace/didChangeWatchedFiles`` for externally changed files.
 
@@ -121,16 +127,15 @@ async def _apply_module_diff(proxy: JdtlsProxy, module_uri: str) -> None:
     """
     data = proxy.pop_module_data(module_uri)
     if data is None:
-        # Race guard: READY may fire before _kick_module_diff finishes (the
-        # filesystem scan is fast but not instantaneous).  Yield once to give
-        # the executor task a chance to complete and store its result.
-        await asyncio.sleep(0.1)
+        # Race guard: READY may fire before _kick_module_diff finishes.
+        # Await the in-flight task directly (no arbitrary sleep).
+        await proxy.await_module_diff(module_uri)
         data = proxy.pop_module_data(module_uri)
     if data is None:
         return
     diff, current_snapshot = data
 
-    if diff and not diff.is_empty:
+    if diff is not None and not diff.is_empty:
         from pygls.uris import from_fs_path, to_fs_path
 
         module_fs = to_fs_path(module_uri) or ""
@@ -518,9 +523,7 @@ def _forward_or_queue(method: str, serialized: Any) -> None:
     if server._skip_jdtls:
         return
     if server._proxy.is_available:
-        task = asyncio.create_task(server._proxy.send_notification(method, serialized))
-        _bg_tasks.add(task)
-        task.add_done_callback(_bg_tasks.discard)
+        _fire_and_forget(server._proxy.send_notification(method, serialized))
     elif server._proxy._lazy_start_fired and not server._proxy._start_failed:
         server._proxy.queue_notification(method, serialized)
 
@@ -550,9 +553,7 @@ async def on_did_open(params: lsp.DidOpenTextDocumentParams) -> None:
         if not server._proxy._lazy_start_fired:
             # First file: kick off lazy start in background.
             server._proxy._lazy_start_fired = True
-            task = asyncio.create_task(_lazy_start_jdtls(uri))
-            _bg_tasks.add(task)
-            task.add_done_callback(_bg_tasks.discard)
+            _fire_and_forget(_lazy_start_jdtls(uri))
 
     # Custom diagnostics always publish immediately — never blocked by jdtls.
     try:

@@ -19,7 +19,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
-from .merkle import ModuleSnapshot, TreeDiff
+from .merkle import _BUILD_FILES, ModuleSnapshot, TreeDiff
 
 logger = logging.getLogger(__name__)
 
@@ -319,7 +319,6 @@ async def read_message(reader: asyncio.StreamReader) -> dict[str, Any] | None:
         return None
 
 
-_BUILD_FILES = ("pom.xml", "build.gradle", "build.gradle.kts")
 _WORKSPACE_DID_CHANGE_FOLDERS = "workspace/didChangeWorkspaceFolders"
 _MAX_QUEUED_NOTIFICATIONS = 200
 _MODULE_READY_TIMEOUT = 30.0
@@ -432,7 +431,7 @@ def _resolve_module_uri(file_uri: str) -> str | None:
     if module_root is None:
         return None
     module_uri = from_fs_path(module_root)
-    return module_uri or None
+    return module_uri if module_uri else None
 
 
 def _version_key(name: str) -> tuple[int, ...]:
@@ -486,11 +485,8 @@ def _compute_module_diff(
     stored = ModuleSnapshot.load(snapshot_path)
 
     if stored is None:
-        # First session: persist the baseline and signal "nothing to do yet".
-        try:
-            current.save(snapshot_path)
-        except OSError as exc:
-            logger.warning("merkle: could not save initial snapshot: %s", exc)
+        # First session: no diff to compute — caller (_apply_module_diff) will
+        # save the baseline snapshot after the module reaches READY.
         return (None, current)
 
     diff = stored.diff(current)
@@ -590,7 +586,11 @@ class JdtlsProxy:
         # Merkle snapshot diff: module_uri → (diff | None, current_snapshot)
         # Populated by _kick_module_diff (background task on add_module_if_new).
         # Consumed by server._apply_module_diff after module reaches READY.
-        self._pending_module_data: dict[str, tuple[TreeDiff | None, ModuleSnapshot]] = {}
+        self._module_diff_results: dict[str, tuple[TreeDiff | None, ModuleSnapshot]] = {}
+        # Task references for in-flight diff computations, keyed by module_uri.
+        # Allows _apply_module_diff to await the task directly if READY fires
+        # before _kick_module_diff stores its result.
+        self._pending_diff_tasks: dict[str, asyncio.Task[None]] = {}
         # Background tasks created by this proxy (prevents GC of fire-and-forget tasks).
         self._proxy_bg_tasks: set[asyncio.Task[Any]] = set()
 
@@ -789,12 +789,24 @@ class JdtlsProxy:
         """Background task: compute snapshot diff and stash it for later use."""
         loop = asyncio.get_running_loop()
         result = await loop.run_in_executor(None, _compute_module_diff, module_uri)
+        self._pending_diff_tasks.pop(module_uri, None)
         if result is not None:
-            self._pending_module_data[module_uri] = result
+            self._module_diff_results[module_uri] = result
 
     def pop_module_data(self, module_uri: str) -> tuple[TreeDiff | None, ModuleSnapshot] | None:
         """Pop and return stashed ``(diff, snapshot)`` for *module_uri*, or ``None``."""
-        return self._pending_module_data.pop(module_uri, None)
+        return self._module_diff_results.pop(module_uri, None)
+
+    async def await_module_diff(self, module_uri: str) -> None:
+        """Wait for the in-flight diff task for *module_uri* to complete, if any.
+
+        Called when the READY signal fires before ``_kick_module_diff`` has
+        stored its result — awaiting the task directly avoids a time-based
+        sleep and ensures the diff is never silently dropped.
+        """
+        task = self._pending_diff_tasks.pop(module_uri, None)
+        if task is not None and not task.done():
+            await task
 
     async def add_module_if_new(self, file_uri: str) -> str | None:
         """Add the module containing *file_uri* to jdtls if not already added.
@@ -827,6 +839,7 @@ class JdtlsProxy:
         diff_task = asyncio.create_task(self._kick_module_diff(module_uri))
         self._proxy_bg_tasks.add(diff_task)
         diff_task.add_done_callback(self._proxy_bg_tasks.discard)
+        self._pending_diff_tasks[module_uri] = diff_task
         return module_uri
 
     async def expand_full_workspace(self) -> None:
@@ -871,7 +884,8 @@ class JdtlsProxy:
         for task in list(self._proxy_bg_tasks):
             task.cancel()
         self._proxy_bg_tasks.clear()
-        self._pending_module_data.clear()
+        self._module_diff_results.clear()
+        self._pending_diff_tasks.clear()
 
         if self._process and self._process.returncode is None:
             try:

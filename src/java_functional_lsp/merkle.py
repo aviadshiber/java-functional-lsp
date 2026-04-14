@@ -9,6 +9,7 @@ instead of a full cold-start re-index.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import logging
@@ -52,8 +53,7 @@ class TreeDiff:
     @property
     def has_build_file_changes(self) -> bool:
         """True if any build file (pom.xml, build.gradle, …) changed."""
-        all_changed = self.added | self.modified | self.removed
-        return any(Path(p).name in _BUILD_FILES for p in all_changed)
+        return any(Path(p).name in _BUILD_FILES for bucket in (self.added, self.modified, self.removed) for p in bucket)
 
     @property
     def all_changed(self) -> frozenset[str]:
@@ -120,8 +120,8 @@ class ModuleSnapshot:
         """Return what changed between *self* (old) and *newer* (current)."""
         old = self.files
         new = newer.files
-        added = frozenset(new) - frozenset(old)
-        removed = frozenset(old) - frozenset(new)
+        added = frozenset(new.keys() - old.keys())
+        removed = frozenset(old.keys() - new.keys())
         modified = frozenset(p for p in old.keys() & new.keys() if old[p] != new[p])
         return TreeDiff(added=added, modified=modified, removed=removed)
 
@@ -139,16 +139,12 @@ class ModuleSnapshot:
         payload = json.dumps({"root": self.root_hash, "files": self.files}, separators=(",", ":"))
         fd, tmp = tempfile.mkstemp(dir=path.parent, suffix=".tmp")
         try:
-            try:
-                os.write(fd, payload.encode())
-            finally:
-                os.close(fd)
+            with os.fdopen(fd, "wb") as fh:
+                fh.write(payload.encode())
             os.replace(tmp, path)
         except Exception:
-            try:
+            with contextlib.suppress(OSError):
                 os.unlink(tmp)
-            except OSError:
-                pass
             raise
 
     @classmethod
@@ -177,7 +173,7 @@ class ModuleSnapshot:
                 for k, v in files.items()
             )
             return cls(root_hash=root_hash, files=files) if valid else None
-        except (OSError, KeyError, json.JSONDecodeError, ValueError):
+        except (OSError, KeyError, ValueError):
             return None
 
 
@@ -196,7 +192,7 @@ def _iter_tracked_files(module_root: Path) -> Iterator[Path]:
     """
     module_resolved = module_root.resolve()
 
-    for dirpath_str, dirnames, filenames in os.walk(str(module_root), followlinks=False):
+    for dirpath_str, dirnames, filenames in os.walk(module_root, followlinks=False):
         # Prune skip dirs in-place to stop os.walk from descending into them.
         dirnames[:] = [d for d in dirnames if d not in _SKIP_DIRS]
 
