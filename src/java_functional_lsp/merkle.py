@@ -139,8 +139,10 @@ class ModuleSnapshot:
         payload = json.dumps({"root": self.root_hash, "files": self.files}, separators=(",", ":"))
         fd, tmp = tempfile.mkstemp(dir=path.parent, suffix=".tmp")
         try:
-            os.write(fd, payload.encode())
-            os.close(fd)
+            try:
+                os.write(fd, payload.encode())
+            finally:
+                os.close(fd)
             os.replace(tmp, path)
         except Exception:
             try:

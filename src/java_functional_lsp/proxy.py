@@ -871,6 +871,7 @@ class JdtlsProxy:
         for task in list(self._proxy_bg_tasks):
             task.cancel()
         self._proxy_bg_tasks.clear()
+        self._pending_module_data.clear()
 
         if self._process and self._process.returncode is None:
             try:

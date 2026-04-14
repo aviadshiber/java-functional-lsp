@@ -121,6 +121,12 @@ async def _apply_module_diff(proxy: JdtlsProxy, module_uri: str) -> None:
     """
     data = proxy.pop_module_data(module_uri)
     if data is None:
+        # Race guard: READY may fire before _kick_module_diff finishes (the
+        # filesystem scan is fast but not instantaneous).  Yield once to give
+        # the executor task a chance to complete and store its result.
+        await asyncio.sleep(0.1)
+        data = proxy.pop_module_data(module_uri)
+    if data is None:
         return
     diff, current_snapshot = data
 
@@ -129,13 +135,29 @@ async def _apply_module_diff(proxy: JdtlsProxy, module_uri: str) -> None:
 
         module_fs = to_fs_path(module_uri) or ""
         if module_fs:
-            changed_uris = [uri for rel in diff.all_changed if (uri := from_fs_path(str(Path(module_fs) / rel)))]
-            if changed_uris:
-                changes = [{"uri": u, "type": lsp.FileChangeType.Changed} for u in changed_uris]
+            module_path = Path(module_fs)
+            changes = (
+                [
+                    {"uri": u, "type": lsp.FileChangeType.Created}
+                    for rel in diff.added
+                    if (u := from_fs_path(str(module_path / rel)))
+                ]
+                + [
+                    {"uri": u, "type": lsp.FileChangeType.Changed}
+                    for rel in diff.modified
+                    if (u := from_fs_path(str(module_path / rel)))
+                ]
+                + [
+                    {"uri": u, "type": lsp.FileChangeType.Deleted}
+                    for rel in diff.removed
+                    if (u := from_fs_path(str(module_path / rel)))
+                ]
+            )
+            if changes:
                 await proxy.send_notification("workspace/didChangeWatchedFiles", {"changes": changes})
                 logger.info(
                     "merkle: notified jdtls of %d externally changed file(s) in module",
-                    len(changed_uris),
+                    len(changes),
                 )
 
     # Always persist the current snapshot so next session has an up-to-date baseline.
@@ -387,7 +409,7 @@ def on_initialize(params: lsp.InitializeParams) -> lsp.InitializeResult:
 
 
 @server.feature(lsp.INITIALIZED)
-async def on_initialized(params: lsp.InitializedParams) -> None:
+async def on_initialized(_params: lsp.InitializedParams) -> None:
     """Check jdtls availability; actual start deferred to first didOpen."""
     logger.info(
         "java-functional-lsp initialized (rules: %s)",
@@ -591,20 +613,6 @@ async def _lazy_start_jdtls(file_uri: str) -> None:
             await server._proxy.flush_queued_notifications()
     except Exception:
         logger.warning("jdtls lazy start failed", exc_info=True)
-
-
-async def _expand_workspace_background() -> None:
-    """Background task: expand jdtls workspace to full monorepo root.
-
-    Runs after jdtls finishes initializing with the first module scope.
-    The user's actively-opened modules are loaded immediately via
-    ``add_module_if_new()`` in ``on_did_open``; this adds the full root
-    so cross-module references for unopened files also work.
-    """
-    try:
-        await server._proxy.expand_full_workspace()
-    except Exception:
-        logger.warning("Failed to expand jdtls workspace", exc_info=True)
 
 
 # --- jdtls passthrough handlers (registered dynamically, NOT at module level) ---
