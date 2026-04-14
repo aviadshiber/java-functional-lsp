@@ -28,7 +28,7 @@ from .analyzers.mutation_checker import MutationChecker
 from .analyzers.null_checker import NullChecker
 from .analyzers.spring_checker import SpringChecker
 from .fixes import get_fix, get_fix_registry_keys
-from .proxy import JdtlsProxy, _resolve_module_uri
+from .proxy import JdtlsProxy, _module_snapshot_path, _resolve_module_uri
 
 logger = logging.getLogger(__name__)
 
@@ -75,18 +75,25 @@ class JavaFunctionalLspServer(LanguageServer):
         self._skip_jdtls_registration: bool = False
         self._init_generation: int = 0
 
-    def _on_jdtls_diagnostics(self, uri: str, diagnostics: list[Any]) -> None:
+    def _on_jdtls_diagnostics(self, uri: str, _diagnostics: list[Any]) -> None:
         """Called when jdtls publishes diagnostics — merge with custom and re-publish.
 
         Also marks the file's module as READY, since receiving diagnostics from
         jdtls is a reliable signal that the module has been indexed (more reliable
         than a first non-None response which may be semantically empty).
+
+        When a module transitions to READY, fires ``_apply_module_diff`` to
+        notify jdtls about any externally changed files (e.g., after git pull).
         """
         if not uri.endswith(".java"):
             return
         module_uri = _resolve_module_uri(uri)
         if module_uri:
             self._proxy.modules.mark_ready(module_uri)
+            # Fire-and-forget: apply Merkle diff and save updated snapshot.
+            task = asyncio.create_task(_apply_module_diff(self._proxy, module_uri))
+            _bg_tasks.add(task)
+            task.add_done_callback(_bg_tasks.discard)
         try:
             _analyze_and_publish(uri)
         except Exception as e:
@@ -100,6 +107,44 @@ _pending: dict[str, asyncio.Task[None]] = {}
 # Background tasks (prevent GC of fire-and-forget tasks)
 _bg_tasks: set[asyncio.Task[None]] = set()
 _DEBOUNCE_SECONDS = 0.15
+
+
+async def _apply_module_diff(proxy: JdtlsProxy, module_uri: str) -> None:
+    """Send ``workspace/didChangeWatchedFiles`` for externally changed files.
+
+    Called (fire-and-forget) when a module reaches READY state.  Pops the
+    ``(diff, snapshot)`` pair computed by ``_kick_module_diff`` during module
+    registration, notifies jdtls about changed files so it can do an
+    incremental rebuild, then persists the updated snapshot to disk.
+
+    No-ops if the diff computation is not yet finished or found no changes.
+    """
+    data = proxy.pop_module_data(module_uri)
+    if data is None:
+        return
+    diff, current_snapshot = data
+
+    if diff and not diff.is_empty:
+        from pygls.uris import from_fs_path, to_fs_path
+
+        module_fs = to_fs_path(module_uri) or ""
+        if module_fs:
+            changed_uris = [uri for rel in diff.all_changed if (uri := from_fs_path(str(Path(module_fs) / rel)))]
+            if changed_uris:
+                changes = [{"uri": u, "type": lsp.FileChangeType.Changed} for u in changed_uris]
+                await proxy.send_notification("workspace/didChangeWatchedFiles", {"changes": changes})
+                logger.info(
+                    "merkle: notified jdtls of %d externally changed file(s) in module",
+                    len(changed_uris),
+                )
+
+    # Always persist the current snapshot so next session has an up-to-date baseline.
+    snapshot_path = _module_snapshot_path(module_uri)
+    loop = asyncio.get_running_loop()
+    try:
+        await loop.run_in_executor(None, current_snapshot.save, snapshot_path)
+    except OSError as exc:
+        logger.warning("merkle: could not save updated snapshot: %s", exc)
 
 
 def _handle_exception(exc_type: type[BaseException], exc_value: BaseException, exc_tb: Any) -> None:

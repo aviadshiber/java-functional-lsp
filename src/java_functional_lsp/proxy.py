@@ -19,6 +19,8 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
+from .merkle import ModuleSnapshot, TreeDiff
+
 logger = logging.getLogger(__name__)
 
 REQUEST_TIMEOUT = 30.0  # seconds — per-request timeout for normal operations
@@ -444,6 +446,57 @@ def _version_key(name: str) -> tuple[int, ...]:
     return tuple(parts)
 
 
+def _module_snapshot_path(module_uri: str) -> Path:
+    """Return the path for the persistent snapshot file for *module_uri*.
+
+    Snapshots live under ``~/.cache/jdtls-snapshots/`` — separate from the
+    jdtls data-dir tree so they survive version-bump cache wipes.
+    Each module gets a 12-char BLAKE2b subdirectory (6-byte digest).
+    """
+    h = hashlib.blake2b(module_uri.encode(), digest_size=6).hexdigest()
+    return Path.home() / ".cache" / "jdtls-snapshots" / h / ".snapshot.json"
+
+
+def _compute_module_diff(
+    module_uri: str,
+) -> tuple[TreeDiff | None, ModuleSnapshot] | None:
+    """Blocking: build current snapshot and diff against stored one.
+
+    Returns ``(diff, current_snapshot)`` or ``None`` on error / size limit.
+    ``diff`` is ``None`` when there is no stored snapshot (first session) or
+    the snapshots are identical — the caller should still save the snapshot in
+    both cases.
+
+    Intended to run inside a thread-pool executor.
+    """
+    from pygls.uris import to_fs_path
+
+    module_fs = to_fs_path(module_uri)
+    if not module_fs:
+        return None
+    module_root = Path(module_fs)
+    if not module_root.is_dir():
+        return None
+
+    current = ModuleSnapshot.build(module_root)
+    if current is None:
+        return None  # file count exceeded limit
+
+    snapshot_path = _module_snapshot_path(module_uri)
+    stored = ModuleSnapshot.load(snapshot_path)
+
+    if stored is None:
+        # First session: persist the baseline and signal "nothing to do yet".
+        try:
+            current.save(snapshot_path)
+        except OSError as exc:
+            logger.warning("merkle: could not save initial snapshot: %s", exc)
+        return (None, current)
+
+    diff = stored.diff(current)
+    return (diff, current)
+
+
 def _clear_cache_on_version_change(cache_root: Path) -> None:
     """Clear jdtls data cache when the server version changes.
 
@@ -534,6 +587,12 @@ class JdtlsProxy:
         self.modules = ModuleRegistry()
         self.has_lombok = False
         self._workspace_expanded = False
+        # Merkle snapshot diff: module_uri → (diff | None, current_snapshot)
+        # Populated by _kick_module_diff (background task on add_module_if_new).
+        # Consumed by server._apply_module_diff after module reaches READY.
+        self._pending_module_data: dict[str, tuple[TreeDiff | None, ModuleSnapshot]] = {}
+        # Background tasks created by this proxy (prevents GC of fire-and-forget tasks).
+        self._proxy_bg_tasks: set[asyncio.Task[Any]] = set()
 
     @property
     def is_available(self) -> bool:
@@ -726,6 +785,17 @@ class JdtlsProxy:
         for method, params in queue:
             await self.send_notification(method, params)
 
+    async def _kick_module_diff(self, module_uri: str) -> None:
+        """Background task: compute snapshot diff and stash it for later use."""
+        loop = asyncio.get_running_loop()
+        result = await loop.run_in_executor(None, _compute_module_diff, module_uri)
+        if result is not None:
+            self._pending_module_data[module_uri] = result
+
+    def pop_module_data(self, module_uri: str) -> tuple[TreeDiff | None, ModuleSnapshot] | None:
+        """Pop and return stashed ``(diff, snapshot)`` for *module_uri*, or ``None``."""
+        return self._pending_module_data.pop(module_uri, None)
+
     async def add_module_if_new(self, file_uri: str) -> str | None:
         """Add the module containing *file_uri* to jdtls if not already added.
 
@@ -751,6 +821,12 @@ class JdtlsProxy:
             _WORKSPACE_DID_CHANGE_FOLDERS,
             {"event": {"added": [{"uri": module_uri, "name": mod_name}], "removed": []}},
         )
+        # Fire-and-forget: compute snapshot diff in background so it is ready
+        # when the module reaches READY state.  Does NOT block the jdtls
+        # readiness timeout (which starts ticking at mark_added above).
+        diff_task = asyncio.create_task(self._kick_module_diff(module_uri))
+        self._proxy_bg_tasks.add(diff_task)
+        diff_task.add_done_callback(self._proxy_bg_tasks.discard)
         return module_uri
 
     async def expand_full_workspace(self) -> None:
@@ -791,6 +867,10 @@ class JdtlsProxy:
             self._reader_task.cancel()
         if self._stderr_task and not self._stderr_task.done():
             self._stderr_task.cancel()
+
+        for task in list(self._proxy_bg_tasks):
+            task.cancel()
+        self._proxy_bg_tasks.clear()
 
         if self._process and self._process.returncode is None:
             try:
