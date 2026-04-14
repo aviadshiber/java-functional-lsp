@@ -1051,7 +1051,7 @@ class TestLazyStart:
         assert proxy._workspace_expanded is True
 
     async def test_expand_full_workspace_removes_initial_module(self) -> None:
-        """When _initial_module_uri differs from root, it should be in the removed list."""
+        """All modules in _states (not just _initial_module_uri) are removed on expansion."""
         from unittest.mock import AsyncMock
 
         from java_functional_lsp.proxy import JdtlsProxy
@@ -1060,13 +1060,17 @@ class TestLazyStart:
         proxy._available = True
         proxy._original_root_uri = "file:///workspace/monorepo"
         proxy._initial_module_uri = "file:///workspace/monorepo/module-a"
+        # Simulate that module-a was mark_added during start() and module-b via add_module_if_new
+        proxy.modules.mark_added("file:///workspace/monorepo/module-a")
+        proxy.modules.mark_added("file:///workspace/monorepo/module-b")
         proxy.send_notification = AsyncMock()  # type: ignore[assignment]
         await proxy.expand_full_workspace()
         proxy.send_notification.assert_called_once()  # type: ignore[attr-defined]
         call_args = proxy.send_notification.call_args[0]  # type: ignore[attr-defined]
         event = call_args[1]["event"]
-        assert len(event["removed"]) == 1
-        assert event["removed"][0]["uri"] == "file:///workspace/monorepo/module-a"
+        removed_uris = {e["uri"] for e in event["removed"]}
+        assert "file:///workspace/monorepo/module-a" in removed_uris
+        assert "file:///workspace/monorepo/module-b" in removed_uris
         assert event["added"][0]["uri"] == "file:///workspace/monorepo"
 
     async def test_expand_full_workspace_noop_when_not_available(self) -> None:

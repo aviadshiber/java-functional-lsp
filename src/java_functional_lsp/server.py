@@ -98,6 +98,8 @@ class JavaFunctionalLspServer(LanguageServer):
                 _fire_and_forget(_apply_module_diff(self._proxy, module_uri))
         try:
             _analyze_and_publish(uri)
+        except FileNotFoundError:
+            pass  # Virtual jdtls file (e.g., decompiled source in jdtls-data); skip silently.
         except Exception as e:
             logger.error("Error re-publishing diagnostics for %s: %s", uri, e)
 
@@ -602,14 +604,21 @@ async def _lazy_start_jdtls(file_uri: str) -> None:
     """Background task: start jdtls scoped to the module containing *file_uri*.
 
     Runs in the background so ``on_did_open`` returns immediately with custom
-    diagnostics. After jdtls initializes, registers capabilities and flushes
-    queued notifications. Workspace expansion is NOT done eagerly — modules
-    are loaded on-demand via ``add_module_if_new()`` as files are opened.
+    diagnostics.  After jdtls initializes, the workspace is immediately expanded
+    to the full IDE workspace root (inside-out) so jdtls discovers all sibling
+    modules before any queued ``didOpen`` notifications are flushed.  This means
+    ``add_module_if_new`` is a no-op for all subsequent file opens — jdtls
+    already covers the whole project.
     """
     try:
         started = await server._proxy.ensure_started(server._init_params, file_uri, config=server._config)
         if started:
             logger.info("jdtls proxy active — full Java language support enabled")
+            # Expand to full workspace BEFORE flushing queued notifications so
+            # all files are processed in the full-workspace context (inside-out).
+            # expand_full_workspace is a no-op for standalone projects where
+            # the workspace root equals the initial module.
+            await server._proxy.expand_full_workspace()
             if server._skip_jdtls_registration:
                 logger.info("Skipping dynamic capability registration (no-register mode)")
             else:

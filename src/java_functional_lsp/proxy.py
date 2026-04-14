@@ -777,6 +777,11 @@ class JdtlsProxy:
         Uses a ``deque(maxlen=200)`` so oldest entries are dropped in O(1)
         when the queue overflows during long jdtls startup.
         """
+        if len(self._queued_notifications) >= _MAX_QUEUED_NOTIFICATIONS:
+            logger.warning(
+                "jdtls: notification queue full (%d cap) — oldest entry dropped; some didOpen events may be missed",
+                _MAX_QUEUED_NOTIFICATIONS,
+            )
         self._queued_notifications.append((method, params))
 
     async def flush_queued_notifications(self) -> None:
@@ -832,7 +837,7 @@ class JdtlsProxy:
         Calls ``modules.mark_added()`` before any ``await`` to prevent
         duplicate add calls from concurrent coroutines.
         """
-        if not self._available:
+        if not self._available or self._workspace_expanded:
             return None
         module_uri = _resolve_module_uri(file_uri)
         if module_uri is None or self.modules.was_added(module_uri):
@@ -873,11 +878,14 @@ class JdtlsProxy:
             return
         self.modules.mark_added(root_uri)
 
-        # Remove initial module folder to avoid double-indexing.
+        # Remove ALL individually-added modules to prevent double-indexing with
+        # the full root.  This covers both the initial scoped module and any
+        # modules added by add_module_if_new during the ensure_started window.
         removed: list[dict[str, str]] = []
-        if self._initial_module_uri and self._initial_module_uri != root_uri:
-            ini_path = to_fs_path(self._initial_module_uri) or self._initial_module_uri
-            removed.append({"uri": self._initial_module_uri, "name": Path(ini_path).name})
+        for uri in list(self.modules._states):
+            if uri != root_uri:
+                p = to_fs_path(uri) or uri
+                removed.append({"uri": uri, "name": Path(p).name})
 
         logger.info("jdtls: expanding to full workspace %s", _redact_path(root_path))
         await self.send_notification(
