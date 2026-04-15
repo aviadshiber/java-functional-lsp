@@ -530,6 +530,22 @@ def _compute_module_diff(
     return (diff, current)
 
 
+def _wipe_data_dir(data_dir: Path) -> None:
+    """Remove *data_dir* so the next jdtls startup gets a clean cold start.
+
+    Called after an initialize timeout to recover from a corrupted OSGi
+    data-dir (e.g. left behind after an OOM crash).
+    """
+    shutil.rmtree(data_dir, ignore_errors=True)
+    if data_dir.exists():
+        logger.warning(
+            "jdtls: failed to wipe data-dir %s — next retry may hang again",
+            _redact_path(str(data_dir)),
+        )
+    else:
+        logger.info("jdtls: wiped data-dir %s after init timeout", _redact_path(str(data_dir)))
+
+
 def _clear_cache_on_version_change(cache_root: Path) -> None:
     """Clear jdtls data cache when the server version changes.
 
@@ -747,6 +763,7 @@ class JdtlsProxy:
             if result is None:
                 logger.error("jdtls initialize request failed or timed out")
                 await self.stop()
+                await asyncio.get_running_loop().run_in_executor(None, _wipe_data_dir, data_dir)
                 return False
 
             self._jdtls_capabilities = result.get("capabilities", {})

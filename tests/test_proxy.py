@@ -851,6 +851,7 @@ class TestStartPassesEnvToSubprocess:
             patch.object(JdtlsProxy, "_stderr_reader", side_effect=fake_stderr_reader),
             patch.object(JdtlsProxy, "send_request", side_effect=fake_send_request),
             patch.object(JdtlsProxy, "stop", side_effect=lambda: None),
+            patch.object(proxy_mod, "_wipe_data_dir"),  # avoid blocking rmtree in tests
         ):
             ok = await proxy.start({"rootUri": f"file://{tmp_path}"})
 
@@ -858,6 +859,67 @@ class TestStartPassesEnvToSubprocess:
         assert ok is False
         # The crucial assertion: env= was passed through to the subprocess call.
         assert captured["env"] == sentinel_env
+
+    @pytest.mark.asyncio
+    async def test_wipe_runs_in_executor_on_init_timeout(self, tmp_path: Any) -> None:
+        """_wipe_data_dir must be dispatched via run_in_executor to avoid blocking the event loop."""
+        from unittest.mock import patch
+
+        import java_functional_lsp.proxy as proxy_mod
+
+        proxy = JdtlsProxy()
+        proxy._jdtls_on_path = True
+
+        fake_process = MagicMock()
+        fake_process.pid = 99999
+        fake_process.stdout = MagicMock()
+        fake_process.stderr = MagicMock()
+        fake_process.returncode = 0
+
+        async def fake_wait() -> int:
+            return 0
+
+        fake_process.wait = fake_wait
+
+        async def fake_create_subprocess(*_a: Any, **_kw: Any) -> Any:
+            return fake_process
+
+        async def fake_reader_loop(_: Any) -> None:
+            return None
+
+        async def fake_stderr_reader(_: Any) -> None:
+            return None
+
+        async def fake_send_request(*_a: Any, **_kw: Any) -> None:
+            return None  # simulate initialize timeout
+
+        wipe_calls: list[Any] = []
+
+        async def fake_run_in_executor(_executor: Any, fn: Any, *args: Any) -> Any:
+            if fn is proxy_mod._wipe_data_dir:
+                wipe_calls.append((fn, args))
+                return None
+            # Other blocking calls (e.g. _blocking_startup) must run for real
+            return fn(*args)
+
+        fake_loop = MagicMock()
+        fake_loop.run_in_executor = fake_run_in_executor
+
+        with (
+            patch.object(proxy_mod.shutil, "which", return_value="/fake/jdtls"),
+            patch.object(proxy_mod, "build_jdtls_env", return_value={}),
+            patch.object(proxy_mod.asyncio, "create_subprocess_exec", side_effect=fake_create_subprocess),
+            patch.object(JdtlsProxy, "_reader_loop", side_effect=fake_reader_loop),
+            patch.object(JdtlsProxy, "_stderr_reader", side_effect=fake_stderr_reader),
+            patch.object(JdtlsProxy, "send_request", side_effect=fake_send_request),
+            patch.object(JdtlsProxy, "stop", side_effect=lambda: None),
+            patch("java_functional_lsp.proxy.asyncio.get_running_loop", return_value=fake_loop),
+        ):
+            ok = await proxy.start({"rootUri": f"file://{tmp_path}"})
+
+        assert ok is False
+        assert len(wipe_calls) == 1
+        assert wipe_calls[0][0] is proxy_mod._wipe_data_dir
 
 
 class TestFindModuleRoot:
@@ -1167,7 +1229,8 @@ class TestLazyStart:
         proxy._jdtls_on_path = True
         captured: dict[str, Any] = {}
 
-        async def capturing_start(params: Any, *, module_root_uri: str | None = None, config: Any = None) -> bool:
+        async def capturing_start(_params: Any, *, module_root_uri: str | None = None, config: Any = None) -> bool:
+            _ = config
             captured["module_root_uri"] = module_root_uri
             return False
 
@@ -1191,7 +1254,8 @@ class TestLazyStart:
 
         captured: dict[str, Any] = {}
 
-        async def capturing_start(params: Any, *, module_root_uri: str | None = None, config: Any = None) -> bool:
+        async def capturing_start(_params: Any, *, module_root_uri: str | None = None, config: Any = None) -> bool:
+            _ = config
             captured["module_root_uri"] = module_root_uri
             return False
 
@@ -1215,3 +1279,58 @@ class TestLazyStart:
         module_root = "file:///workspace/monorepo/module-a"
         module_hash = hashlib.sha256(module_root.encode()).hexdigest()[:12]
         assert expected_hash != module_hash
+
+
+# ---------------------------------------------------------------------------
+# _wipe_data_dir
+# ---------------------------------------------------------------------------
+
+
+class TestWipeDataDir:
+    def test_wipe_removes_directory(self, tmp_path: Path) -> None:
+        """Directory is removed and info is logged."""
+        from java_functional_lsp.proxy import _wipe_data_dir
+
+        data_dir = tmp_path / "data"
+        data_dir.mkdir()
+        (data_dir / "some_file.dat").write_text("x")
+
+        _wipe_data_dir(data_dir)
+
+        assert not data_dir.exists()
+
+    def test_wipe_logs_warning_when_removal_fails(self, tmp_path: Path) -> None:
+        """Warning is logged when rmtree silently fails (dir still present)."""
+        from unittest.mock import patch
+
+        from java_functional_lsp.proxy import _wipe_data_dir
+
+        data_dir = tmp_path / "data"
+        data_dir.mkdir()
+
+        with patch("shutil.rmtree"):  # no-op — dir remains
+            with patch("java_functional_lsp.proxy.logger") as mock_logger:
+                _wipe_data_dir(data_dir)
+                mock_logger.warning.assert_called_once()
+                # info must NOT be called when wipe failed
+                mock_logger.info.assert_not_called()
+
+    def test_wipe_logs_info_on_success(self, tmp_path: Path) -> None:
+        """Info is logged (not warning) when directory is successfully removed."""
+        from unittest.mock import patch
+
+        from java_functional_lsp.proxy import _wipe_data_dir
+
+        data_dir = tmp_path / "data"
+        data_dir.mkdir()
+
+        with patch("java_functional_lsp.proxy.logger") as mock_logger:
+            _wipe_data_dir(data_dir)
+            mock_logger.info.assert_called_once()
+            mock_logger.warning.assert_not_called()
+
+    def test_wipe_nonexistent_dir_does_not_raise(self, tmp_path: Path) -> None:
+        """Calling wipe on a non-existent dir is safe."""
+        from java_functional_lsp.proxy import _wipe_data_dir
+
+        _wipe_data_dir(tmp_path / "ghost")  # should not raise
