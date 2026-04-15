@@ -448,16 +448,25 @@ def _version_key(name: str) -> tuple[int, ...]:
 def _find_maven_group_root(initial_module: Path, workspace_root: Path) -> Path:
     """Return the tightest Maven multi-module parent of *initial_module*.
 
-    Walks up from ``initial_module.parent`` toward (and including)
-    ``workspace_root``, returning the first ancestor whose ``pom.xml``
-    contains a ``<modules>`` section.  Falls back to ``workspace_root`` when
-    no such intermediate parent exists (e.g. flat single-level monorepos).
+    Walks up from ``initial_module.parent`` (the module itself is skipped —
+    we want its *parent* group, not the module's own pom) toward (and
+    including) ``workspace_root``, returning the first ancestor whose
+    ``pom.xml`` contains a ``<modules>`` section.  Falls back to
+    ``workspace_root`` when no such intermediate parent exists (e.g. flat
+    single-level monorepos).
 
     This keeps the jdtls index bounded to a module *group* (typically
     5-20 modules) rather than the full IDE workspace (potentially 200+ modules)
     which would cause ``OutOfMemoryError: Java heap space`` during indexing.
+
+    Both *initial_module* and *workspace_root* are resolved to real paths
+    before walking to avoid symlink-based boundary escapes.
     """
-    current = initial_module.parent
+    workspace_root = workspace_root.resolve()
+    current = initial_module.resolve().parent
+    # Bail immediately if the initial module is outside the workspace.
+    if not current.is_relative_to(workspace_root):
+        return workspace_root
     while True:
         pom = current / "pom.xml"
         if pom.is_file():
@@ -911,12 +920,12 @@ class JdtlsProxy:
         workspace_path = to_fs_path(self._original_root_uri) or self._original_root_uri
 
         # Find the tightest multi-module Maven parent of the initial module.
-        expansion_path: str = workspace_path
+        group_root_path: str = workspace_path
         if self._initial_module_uri:
             initial_path = to_fs_path(self._initial_module_uri) or self._initial_module_uri
-            expansion_path = str(_find_maven_group_root(Path(initial_path), Path(workspace_path)))
+            group_root_path = str(_find_maven_group_root(Path(initial_path), Path(workspace_path)))
 
-        root_path = expansion_path
+        root_path = group_root_path
         root_uri = from_fs_path(root_path) or self._original_root_uri
         if self.modules.was_added(root_uri):
             self._workspace_expanded = True
