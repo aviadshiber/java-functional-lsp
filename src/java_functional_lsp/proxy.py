@@ -448,12 +448,12 @@ def _version_key(name: str) -> tuple[int, ...]:
 def _find_maven_group_root(initial_module: Path, workspace_root: Path) -> Path:
     """Return the tightest Maven multi-module parent of *initial_module*.
 
-    Walks up from ``initial_module.parent`` (the module itself is skipped —
-    we want its *parent* group, not the module's own pom) toward (and
-    including) ``workspace_root``, returning the first ancestor whose
-    ``pom.xml`` contains a ``<modules>`` section.  Falls back to
-    ``workspace_root`` when no such intermediate parent exists (e.g. flat
-    single-level monorepos).
+    Walks up from ``initial_module.parent`` toward (but NOT including)
+    ``workspace_root``, returning the first ancestor whose ``pom.xml``
+    contains a ``<modules>`` section.  Falls back to ``initial_module``
+    itself when no intermediate group pom exists (e.g. modules that sit
+    directly under ``workspace_root``), keeping the scope as tight as
+    possible and avoiding accidental full-monorepo indexing.
 
     This keeps the jdtls index bounded to a module *group* (typically
     5-20 modules) rather than the full IDE workspace (potentially 200+ modules)
@@ -463,11 +463,16 @@ def _find_maven_group_root(initial_module: Path, workspace_root: Path) -> Path:
     before walking to avoid symlink-based boundary escapes.
     """
     workspace_root = workspace_root.resolve()
-    current = initial_module.resolve().parent
+    resolved_module = initial_module.resolve()
+    current = resolved_module.parent
     # Bail immediately if the initial module is outside the workspace.
     if not current.is_relative_to(workspace_root):
         return workspace_root
-    while True:
+    # Walk up to (but NOT including) workspace_root.  Inspecting workspace_root's
+    # own pom.xml would include the entire monorepo (e.g. 200+ modules) which
+    # causes OOM.  For flat modules that live directly under workspace_root there
+    # is no intermediate group; fall back to the initial module itself.
+    while current not in (workspace_root, current.parent):
         pom = current / "pom.xml"
         if pom.is_file():
             try:
@@ -475,10 +480,9 @@ def _find_maven_group_root(initial_module: Path, workspace_root: Path) -> Path:
                     return current
             except OSError:
                 pass
-        if current in (workspace_root, current.parent):
-            break
         current = current.parent
-    return workspace_root
+    # No intermediate group found — use the initial module as its own scope.
+    return resolved_module
 
 
 @lru_cache(maxsize=256)

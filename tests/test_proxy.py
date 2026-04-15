@@ -1131,17 +1131,24 @@ class TestLazyStart:
         assert event["added"][0]["uri"] == group.as_uri()
         assert event["added"][0]["uri"] != workspace_uri
 
-    async def test_expand_falls_back_to_workspace_root_when_no_group_pom(self, tmp_path: Path) -> None:
-        """Falls back to the IDE workspace root when no intermediate multi-module parent exists."""
+    async def test_expand_noop_for_flat_module_directly_under_workspace(self, tmp_path: Path) -> None:
+        """No notification sent when the initial module IS the group root (flat layout).
+
+        For modules sitting directly under workspace_root with no intermediate group pom,
+        _find_maven_group_root returns the module itself. Since it was already added,
+        expand_full_workspace() is a no-op — which is correct: the scope is already
+        as tight as possible and workspace_root's pom.xml (potentially 200+ modules) is
+        never inspected.
+        """
         from unittest.mock import AsyncMock
 
         from java_functional_lsp.proxy import JdtlsProxy
 
-        # Flat layout: workspace/module — no intermediate pom.xml
+        # Flat layout: workspace/module — no intermediate pom.xml between module and workspace
         workspace = tmp_path / "workspace"
         module = workspace / "module"
         module.mkdir(parents=True)
-        # workspace/pom.xml has <modules>, but there's nothing in between
+        # workspace/pom.xml has <modules>, but the walk stops BEFORE reaching it
         (workspace / "pom.xml").write_text("<project><modules><module>module</module></modules></project>")
 
         module_uri = module.as_uri()
@@ -1155,9 +1162,9 @@ class TestLazyStart:
         proxy.send_notification = AsyncMock()  # type: ignore[assignment]
         await proxy.expand_full_workspace()
 
-        call_args = proxy.send_notification.call_args[0]  # type: ignore[attr-defined]
-        event = call_args[1]["event"]
-        assert event["added"][0]["uri"] == workspace_uri
+        # No notification — module was already added and is already the tightest scope
+        proxy.send_notification.assert_not_called()  # type: ignore[attr-defined]
+        assert proxy._workspace_expanded is True
 
     async def test_expand_full_workspace_sends_notification(self) -> None:
         from unittest.mock import AsyncMock
@@ -1172,28 +1179,43 @@ class TestLazyStart:
         proxy.send_notification.assert_called_once()  # type: ignore[attr-defined]
         assert proxy._workspace_expanded is True
 
-    async def test_expand_full_workspace_removes_initial_module(self) -> None:
-        """All modules in _states (not just _initial_module_uri) are removed on expansion."""
+    async def test_expand_full_workspace_removes_initial_module(self, tmp_path: Path) -> None:
+        """All modules in _states are removed when expanding to an intermediate group root."""
         from unittest.mock import AsyncMock
 
         from java_functional_lsp.proxy import JdtlsProxy
 
+        # Layout: monorepo/group/module-a, monorepo/group/module-b
+        # group/pom.xml has <modules> → group becomes the expansion target
+        monorepo = tmp_path / "monorepo"
+        group = monorepo / "group"
+        module_a = group / "module-a"
+        module_b = group / "module-b"
+        for d in (module_a, module_b):
+            d.mkdir(parents=True)
+        (group / "pom.xml").write_text("<project><modules><module>module-a</module></modules></project>")
+
+        module_a_uri = module_a.as_uri()
+        module_b_uri = module_b.as_uri()
+        monorepo_uri = monorepo.as_uri()
+        group_uri = group.as_uri()
+
         proxy = JdtlsProxy()
         proxy._available = True
-        proxy._original_root_uri = "file:///workspace/monorepo"
-        proxy._initial_module_uri = "file:///workspace/monorepo/module-a"
-        # Simulate that module-a was mark_added during start() and module-b via add_module_if_new
-        proxy.modules.mark_added("file:///workspace/monorepo/module-a")
-        proxy.modules.mark_added("file:///workspace/monorepo/module-b")
+        proxy._original_root_uri = monorepo_uri
+        proxy._initial_module_uri = module_a_uri
+        # Simulate module-a added during start() and module-b via add_module_if_new
+        proxy.modules.mark_added(module_a_uri)
+        proxy.modules.mark_added(module_b_uri)
         proxy.send_notification = AsyncMock()  # type: ignore[assignment]
         await proxy.expand_full_workspace()
         proxy.send_notification.assert_called_once()  # type: ignore[attr-defined]
         call_args = proxy.send_notification.call_args[0]  # type: ignore[attr-defined]
         event = call_args[1]["event"]
         removed_uris = {e["uri"] for e in event["removed"]}
-        assert "file:///workspace/monorepo/module-a" in removed_uris
-        assert "file:///workspace/monorepo/module-b" in removed_uris
-        assert event["added"][0]["uri"] == "file:///workspace/monorepo"
+        assert module_a_uri in removed_uris
+        assert module_b_uri in removed_uris
+        assert event["added"][0]["uri"] == group_uri
 
     async def test_expand_full_workspace_noop_when_not_available(self) -> None:
         from unittest.mock import AsyncMock
