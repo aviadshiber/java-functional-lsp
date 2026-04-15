@@ -1215,3 +1215,58 @@ class TestLazyStart:
         module_root = "file:///workspace/monorepo/module-a"
         module_hash = hashlib.sha256(module_root.encode()).hexdigest()[:12]
         assert expected_hash != module_hash
+
+
+# ---------------------------------------------------------------------------
+# _wipe_data_dir
+# ---------------------------------------------------------------------------
+
+
+class TestWipeDataDir:
+    def test_wipe_removes_directory(self, tmp_path: Path) -> None:
+        """Directory is removed and info is logged."""
+        from java_functional_lsp.proxy import _wipe_data_dir
+
+        data_dir = tmp_path / "data"
+        data_dir.mkdir()
+        (data_dir / "some_file.dat").write_text("x")
+
+        _wipe_data_dir(data_dir)
+
+        assert not data_dir.exists()
+
+    def test_wipe_logs_warning_when_removal_fails(self, tmp_path: Path) -> None:
+        """Warning is logged when rmtree silently fails (dir still present)."""
+        from unittest.mock import patch
+
+        from java_functional_lsp.proxy import _wipe_data_dir
+
+        data_dir = tmp_path / "data"
+        data_dir.mkdir()
+
+        with patch("shutil.rmtree"):  # no-op — dir remains
+            with patch("java_functional_lsp.proxy.logger") as mock_logger:
+                _wipe_data_dir(data_dir)
+                mock_logger.warning.assert_called_once()
+                # info must NOT be called when wipe failed
+                mock_logger.info.assert_not_called()
+
+    def test_wipe_logs_info_on_success(self, tmp_path: Path) -> None:
+        """Info is logged (not warning) when directory is successfully removed."""
+        from unittest.mock import patch
+
+        from java_functional_lsp.proxy import _wipe_data_dir
+
+        data_dir = tmp_path / "data"
+        data_dir.mkdir()
+
+        with patch("java_functional_lsp.proxy.logger") as mock_logger:
+            _wipe_data_dir(data_dir)
+            mock_logger.info.assert_called_once()
+            mock_logger.warning.assert_not_called()
+
+    def test_wipe_nonexistent_dir_does_not_raise(self, tmp_path: Path) -> None:
+        """Calling wipe on a non-existent dir is safe."""
+        from java_functional_lsp.proxy import _wipe_data_dir
+
+        _wipe_data_dir(tmp_path / "ghost")  # should not raise

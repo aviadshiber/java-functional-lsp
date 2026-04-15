@@ -537,7 +537,13 @@ def _wipe_data_dir(data_dir: Path) -> None:
     data-dir (e.g. left behind after an OOM crash).
     """
     shutil.rmtree(data_dir, ignore_errors=True)
-    logger.info("jdtls: wiped data-dir %s after init timeout", _redact_path(str(data_dir)))
+    if data_dir.exists():
+        logger.warning(
+            "jdtls: failed to wipe data-dir %s — next retry may hang again",
+            _redact_path(str(data_dir)),
+        )
+    else:
+        logger.info("jdtls: wiped data-dir %s after init timeout", _redact_path(str(data_dir)))
 
 
 def _clear_cache_on_version_change(cache_root: Path) -> None:
