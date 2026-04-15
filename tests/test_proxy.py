@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import subprocess
+from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock, patch
 
@@ -1036,6 +1037,65 @@ class TestLazyStart:
             assert result1 is not None  # New module URI
             assert result2 is None  # Already known
             assert proxy.send_notification.call_count == 1  # type: ignore[attr-defined]
+
+    async def test_expand_uses_maven_group_root_not_workspace_root(self, tmp_path: Path) -> None:
+        """expand_full_workspace expands to nearest multi-module Maven parent, not the full IDE root."""
+        from unittest.mock import AsyncMock
+
+        from java_functional_lsp.proxy import JdtlsProxy
+
+        # Layout: workspace/group/module  — group/pom.xml has <modules>
+        workspace = tmp_path / "workspace"
+        group = workspace / "group"
+        module = group / "module"
+        module.mkdir(parents=True)
+        (group / "pom.xml").write_text("<project><modules><module>module</module></modules></project>")
+        (workspace / "pom.xml").write_text("<project><modules><module>group</module></modules></project>")
+
+        module_uri = module.as_uri()
+        workspace_uri = workspace.as_uri()
+
+        proxy = JdtlsProxy()
+        proxy._available = True
+        proxy._original_root_uri = workspace_uri
+        proxy._initial_module_uri = module_uri
+        proxy.modules.mark_added(module_uri)
+        proxy.send_notification = AsyncMock()  # type: ignore[assignment]
+        await proxy.expand_full_workspace()
+
+        call_args = proxy.send_notification.call_args[0]  # type: ignore[attr-defined]
+        event = call_args[1]["event"]
+        # Should expand to group/, NOT workspace/
+        assert event["added"][0]["uri"] == group.as_uri()
+        assert event["added"][0]["uri"] != workspace_uri
+
+    async def test_expand_falls_back_to_workspace_root_when_no_group_pom(self, tmp_path: Path) -> None:
+        """Falls back to the IDE workspace root when no intermediate multi-module parent exists."""
+        from unittest.mock import AsyncMock
+
+        from java_functional_lsp.proxy import JdtlsProxy
+
+        # Flat layout: workspace/module — no intermediate pom.xml
+        workspace = tmp_path / "workspace"
+        module = workspace / "module"
+        module.mkdir(parents=True)
+        # workspace/pom.xml has <modules>, but there's nothing in between
+        (workspace / "pom.xml").write_text("<project><modules><module>module</module></modules></project>")
+
+        module_uri = module.as_uri()
+        workspace_uri = workspace.as_uri()
+
+        proxy = JdtlsProxy()
+        proxy._available = True
+        proxy._original_root_uri = workspace_uri
+        proxy._initial_module_uri = module_uri
+        proxy.modules.mark_added(module_uri)
+        proxy.send_notification = AsyncMock()  # type: ignore[assignment]
+        await proxy.expand_full_workspace()
+
+        call_args = proxy.send_notification.call_args[0]  # type: ignore[attr-defined]
+        event = call_args[1]["event"]
+        assert event["added"][0]["uri"] == workspace_uri
 
     async def test_expand_full_workspace_sends_notification(self) -> None:
         from unittest.mock import AsyncMock

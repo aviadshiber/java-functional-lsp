@@ -445,6 +445,42 @@ def _version_key(name: str) -> tuple[int, ...]:
     return tuple(parts)
 
 
+def _find_maven_group_root(initial_module: Path, workspace_root: Path) -> Path:
+    """Return the tightest Maven multi-module parent of *initial_module*.
+
+    Walks up from ``initial_module.parent`` (the module itself is skipped —
+    we want its *parent* group, not the module's own pom) toward (and
+    including) ``workspace_root``, returning the first ancestor whose
+    ``pom.xml`` contains a ``<modules>`` section.  Falls back to
+    ``workspace_root`` when no such intermediate parent exists (e.g. flat
+    single-level monorepos).
+
+    This keeps the jdtls index bounded to a module *group* (typically
+    5-20 modules) rather than the full IDE workspace (potentially 200+ modules)
+    which would cause ``OutOfMemoryError: Java heap space`` during indexing.
+
+    Both *initial_module* and *workspace_root* are resolved to real paths
+    before walking to avoid symlink-based boundary escapes.
+    """
+    workspace_root = workspace_root.resolve()
+    current = initial_module.resolve().parent
+    # Bail immediately if the initial module is outside the workspace.
+    if not current.is_relative_to(workspace_root):
+        return workspace_root
+    while True:
+        pom = current / "pom.xml"
+        if pom.is_file():
+            try:
+                if "<modules>" in pom.read_text(encoding="utf-8", errors="ignore"):
+                    return current
+            except OSError:
+                pass
+        if current in (workspace_root, current.parent):
+            break
+        current = current.parent
+    return workspace_root
+
+
 @lru_cache(maxsize=256)
 def _module_snapshot_path(module_uri: str) -> Path:
     """Return the path for the persistent snapshot file for *module_uri*.
@@ -862,16 +898,34 @@ class JdtlsProxy:
         return module_uri
 
     async def expand_full_workspace(self) -> None:
-        """Expand jdtls workspace to the full monorepo root (background task).
+        """Expand jdtls workspace to the nearest Maven module-group root.
 
-        Removes the initial module-scoped folder and adds the full root to
-        avoid double-indexing.
+        Instead of expanding all the way to the IDE workspace root (which may
+        contain hundreds of Maven modules and cause jdtls OOM), this walks up
+        from the initial module to find the *nearest* ancestor directory whose
+        ``pom.xml`` declares ``<modules>`` — i.e. the tightest multi-module
+        Maven parent.  This covers sibling modules (the common case for
+        cross-module navigation) without ballooning the index.
+
+        Falls back to the full IDE workspace root when no intermediate
+        multi-module parent is found.
+
+        Removes all individually-added module folders to avoid double-indexing
+        with the newly added group root.
         """
         if self._workspace_expanded or not self._available or not self._original_root_uri:
             return
         from pygls.uris import from_fs_path, to_fs_path
 
-        root_path = to_fs_path(self._original_root_uri) or self._original_root_uri
+        workspace_path = to_fs_path(self._original_root_uri) or self._original_root_uri
+
+        # Find the tightest multi-module Maven parent of the initial module.
+        group_root_path: str = workspace_path
+        if self._initial_module_uri:
+            initial_path = to_fs_path(self._initial_module_uri) or self._initial_module_uri
+            group_root_path = str(_find_maven_group_root(Path(initial_path), Path(workspace_path)))
+
+        root_path = group_root_path
         root_uri = from_fs_path(root_path) or self._original_root_uri
         if self.modules.was_added(root_uri):
             self._workspace_expanded = True
@@ -887,7 +941,7 @@ class JdtlsProxy:
                 p = to_fs_path(uri) or uri
                 removed.append({"uri": uri, "name": Path(p).name})
 
-        logger.info("jdtls: expanding to full workspace %s", _redact_path(root_path))
+        logger.info("jdtls: expanding workspace to module group %s", _redact_path(root_path))
         await self.send_notification(
             _WORKSPACE_DID_CHANGE_FOLDERS,
             {"event": {"added": [{"uri": root_uri, "name": Path(root_path).name}], "removed": removed}},
