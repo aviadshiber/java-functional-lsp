@@ -763,7 +763,7 @@ class JdtlsProxy:
             if result is None:
                 logger.error("jdtls initialize request failed or timed out")
                 await self.stop()
-                _wipe_data_dir(data_dir)
+                await asyncio.get_running_loop().run_in_executor(None, _wipe_data_dir, data_dir)
                 return False
 
             self._jdtls_capabilities = result.get("capabilities", {})
