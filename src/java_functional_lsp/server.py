@@ -446,6 +446,7 @@ _JDTLS_CAPABILITIES: list[tuple[str, str, type[Any], dict[str, Any]]] = [
     ("definition", lsp.TEXT_DOCUMENT_DEFINITION, lsp.DefinitionRegistrationOptions, {}),
     ("references", lsp.TEXT_DOCUMENT_REFERENCES, lsp.ReferenceRegistrationOptions, {}),
     ("document-symbol", lsp.TEXT_DOCUMENT_DOCUMENT_SYMBOL, lsp.DocumentSymbolRegistrationOptions, {}),
+    ("call-hierarchy", lsp.TEXT_DOCUMENT_PREPARE_CALL_HIERARCHY, lsp.CallHierarchyRegistrationOptions, {}),
 ]
 
 # Maps LSP method → handler function for dynamic registration.
@@ -499,7 +500,7 @@ async def _register_jdtls_capabilities() -> None:
             return
 
         _jdtls_capabilities_registered = True
-        logger.info("Dynamically registered jdtls capabilities (hover, definition, references, completion, symbol)")
+        logger.info("jdtls capabilities registered: completion, hover, definition, references, symbol, call-hierarchy")
     except Exception:
         logger.warning("Failed to dynamically register jdtls capabilities", exc_info=True)
 
@@ -739,6 +740,43 @@ async def _on_document_symbol(params: lsp.DocumentSymbolParams) -> list[lsp.Docu
         return None
 
 
+async def _on_prepare_call_hierarchy(params: lsp.CallHierarchyPrepareParams) -> list[lsp.CallHierarchyItem] | None:
+    """Forward prepareCallHierarchy request to jdtls."""
+    result = await _ensure_module_and_forward("textDocument/prepareCallHierarchy", params, params.text_document.uri)
+    if result is None:
+        return None
+    try:
+        return [_converter.structure(item, lsp.CallHierarchyItem) for item in result]
+    except Exception:
+        return None
+
+
+async def _on_incoming_calls(
+    params: lsp.CallHierarchyIncomingCallsParams,
+) -> list[lsp.CallHierarchyIncomingCall] | None:
+    """Forward callHierarchy/incomingCalls request to jdtls."""
+    result = await _ensure_module_and_forward("callHierarchy/incomingCalls", params, params.item.uri)
+    if result is None:
+        return None
+    try:
+        return [_converter.structure(c, lsp.CallHierarchyIncomingCall) for c in result]
+    except Exception:
+        return None
+
+
+async def _on_outgoing_calls(
+    params: lsp.CallHierarchyOutgoingCallsParams,
+) -> list[lsp.CallHierarchyOutgoingCall] | None:
+    """Forward callHierarchy/outgoingCalls request to jdtls."""
+    result = await _ensure_module_and_forward("callHierarchy/outgoingCalls", params, params.item.uri)
+    if result is None:
+        return None
+    try:
+        return [_converter.structure(c, lsp.CallHierarchyOutgoingCall) for c in result]
+    except Exception:
+        return None
+
+
 # Populate handler map for dynamic registration.
 _JDTLS_HANDLERS.update(
     {
@@ -747,6 +785,9 @@ _JDTLS_HANDLERS.update(
         lsp.TEXT_DOCUMENT_DEFINITION: _on_definition,
         lsp.TEXT_DOCUMENT_REFERENCES: _on_references,
         lsp.TEXT_DOCUMENT_DOCUMENT_SYMBOL: _on_document_symbol,
+        lsp.TEXT_DOCUMENT_PREPARE_CALL_HIERARCHY: _on_prepare_call_hierarchy,
+        lsp.CALL_HIERARCHY_INCOMING_CALLS: _on_incoming_calls,
+        lsp.CALL_HIERARCHY_OUTGOING_CALLS: _on_outgoing_calls,
     }
 )
 

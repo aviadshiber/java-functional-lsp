@@ -319,16 +319,17 @@ class TestServerInternals:
         from java_functional_lsp.server import _JDTLS_REG_PREFIX, _build_jdtls_registrations
 
         regs = _build_jdtls_registrations()
-        assert len(regs) == 5
+        assert len(regs) == 6
         methods = {r.method for r in regs}
         assert lsp.TEXT_DOCUMENT_HOVER in methods
         assert lsp.TEXT_DOCUMENT_DEFINITION in methods
         assert lsp.TEXT_DOCUMENT_REFERENCES in methods
         assert lsp.TEXT_DOCUMENT_COMPLETION in methods
         assert lsp.TEXT_DOCUMENT_DOCUMENT_SYMBOL in methods
+        assert lsp.TEXT_DOCUMENT_PREPARE_CALL_HIERARCHY in methods
         # All IDs are unique and use the shared prefix
         ids = {r.id for r in regs}
-        assert len(ids) == 5
+        assert len(ids) == 6
         assert all(rid.startswith(_JDTLS_REG_PREFIX) for rid in ids)
         # All have java document selector with correct language
         for r in regs:
@@ -386,16 +387,19 @@ class TestServerInternals:
                 await srv_mod._register_jdtls_capabilities()
         finally:
             srv_mod._jdtls_capabilities_registered = old_flag
-        # Handlers were registered for all 5 methods
+        # Handlers were registered for all methods (including call hierarchy)
         assert lsp.TEXT_DOCUMENT_HOVER in registered_methods
         assert lsp.TEXT_DOCUMENT_COMPLETION in registered_methods
         assert lsp.TEXT_DOCUMENT_DEFINITION in registered_methods
         assert lsp.TEXT_DOCUMENT_REFERENCES in registered_methods
         assert lsp.TEXT_DOCUMENT_DOCUMENT_SYMBOL in registered_methods
+        assert lsp.TEXT_DOCUMENT_PREPARE_CALL_HIERARCHY in registered_methods
+        assert lsp.CALL_HIERARCHY_INCOMING_CALLS in registered_methods
+        assert lsp.CALL_HIERARCHY_OUTGOING_CALLS in registered_methods
         # client_register_capability_async was called
         mock_reg.assert_called_once()
         # Success log emitted
-        assert any("Dynamically registered" in r.getMessage() for r in caplog.records)
+        assert any("jdtls capabilities registered" in r.getMessage() for r in caplog.records)
 
     async def test_register_jdtls_capabilities_idempotent(self) -> None:
         """Second call is a no-op (idempotency guard)."""
@@ -544,6 +548,123 @@ class TestServerInternals:
             assert srv._proxy.modules.get_state("file:///mod") == ModuleState.READY
         finally:
             srv._proxy.modules.clear()
+
+    async def test_on_prepare_call_hierarchy_forwards_to_jdtls(self) -> None:
+        """_on_prepare_call_hierarchy forwards request and structures result."""
+        from unittest.mock import AsyncMock, patch
+
+        from java_functional_lsp.server import _on_prepare_call_hierarchy
+
+        item = {
+            "name": "parsePrimaryEnrichmentResponse",
+            "kind": 6,
+            "uri": "file:///mod/Foo.java",
+            "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 10}},
+            "selectionRange": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 10}},
+        }
+        params = lsp.CallHierarchyPrepareParams(
+            text_document=lsp.TextDocumentIdentifier(uri="file:///mod/Foo.java"),
+            position=lsp.Position(line=0, character=0),
+        )
+        mock_forward = AsyncMock(return_value=[item])
+        with patch("java_functional_lsp.server._ensure_module_and_forward", mock_forward):
+            result = await _on_prepare_call_hierarchy(params)
+        assert result is not None
+        assert len(result) == 1
+        assert result[0].name == "parsePrimaryEnrichmentResponse"
+        mock_forward.assert_called_once_with("textDocument/prepareCallHierarchy", params, "file:///mod/Foo.java")
+
+    async def test_on_prepare_call_hierarchy_returns_none_on_null(self) -> None:
+        from unittest.mock import AsyncMock, patch
+
+        from java_functional_lsp.server import _on_prepare_call_hierarchy
+
+        params = lsp.CallHierarchyPrepareParams(
+            text_document=lsp.TextDocumentIdentifier(uri="file:///mod/Foo.java"),
+            position=lsp.Position(line=0, character=0),
+        )
+        with patch("java_functional_lsp.server._ensure_module_and_forward", AsyncMock(return_value=None)):
+            result = await _on_prepare_call_hierarchy(params)
+        assert result is None
+
+    async def test_on_incoming_calls_forwards_using_item_uri(self) -> None:
+        """_on_incoming_calls uses params.item.uri as the file_uri for module resolution."""
+        from unittest.mock import AsyncMock, patch
+
+        from java_functional_lsp.server import _on_incoming_calls
+
+        item = lsp.CallHierarchyItem(
+            name="caller",
+            kind=lsp.SymbolKind.Method,
+            uri="file:///mod/Foo.java",
+            range=lsp.Range(start=lsp.Position(line=0, character=0), end=lsp.Position(line=0, character=5)),
+            selection_range=lsp.Range(start=lsp.Position(line=0, character=0), end=lsp.Position(line=0, character=5)),
+        )
+        params = lsp.CallHierarchyIncomingCallsParams(item=item)
+        incoming = {
+            "from": {
+                "name": "caller",
+                "kind": 6,
+                "uri": "file:///mod/Foo.java",
+                "range": {"start": {"line": 1, "character": 0}, "end": {"line": 1, "character": 6}},
+                "selectionRange": {"start": {"line": 1, "character": 0}, "end": {"line": 1, "character": 6}},
+            },
+            "fromRanges": [{"start": {"line": 1, "character": 0}, "end": {"line": 1, "character": 6}}],
+        }
+        mock_forward = AsyncMock(return_value=[incoming])
+        with patch("java_functional_lsp.server._ensure_module_and_forward", mock_forward):
+            result = await _on_incoming_calls(params)
+        assert result is not None
+        assert len(result) == 1
+        mock_forward.assert_called_once_with("callHierarchy/incomingCalls", params, "file:///mod/Foo.java")
+
+    async def test_on_incoming_calls_returns_none_on_null(self) -> None:
+        from unittest.mock import AsyncMock, patch
+
+        from java_functional_lsp.server import _on_incoming_calls
+
+        item = lsp.CallHierarchyItem(
+            name="x",
+            kind=lsp.SymbolKind.Method,
+            uri="file:///mod/Foo.java",
+            range=lsp.Range(start=lsp.Position(line=0, character=0), end=lsp.Position(line=0, character=1)),
+            selection_range=lsp.Range(start=lsp.Position(line=0, character=0), end=lsp.Position(line=0, character=1)),
+        )
+        params = lsp.CallHierarchyIncomingCallsParams(item=item)
+        with patch("java_functional_lsp.server._ensure_module_and_forward", AsyncMock(return_value=None)):
+            result = await _on_incoming_calls(params)
+        assert result is None
+
+    async def test_on_outgoing_calls_forwards_using_item_uri(self) -> None:
+        """_on_outgoing_calls uses params.item.uri as the file_uri for module resolution."""
+        from unittest.mock import AsyncMock, patch
+
+        from java_functional_lsp.server import _on_outgoing_calls
+
+        item = lsp.CallHierarchyItem(
+            name="callee",
+            kind=lsp.SymbolKind.Method,
+            uri="file:///mod/Bar.java",
+            range=lsp.Range(start=lsp.Position(line=5, character=0), end=lsp.Position(line=5, character=6)),
+            selection_range=lsp.Range(start=lsp.Position(line=5, character=0), end=lsp.Position(line=5, character=6)),
+        )
+        params = lsp.CallHierarchyOutgoingCallsParams(item=item)
+        outgoing = {
+            "to": {
+                "name": "callee",
+                "kind": 6,
+                "uri": "file:///mod/Bar.java",
+                "range": {"start": {"line": 5, "character": 0}, "end": {"line": 5, "character": 6}},
+                "selectionRange": {"start": {"line": 5, "character": 0}, "end": {"line": 5, "character": 6}},
+            },
+            "fromRanges": [{"start": {"line": 5, "character": 0}, "end": {"line": 5, "character": 6}}],
+        }
+        mock_forward = AsyncMock(return_value=[outgoing])
+        with patch("java_functional_lsp.server._ensure_module_and_forward", mock_forward):
+            result = await _on_outgoing_calls(params)
+        assert result is not None
+        assert len(result) == 1
+        mock_forward.assert_called_once_with("callHierarchy/outgoingCalls", params, "file:///mod/Bar.java")
 
     def test_serialize_params_camelcase(self) -> None:
         from java_functional_lsp.server import _serialize_params
