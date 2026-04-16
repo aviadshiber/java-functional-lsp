@@ -352,6 +352,14 @@ class TestServerInternals:
         comp = next(r for r in regs if r.method == lsp.TEXT_DOCUMENT_COMPLETION)
         assert comp.register_options is not None
         assert comp.register_options.get("triggerCharacters") == ["."]
+        # SignatureHelp has triggerCharacters
+        sig = next(r for r in regs if r.method == lsp.TEXT_DOCUMENT_SIGNATURE_HELP)
+        assert sig.register_options is not None
+        assert sig.register_options.get("triggerCharacters") == ["(", ","]
+        # Rename advertises prepareProvider so the IDE sends textDocument/prepareRename
+        rename = next(r for r in regs if r.method == lsp.TEXT_DOCUMENT_RENAME)
+        assert rename.register_options is not None
+        assert rename.register_options.get("prepareProvider") is True
 
     async def test_register_jdtls_capabilities_logs_on_failure(self, caplog: Any) -> None:
         """_register_jdtls_capabilities logs a warning when the client rejects."""
@@ -533,7 +541,7 @@ class TestServerInternals:
         mock_add = AsyncMock(return_value="file:///mod")
         mock_send = AsyncMock(side_effect=[None, {"result": "ok"}])
 
-        async def mock_wait(uri: str, timeout: float = 30.0) -> bool:
+        async def mock_wait(uri: str, timeout: float = 30.0) -> bool:  # pyright: ignore[reportUnusedParameter]
             srv._proxy.modules.mark_ready(uri)
             return True
 
@@ -971,6 +979,7 @@ class TestServerInternals:
         assert len(result) == 1
         assert result[0].name == "FooService"
         mock_send.assert_called_once()
+        assert mock_send.call_args[0][0] == "workspace/symbol"
 
     async def test_on_workspace_symbol_returns_none_when_unavailable(self) -> None:
         """_on_workspace_symbol returns None when jdtls is not available."""
@@ -983,6 +992,118 @@ class TestServerInternals:
         with patch.object(srv._proxy, "_available", False):
             result = await _on_workspace_symbol(params)
         assert result is None
+
+    async def test_on_document_highlight_returns_none_on_null(self) -> None:
+        from unittest.mock import AsyncMock, patch
+
+        from java_functional_lsp.server import _on_document_highlight
+
+        params = lsp.DocumentHighlightParams(
+            text_document=lsp.TextDocumentIdentifier(uri="file:///mod/Foo.java"),
+            position=lsp.Position(line=0, character=0),
+        )
+        with patch("java_functional_lsp.server._ensure_module_and_forward", AsyncMock(return_value=None)):
+            assert await _on_document_highlight(params) is None
+
+    async def test_on_type_definition_returns_none_on_null(self) -> None:
+        from unittest.mock import AsyncMock, patch
+
+        from java_functional_lsp.server import _on_type_definition
+
+        params = lsp.TypeDefinitionParams(
+            text_document=lsp.TextDocumentIdentifier(uri="file:///mod/Foo.java"),
+            position=lsp.Position(line=0, character=0),
+        )
+        with patch("java_functional_lsp.server._ensure_module_and_forward", AsyncMock(return_value=None)):
+            assert await _on_type_definition(params) is None
+
+    async def test_on_declaration_returns_none_on_null(self) -> None:
+        from unittest.mock import AsyncMock, patch
+
+        from java_functional_lsp.server import _on_declaration
+
+        params = lsp.DeclarationParams(
+            text_document=lsp.TextDocumentIdentifier(uri="file:///mod/Foo.java"),
+            position=lsp.Position(line=0, character=0),
+        )
+        with patch("java_functional_lsp.server._ensure_module_and_forward", AsyncMock(return_value=None)):
+            assert await _on_declaration(params) is None
+
+    async def test_on_prepare_rename_returns_none_on_null(self) -> None:
+        from unittest.mock import AsyncMock, patch
+
+        from java_functional_lsp.server import _on_prepare_rename
+
+        params = lsp.PrepareRenameParams(
+            text_document=lsp.TextDocumentIdentifier(uri="file:///mod/Foo.java"),
+            position=lsp.Position(line=0, character=0),
+        )
+        with patch("java_functional_lsp.server._ensure_module_and_forward", AsyncMock(return_value=None)):
+            assert await _on_prepare_rename(params) is None
+
+    async def test_on_prepare_rename_returns_placeholder_when_jdtls_sends_placeholder(self) -> None:
+        """_on_prepare_rename handles PrepareRenamePlaceholder (the typical jdtls response)."""
+        from unittest.mock import AsyncMock, patch
+
+        from java_functional_lsp.server import _on_prepare_rename
+
+        params = lsp.PrepareRenameParams(
+            text_document=lsp.TextDocumentIdentifier(uri="file:///mod/Foo.java"),
+            position=lsp.Position(line=3, character=5),
+        )
+        raw = {
+            "range": {"start": {"line": 3, "character": 4}, "end": {"line": 3, "character": 7}},
+            "placeholder": "foo",
+        }
+        mock_forward = AsyncMock(return_value=raw)
+        with patch("java_functional_lsp.server._ensure_module_and_forward", mock_forward):
+            result = await _on_prepare_rename(params)
+        assert isinstance(result, lsp.PrepareRenamePlaceholder)
+        assert result.placeholder == "foo"
+
+    async def test_on_prepare_type_hierarchy_returns_none_on_null(self) -> None:
+        from unittest.mock import AsyncMock, patch
+
+        from java_functional_lsp.server import _on_prepare_type_hierarchy
+
+        params = lsp.TypeHierarchyPrepareParams(
+            text_document=lsp.TextDocumentIdentifier(uri="file:///mod/Foo.java"),
+            position=lsp.Position(line=0, character=0),
+        )
+        with patch("java_functional_lsp.server._ensure_module_and_forward", AsyncMock(return_value=None)):
+            assert await _on_prepare_type_hierarchy(params) is None
+
+    async def test_on_type_hierarchy_supertypes_returns_none_on_null(self) -> None:
+        from unittest.mock import AsyncMock, patch
+
+        from java_functional_lsp.server import _on_type_hierarchy_supertypes
+
+        item = lsp.TypeHierarchyItem(
+            name="Foo",
+            kind=lsp.SymbolKind.Class,
+            uri="file:///mod/Foo.java",
+            range=lsp.Range(start=lsp.Position(line=0, character=0), end=lsp.Position(line=0, character=3)),
+            selection_range=lsp.Range(start=lsp.Position(line=0, character=0), end=lsp.Position(line=0, character=3)),
+        )
+        params = lsp.TypeHierarchySupertypesParams(item=item)
+        with patch("java_functional_lsp.server._ensure_module_and_forward", AsyncMock(return_value=None)):
+            assert await _on_type_hierarchy_supertypes(params) is None
+
+    async def test_on_type_hierarchy_subtypes_returns_none_on_null(self) -> None:
+        from unittest.mock import AsyncMock, patch
+
+        from java_functional_lsp.server import _on_type_hierarchy_subtypes
+
+        item = lsp.TypeHierarchyItem(
+            name="Base",
+            kind=lsp.SymbolKind.Class,
+            uri="file:///mod/Base.java",
+            range=lsp.Range(start=lsp.Position(line=0, character=0), end=lsp.Position(line=0, character=4)),
+            selection_range=lsp.Range(start=lsp.Position(line=0, character=0), end=lsp.Position(line=0, character=4)),
+        )
+        params = lsp.TypeHierarchySubtypesParams(item=item)
+        with patch("java_functional_lsp.server._ensure_module_and_forward", AsyncMock(return_value=None)):
+            assert await _on_type_hierarchy_subtypes(params) is None
 
     def test_serialize_params_camelcase(self) -> None:
         from java_functional_lsp.server import _serialize_params

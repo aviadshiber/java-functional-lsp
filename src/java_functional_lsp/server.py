@@ -457,7 +457,7 @@ _JDTLS_CAPABILITIES: list[tuple[str, str, type[Any], dict[str, Any]]] = [
     ("type-definition", lsp.TEXT_DOCUMENT_TYPE_DEFINITION, lsp.TypeDefinitionRegistrationOptions, {}),
     ("declaration", lsp.TEXT_DOCUMENT_DECLARATION, lsp.DeclarationRegistrationOptions, {}),
     ("document-highlight", lsp.TEXT_DOCUMENT_DOCUMENT_HIGHLIGHT, lsp.DocumentHighlightRegistrationOptions, {}),
-    ("rename", lsp.TEXT_DOCUMENT_RENAME, lsp.RenameRegistrationOptions, {}),
+    ("rename", lsp.TEXT_DOCUMENT_RENAME, lsp.RenameRegistrationOptions, {"prepare_provider": True}),
     ("type-hierarchy", lsp.TEXT_DOCUMENT_PREPARE_TYPE_HIERARCHY, lsp.TypeHierarchyRegistrationOptions, {}),
     ("workspace-symbol", lsp.WORKSPACE_SYMBOL, lsp.WorkspaceSymbolRegistrationOptions, {}),
 ]
@@ -878,16 +878,24 @@ async def _on_rename(params: lsp.RenameParams) -> lsp.WorkspaceEdit | None:
         return None
 
 
-async def _on_prepare_rename(params: lsp.PrepareRenameParams) -> lsp.Range | None:
-    """Forward prepareRename request to jdtls."""
+async def _on_prepare_rename(
+    params: lsp.PrepareRenameParams,
+) -> lsp.Range | lsp.PrepareRenamePlaceholder | lsp.PrepareRenameDefaultBehavior | None:
+    """Forward prepareRename request to jdtls.
+
+    jdtls may return Range, PrepareRenamePlaceholder ({range, placeholder}),
+    or PrepareRenameDefaultBehavior ({defaultBehavior}) — try each in order.
+    """
     result = await _ensure_module_and_forward("textDocument/prepareRename", params, params.text_document.uri)
     if result is None:
         return None
-    try:
-        return _converter.structure(result, lsp.Range)
-    except Exception:
-        logger.debug("Failed to structure prepareRename result", exc_info=True)
-        return None
+    for target_type in (lsp.PrepareRenamePlaceholder, lsp.PrepareRenameDefaultBehavior, lsp.Range):
+        try:
+            return _converter.structure(result, target_type)  # type: ignore[return-value]
+        except Exception:
+            pass
+    logger.debug("Failed to structure prepareRename result as any known type", exc_info=False)
+    return None
 
 
 async def _on_prepare_type_hierarchy(
