@@ -447,6 +447,19 @@ _JDTLS_CAPABILITIES: list[tuple[str, str, type[Any], dict[str, Any]]] = [
     ("references", lsp.TEXT_DOCUMENT_REFERENCES, lsp.ReferenceRegistrationOptions, {}),
     ("document-symbol", lsp.TEXT_DOCUMENT_DOCUMENT_SYMBOL, lsp.DocumentSymbolRegistrationOptions, {}),
     ("call-hierarchy", lsp.TEXT_DOCUMENT_PREPARE_CALL_HIERARCHY, lsp.CallHierarchyRegistrationOptions, {}),
+    (
+        "signature-help",
+        lsp.TEXT_DOCUMENT_SIGNATURE_HELP,
+        lsp.SignatureHelpRegistrationOptions,
+        {"trigger_characters": ["(", ","], "retrigger_characters": [")"]},
+    ),
+    ("implementation", lsp.TEXT_DOCUMENT_IMPLEMENTATION, lsp.ImplementationRegistrationOptions, {}),
+    ("type-definition", lsp.TEXT_DOCUMENT_TYPE_DEFINITION, lsp.TypeDefinitionRegistrationOptions, {}),
+    ("declaration", lsp.TEXT_DOCUMENT_DECLARATION, lsp.DeclarationRegistrationOptions, {}),
+    ("document-highlight", lsp.TEXT_DOCUMENT_DOCUMENT_HIGHLIGHT, lsp.DocumentHighlightRegistrationOptions, {}),
+    ("rename", lsp.TEXT_DOCUMENT_RENAME, lsp.RenameRegistrationOptions, {}),
+    ("type-hierarchy", lsp.TEXT_DOCUMENT_PREPARE_TYPE_HIERARCHY, lsp.TypeHierarchyRegistrationOptions, {}),
+    ("workspace-symbol", lsp.WORKSPACE_SYMBOL, lsp.WorkspaceSymbolRegistrationOptions, {}),
 ]
 
 # Maps LSP method → handler function for dynamic registration.
@@ -458,14 +471,20 @@ _jdtls_capabilities_registered = False
 
 def _build_jdtls_registrations() -> list[lsp.Registration]:
     """Build LSP Registration objects for jdtls-dependent capabilities."""
-    return [
-        lsp.Registration(
-            id=f"{_JDTLS_REG_PREFIX}{suffix}",
-            method=method,
-            register_options=_converter.unstructure(opts_cls(document_selector=_JAVA_SELECTOR, **extra)),
+    result = []
+    for suffix, method, opts_cls, extra in _JDTLS_CAPABILITIES:
+        field_names = {f.name for f in getattr(opts_cls, "__attrs_attrs__", [])}
+        kwargs: dict[str, Any] = {**extra}
+        if "document_selector" in field_names:
+            kwargs["document_selector"] = _JAVA_SELECTOR
+        result.append(
+            lsp.Registration(
+                id=f"{_JDTLS_REG_PREFIX}{suffix}",
+                method=method,
+                register_options=_converter.unstructure(opts_cls(**kwargs)),
+            )
         )
-        for suffix, method, opts_cls, extra in _JDTLS_CAPABILITIES
-    ]
+    return result
 
 
 async def _register_jdtls_capabilities() -> None:
@@ -500,7 +519,11 @@ async def _register_jdtls_capabilities() -> None:
             return
 
         _jdtls_capabilities_registered = True
-        logger.info("jdtls capabilities registered: completion, hover, definition, references, symbol, call-hierarchy")
+        logger.info(
+            "jdtls capabilities registered: completion, hover, definition, references, symbol, "
+            "call-hierarchy, signature-help, implementation, type-definition, declaration, "
+            "document-highlight, rename, type-hierarchy, workspace-symbol"
+        )
     except Exception:
         logger.warning("Failed to dynamically register jdtls capabilities", exc_info=True)
 
@@ -777,6 +800,153 @@ async def _on_outgoing_calls(
         return None
 
 
+async def _on_signature_help(params: lsp.SignatureHelpParams) -> lsp.SignatureHelp | None:
+    """Forward signatureHelp request to jdtls."""
+    result = await _ensure_module_and_forward("textDocument/signatureHelp", params, params.text_document.uri)
+    if result is None:
+        return None
+    try:
+        return _converter.structure(result, lsp.SignatureHelp)
+    except Exception:
+        logger.debug("Failed to structure signatureHelp result", exc_info=True)
+        return None
+
+
+async def _on_implementation(params: lsp.ImplementationParams) -> list[lsp.Location] | None:
+    """Forward go-to-implementation request to jdtls."""
+    result = await _ensure_module_and_forward("textDocument/implementation", params, params.text_document.uri)
+    if result is None:
+        return None
+    try:
+        if isinstance(result, list):
+            return [_converter.structure(loc, lsp.Location) for loc in result]
+        return [_converter.structure(result, lsp.Location)]
+    except Exception:
+        logger.debug("Failed to structure implementation result", exc_info=True)
+        return None
+
+
+async def _on_type_definition(params: lsp.TypeDefinitionParams) -> list[lsp.Location] | None:
+    """Forward go-to-type-definition request to jdtls."""
+    result = await _ensure_module_and_forward("textDocument/typeDefinition", params, params.text_document.uri)
+    if result is None:
+        return None
+    try:
+        if isinstance(result, list):
+            return [_converter.structure(loc, lsp.Location) for loc in result]
+        return [_converter.structure(result, lsp.Location)]
+    except Exception:
+        logger.debug("Failed to structure typeDefinition result", exc_info=True)
+        return None
+
+
+async def _on_declaration(params: lsp.DeclarationParams) -> list[lsp.Location] | None:
+    """Forward go-to-declaration request to jdtls."""
+    result = await _ensure_module_and_forward("textDocument/declaration", params, params.text_document.uri)
+    if result is None:
+        return None
+    try:
+        if isinstance(result, list):
+            return [_converter.structure(loc, lsp.Location) for loc in result]
+        return [_converter.structure(result, lsp.Location)]
+    except Exception:
+        logger.debug("Failed to structure declaration result", exc_info=True)
+        return None
+
+
+async def _on_document_highlight(params: lsp.DocumentHighlightParams) -> list[lsp.DocumentHighlight] | None:
+    """Forward documentHighlight request to jdtls."""
+    result = await _ensure_module_and_forward("textDocument/documentHighlight", params, params.text_document.uri)
+    if result is None:
+        return None
+    try:
+        return [_converter.structure(h, lsp.DocumentHighlight) for h in result]
+    except Exception:
+        logger.debug("Failed to structure documentHighlight result", exc_info=True)
+        return None
+
+
+async def _on_rename(params: lsp.RenameParams) -> lsp.WorkspaceEdit | None:
+    """Forward rename request to jdtls."""
+    result = await _ensure_module_and_forward("textDocument/rename", params, params.text_document.uri)
+    if result is None:
+        return None
+    try:
+        return _converter.structure(result, lsp.WorkspaceEdit)
+    except Exception:
+        logger.debug("Failed to structure rename result", exc_info=True)
+        return None
+
+
+async def _on_prepare_rename(params: lsp.PrepareRenameParams) -> lsp.Range | None:
+    """Forward prepareRename request to jdtls."""
+    result = await _ensure_module_and_forward("textDocument/prepareRename", params, params.text_document.uri)
+    if result is None:
+        return None
+    try:
+        return _converter.structure(result, lsp.Range)
+    except Exception:
+        logger.debug("Failed to structure prepareRename result", exc_info=True)
+        return None
+
+
+async def _on_prepare_type_hierarchy(
+    params: lsp.TypeHierarchyPrepareParams,
+) -> list[lsp.TypeHierarchyItem] | None:
+    """Forward prepareTypeHierarchy request to jdtls."""
+    result = await _ensure_module_and_forward("textDocument/prepareTypeHierarchy", params, params.text_document.uri)
+    if result is None:
+        return None
+    try:
+        return [_converter.structure(item, lsp.TypeHierarchyItem) for item in result]
+    except Exception:
+        logger.debug("Failed to structure prepareTypeHierarchy result", exc_info=True)
+        return None
+
+
+async def _on_type_hierarchy_supertypes(
+    params: lsp.TypeHierarchySupertypesParams,
+) -> list[lsp.TypeHierarchyItem] | None:
+    """Forward typeHierarchy/supertypes request to jdtls."""
+    result = await _ensure_module_and_forward("typeHierarchy/supertypes", params, params.item.uri)
+    if result is None:
+        return None
+    try:
+        return [_converter.structure(item, lsp.TypeHierarchyItem) for item in result]
+    except Exception:
+        logger.debug("Failed to structure typeHierarchy/supertypes result", exc_info=True)
+        return None
+
+
+async def _on_type_hierarchy_subtypes(
+    params: lsp.TypeHierarchySubtypesParams,
+) -> list[lsp.TypeHierarchyItem] | None:
+    """Forward typeHierarchy/subtypes request to jdtls."""
+    result = await _ensure_module_and_forward("typeHierarchy/subtypes", params, params.item.uri)
+    if result is None:
+        return None
+    try:
+        return [_converter.structure(item, lsp.TypeHierarchyItem) for item in result]
+    except Exception:
+        logger.debug("Failed to structure typeHierarchy/subtypes result", exc_info=True)
+        return None
+
+
+async def _on_workspace_symbol(params: lsp.WorkspaceSymbolParams) -> list[lsp.WorkspaceSymbol] | None:
+    """Forward workspace/symbol request to jdtls (no text_document — use proxy directly)."""
+    proxy = server._proxy
+    if not proxy.is_available:
+        return None
+    result = await proxy.send_request("workspace/symbol", _serialize_params(params))
+    if result is None:
+        return None
+    try:
+        return [_converter.structure(s, lsp.WorkspaceSymbol) for s in result]
+    except Exception:
+        logger.debug("Failed to structure workspace/symbol result", exc_info=True)
+        return None
+
+
 # Populate handler map for dynamic registration.
 _JDTLS_HANDLERS.update(
     {
@@ -788,6 +958,17 @@ _JDTLS_HANDLERS.update(
         lsp.TEXT_DOCUMENT_PREPARE_CALL_HIERARCHY: _on_prepare_call_hierarchy,
         lsp.CALL_HIERARCHY_INCOMING_CALLS: _on_incoming_calls,
         lsp.CALL_HIERARCHY_OUTGOING_CALLS: _on_outgoing_calls,
+        lsp.TEXT_DOCUMENT_SIGNATURE_HELP: _on_signature_help,
+        lsp.TEXT_DOCUMENT_IMPLEMENTATION: _on_implementation,
+        lsp.TEXT_DOCUMENT_TYPE_DEFINITION: _on_type_definition,
+        lsp.TEXT_DOCUMENT_DECLARATION: _on_declaration,
+        lsp.TEXT_DOCUMENT_DOCUMENT_HIGHLIGHT: _on_document_highlight,
+        lsp.TEXT_DOCUMENT_RENAME: _on_rename,
+        lsp.TEXT_DOCUMENT_PREPARE_RENAME: _on_prepare_rename,
+        lsp.TEXT_DOCUMENT_PREPARE_TYPE_HIERARCHY: _on_prepare_type_hierarchy,
+        lsp.TYPE_HIERARCHY_SUPERTYPES: _on_type_hierarchy_supertypes,
+        lsp.TYPE_HIERARCHY_SUBTYPES: _on_type_hierarchy_subtypes,
+        lsp.WORKSPACE_SYMBOL: _on_workspace_symbol,
     }
 )
 
