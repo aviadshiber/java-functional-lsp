@@ -465,13 +465,14 @@ def _find_maven_group_root(initial_module: Path, workspace_root: Path) -> Path:
     workspace_root = workspace_root.resolve()
     resolved_module = initial_module.resolve()
     current = resolved_module.parent
-    # Bail immediately if the initial module is outside the workspace.
+    # Case 1: module is outside the workspace entirely — scope to workspace_root
+    # (also fires when initial_module == workspace_root, since parent is then
+    # outside workspace_root).
     if not current.is_relative_to(workspace_root):
         return workspace_root
     # Walk up to (but NOT including) workspace_root.  Inspecting workspace_root's
-    # own pom.xml would include the entire monorepo (e.g. 200+ modules) which
-    # causes OOM.  For flat modules that live directly under workspace_root there
-    # is no intermediate group; fall back to the initial module itself.
+    # own pom.xml would include the entire monorepo (e.g. 200+ modules) → OOM.
+    # `current.parent == current` detects the filesystem root (POSIX `/` or Windows drive).
     while current not in (workspace_root, current.parent):
         pom = current / "pom.xml"
         if pom.is_file():
@@ -481,7 +482,8 @@ def _find_maven_group_root(initial_module: Path, workspace_root: Path) -> Path:
             except OSError:
                 pass
         current = current.parent
-    # No intermediate group found — use the initial module as its own scope.
+    # Case 2: no intermediate group pom found — use the initial module as its own scope
+    # (tightest possible; avoids full-monorepo indexing for flat modules under workspace_root).
     return resolved_module
 
 
@@ -928,8 +930,10 @@ class JdtlsProxy:
         Maven parent.  This covers sibling modules (the common case for
         cross-module navigation) without ballooning the index.
 
-        Falls back to the full IDE workspace root when no intermediate
-        multi-module parent is found.
+        Falls back to the initial module itself when no intermediate
+        multi-module parent is found (e.g. flat modules sitting directly
+        under the workspace root), keeping the jdtls scope as tight as
+        possible.
 
         Removes all individually-added module folders to avoid double-indexing
         with the newly added group root.

@@ -1132,13 +1132,13 @@ class TestLazyStart:
         assert event["added"][0]["uri"] != workspace_uri
 
     async def test_expand_noop_for_flat_module_directly_under_workspace(self, tmp_path: Path) -> None:
-        """No notification sent when the initial module IS the group root (flat layout).
+        """No notification sent for flat modules sitting directly under workspace_root.
 
-        For modules sitting directly under workspace_root with no intermediate group pom,
-        _find_maven_group_root returns the module itself. Since it was already added,
-        expand_full_workspace() is a no-op — which is correct: the scope is already
-        as tight as possible and workspace_root's pom.xml (potentially 200+ modules) is
-        never inspected.
+        When there is no intermediate group pom between the module and workspace_root,
+        _find_maven_group_root returns the module itself (not workspace_root). Since the
+        module was already added, expand_full_workspace() is a no-op — which is correct:
+        the scope is already as tight as possible and workspace_root's pom.xml
+        (potentially 200+ modules → OOM) is never inspected.
         """
         from unittest.mock import AsyncMock
 
