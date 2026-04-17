@@ -660,7 +660,24 @@ async def _lazy_start_jdtls(file_uri: str) -> None:
 # they only activate after jdtls starts.
 
 
-async def _ensure_module_and_forward(method: str, params: Any, file_uri: str) -> Any | None:
+# Methods that operate on a single file and succeed before cross-file indexing
+# is complete. A successful response from these does NOT mean the module is fully
+# indexed, so we must NOT use them to transition the module to READY — doing so
+# would cause cross-file requests (references, callHierarchy) to skip the wait
+# and return empty results from an under-indexed jdtls instance.
+_LIGHTWEIGHT_METHODS: frozenset[str] = frozenset(
+    {
+        "textDocument/documentHighlight",
+        "textDocument/documentSymbol",
+    }
+)
+
+
+async def _ensure_module_and_forward(
+    method: str,
+    params: Any,
+    file_uri: str,
+) -> Any | None:
     """Forward a request to jdtls, ensuring the file's module is loaded.
 
     Uses ``ModuleRegistry`` for adaptive waiting:
@@ -668,8 +685,11 @@ async def _ensure_module_and_forward(method: str, params: Any, file_uri: str) ->
     - **UNKNOWN**: add module, wait until ready (adaptive, not fixed sleep)
     - **ADDED**: module sent but not confirmed — wait until ready
 
-    When a request succeeds, marks the module as READY so subsequent
-    requests skip the wait entirely.
+    When a request that requires full project indexing succeeds, marks the
+    module as READY so subsequent requests skip the wait entirely.
+    Methods in ``_LIGHTWEIGHT_METHODS`` operate on a single file and succeed
+    before cross-file indexing completes — their success is never used to
+    signal readiness.
     """
     proxy = server._proxy
     if not proxy.is_available:
@@ -687,9 +707,10 @@ async def _ensure_module_and_forward(method: str, params: Any, file_uri: str) ->
     serialized = _serialize_params(params)
     result = await proxy.send_request(method, serialized)
 
+    can_mark_ready = method not in _LIGHTWEIGHT_METHODS
     if result is not None:
-        # Success — mark module as ready so future requests are instant.
-        if module_uri:
+        # Success — mark module as ready so future cross-file requests are instant.
+        if can_mark_ready and module_uri:
             proxy.modules.mark_ready(module_uri)
         return result
 
@@ -701,7 +722,7 @@ async def _ensure_module_and_forward(method: str, params: Any, file_uri: str) ->
         await proxy.modules.wait_until_ready(wait_uri, timeout=5.0)
     # Always retry once after waiting — even on timeout the module may be ready.
     result = await proxy.send_request(method, serialized)
-    if result is not None and module_uri:
+    if result is not None and can_mark_ready and module_uri:
         proxy.modules.mark_ready(module_uri)
     return result
 

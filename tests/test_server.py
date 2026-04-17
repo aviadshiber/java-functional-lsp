@@ -581,6 +581,34 @@ class TestServerInternals:
         finally:
             srv._proxy.modules.clear()
 
+    async def test_ensure_module_and_forward_lightweight_methods_skip_transition(self) -> None:
+        """Methods in _LIGHTWEIGHT_METHODS do not transition module to READY."""
+        from unittest.mock import AsyncMock, patch
+
+        from java_functional_lsp.proxy import ModuleState
+        from java_functional_lsp.server import _LIGHTWEIGHT_METHODS, _ensure_module_and_forward
+        from java_functional_lsp.server import server as srv
+
+        mock_add = AsyncMock(return_value="file:///mod")
+        raw_result = [{"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 3}}}]
+        mock_send = AsyncMock(return_value=raw_result)
+        try:
+            for lightweight_method in _LIGHTWEIGHT_METHODS:
+                srv._proxy.modules.clear()
+                with (
+                    patch.object(srv._proxy, "add_module_if_new", mock_add),
+                    patch.object(srv._proxy, "send_request", mock_send),
+                    patch.object(srv._proxy, "_available", True),
+                    patch("java_functional_lsp.server._resolve_module_uri", return_value="file:///mod"),
+                ):
+                    await _ensure_module_and_forward(lightweight_method, {}, "file:///mod/F.java")
+                # Module should NOT be READY — lightweight op does not confirm full indexing.
+                assert srv._proxy.modules.get_state("file:///mod") != ModuleState.READY, (
+                    f"{lightweight_method} should not mark module as READY"
+                )
+        finally:
+            srv._proxy.modules.clear()
+
     async def test_on_prepare_call_hierarchy_forwards_to_jdtls(self) -> None:
         """_on_prepare_call_hierarchy forwards request and structures result."""
         from unittest.mock import AsyncMock, patch
