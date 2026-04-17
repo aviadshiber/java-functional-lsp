@@ -76,12 +76,17 @@ class JavaFunctionalLspServer(LanguageServer):
         self._skip_jdtls_registration: bool = False
         self._init_generation: int = 0
 
-    def _on_jdtls_diagnostics(self, uri: str, _diagnostics: list[Any]) -> None:
+    def _on_jdtls_diagnostics(self, uri: str, diagnostics: list[Any]) -> None:
         """Called when jdtls publishes diagnostics — merge with custom and re-publish.
 
         Also marks the file's module as READY, since receiving diagnostics from
         jdtls is a reliable signal that the module has been indexed (more reliable
         than a first non-None response which may be semantically empty).
+
+        Exception: if any diagnostic carries ``_JDTLS_NON_PROJECT_CODE`` (code 16),
+        jdtls has opened the file but hasn't resolved its Maven project yet — only
+        syntax errors are available.  We skip the READY transition and wait for the
+        follow-up publish (after Maven import completes) that arrives without code 16.
 
         When a module transitions to READY, fires ``_apply_module_diff`` to
         notify jdtls about any externally changed files (e.g., after git pull).
@@ -90,6 +95,12 @@ class JavaFunctionalLspServer(LanguageServer):
             return
         module_uri = _resolve_module_uri(uri)
         if module_uri:
+            is_non_project = any(
+                str(d.get("code", "")) == _JDTLS_NON_PROJECT_CODE for d in diagnostics if isinstance(d, dict)
+            )
+            if is_non_project:
+                logger.info("jdtls: skipping READY for %s (non-project file, Maven import pending)", Path(uri).name)
+                return
             already_ready = self._proxy.modules.is_ready(module_uri)
             self._proxy.modules.mark_ready(module_uri)
             if not already_ready:
@@ -419,7 +430,7 @@ def on_initialize(params: lsp.InitializeParams) -> lsp.InitializeResult:
 
 
 @server.feature(lsp.INITIALIZED)
-async def on_initialized(_params: lsp.InitializedParams) -> None:
+async def on_initialized(_: lsp.InitializedParams) -> None:
     """Check jdtls availability; actual start deferred to first didOpen."""
     logger.info(
         "java-functional-lsp initialized (rules: %s)",
@@ -671,6 +682,12 @@ _LIGHTWEIGHT_METHODS: frozenset[str] = frozenset(
         "textDocument/documentSymbol",
     }
 )
+
+# jdtls diagnostic code for files it opened but hasn't resolved into a Maven project yet.
+# When this appears in a publishDiagnostics batch, jdtls has syntax info only — no classpath,
+# no cross-file resolution.  We must NOT mark the module READY yet; wait for a re-publish
+# without code 16 (after Maven project import finishes).
+_JDTLS_NON_PROJECT_CODE: str = "16"
 
 
 async def _ensure_module_and_forward(
