@@ -696,12 +696,18 @@ async def _ensure_module_and_forward(
         return None
 
     module_uri = _resolve_module_uri(file_uri)
+    short_mod = Path(to_fs_path(module_uri) or module_uri).name if module_uri else "<none>"
 
     # Hot path: module already confirmed working.
     if module_uri and proxy.modules.is_ready(module_uri):
-        return await proxy.send_request(method, _serialize_params(params))
+        logger.info("jdtls: %s [hot] module=%s", method, short_mod)
+        result = await proxy.send_request(method, _serialize_params(params))
+        if result is None:
+            logger.info("jdtls: %s [hot] → null (jdtls has no result for this file_uri)", method)
+        return result
 
     # Cold path: add module if unknown, then wait for ready.
+    logger.info("jdtls: %s [cold] module=%s expanded=%s", method, short_mod, proxy._workspace_expanded)
     new_module_uri = await proxy.add_module_if_new(file_uri)
 
     serialized = _serialize_params(params)
@@ -719,11 +725,13 @@ async def _ensure_module_and_forward(
     # If a concurrent request succeeds, Event.set() wakes us early.
     wait_uri = new_module_uri or module_uri
     if wait_uri and not proxy.modules.is_ready(wait_uri):
+        logger.info("jdtls: %s [cold] waiting for module %s to become ready", method, short_mod)
         await proxy.modules.wait_until_ready(wait_uri, timeout=5.0)
     # Always retry once after waiting — even on timeout the module may be ready.
     result = await proxy.send_request(method, serialized)
     if result is not None and can_mark_ready and module_uri:
         proxy.modules.mark_ready(module_uri)
+    logger.info("jdtls: %s [cold] retry → %s", method, "result" if result is not None else "null")
     return result
 
 
@@ -803,8 +811,11 @@ async def _on_incoming_calls(
     if result is None:
         return None
     try:
-        return [_converter.structure(c, lsp.CallHierarchyIncomingCall) for c in result]
-    except Exception:
+        structured = [_converter.structure(c, lsp.CallHierarchyIncomingCall) for c in result]
+        logger.info("jdtls: incomingCalls → %d callers", len(structured))
+        return structured
+    except Exception as e:
+        logger.warning("jdtls: incomingCalls structuring failed: %s (raw=%r)", e, result)
         return None
 
 
