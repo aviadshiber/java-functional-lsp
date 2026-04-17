@@ -100,13 +100,13 @@ class JavaFunctionalLspServer(LanguageServer):
             )
             if is_non_project:
                 logger.info("jdtls: skipping READY for %s (non-project file, Maven import pending)", Path(uri).name)
-                return
-            already_ready = self._proxy.modules.is_ready(module_uri)
-            self._proxy.modules.mark_ready(module_uri)
-            if not already_ready:
-                # First READY transition only — subsequent diagnostics for the same
-                # module are no-ops to avoid spawning O(files) redundant tasks.
-                _fire_and_forget(_apply_module_diff(self._proxy, module_uri))
+            else:
+                already_ready = self._proxy.modules.is_ready(module_uri)
+                self._proxy.modules.mark_ready(module_uri)
+                if not already_ready:
+                    # First READY transition only — subsequent diagnostics for the same
+                    # module are no-ops to avoid spawning O(files) redundant tasks.
+                    _fire_and_forget(_apply_module_diff(self._proxy, module_uri))
         try:
             _analyze_and_publish(uri)
         except FileNotFoundError:

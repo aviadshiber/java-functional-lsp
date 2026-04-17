@@ -292,6 +292,8 @@ class TestServerInternals:
 
     def test_on_jdtls_diagnostics_non_project_skips_ready(self) -> None:
         """A publishDiagnostics batch with code-16 must NOT mark the module READY."""
+        from unittest.mock import patch
+
         from java_functional_lsp.proxy import ModuleState
         from java_functional_lsp.server import server
 
@@ -304,7 +306,11 @@ class TestServerInternals:
             "severity": 2,
             "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 1}},
         }
-        server._on_jdtls_diagnostics(uri, [non_project_diag])
+        with (
+            patch("java_functional_lsp.server._resolve_module_uri", return_value="file:///mod"),
+            patch("java_functional_lsp.server._analyze_and_publish"),
+        ):
+            server._on_jdtls_diagnostics(uri, [non_project_diag])
         assert server._proxy.modules.get_state("file:///mod") != ModuleState.READY
 
     def test_on_jdtls_diagnostics_project_file_marks_ready(self) -> None:
