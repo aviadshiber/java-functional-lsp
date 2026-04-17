@@ -290,6 +290,54 @@ class TestServerInternals:
         finally:
             server.workspace.remove_text_document(uri)
 
+    def test_on_jdtls_diagnostics_non_project_skips_ready(self) -> None:
+        """A publishDiagnostics batch with code-16 must NOT mark the module READY."""
+        from unittest.mock import patch
+
+        from java_functional_lsp.proxy import ModuleState
+        from java_functional_lsp.server import server
+
+        server._proxy.modules.clear()
+        uri = "file:///mod/Foo.java"
+        non_project_diag = {
+            "code": "16",
+            "message": "Foo.java is a non-project file, only syntax errors are reported",
+            "source": "Java",
+            "severity": 2,
+            "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 1}},
+        }
+        with (
+            patch("java_functional_lsp.server._resolve_module_uri", return_value="file:///mod"),
+            patch("java_functional_lsp.server._analyze_and_publish"),
+        ):
+            server._on_jdtls_diagnostics(uri, [non_project_diag])
+        assert server._proxy.modules.get_state("file:///mod") != ModuleState.READY
+
+    def test_on_jdtls_diagnostics_project_file_marks_ready(self) -> None:
+        """A publishDiagnostics batch without code-16 MUST mark the module READY."""
+        from unittest.mock import patch
+
+        from java_functional_lsp.proxy import ModuleState
+        from java_functional_lsp.server import server
+
+        server._proxy.modules.clear()
+        uri = "file:///mod/Pr.java"
+        real_diag = {
+            "code": "268435844",
+            "message": "Some unused import",
+            "source": "Java",
+            "severity": 2,
+            "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 1}},
+        }
+        with (
+            patch("java_functional_lsp.server._resolve_module_uri", return_value="file:///mod"),
+            patch("java_functional_lsp.server._analyze_and_publish"),
+            patch("java_functional_lsp.server._fire_and_forget"),
+        ):
+            server._on_jdtls_diagnostics(uri, [real_diag])
+        assert server._proxy.modules.get_state("file:///mod") == ModuleState.READY
+        server._proxy.modules.clear()
+
     def test_init_capabilities_exclude_jdtls_features(self) -> None:
         """Static capabilities must NOT include hover/definition/references/completion/documentSymbol.
 
@@ -541,7 +589,7 @@ class TestServerInternals:
         mock_add = AsyncMock(return_value="file:///mod")
         mock_send = AsyncMock(side_effect=[None, {"result": "ok"}])
 
-        async def mock_wait(uri: str, timeout: float = 30.0) -> bool:  # pyright: ignore[reportUnusedParameter]
+        async def mock_wait(uri: str, timeout: float = 30.0) -> bool:  # type: ignore[reportUnusedParameter]
             srv._proxy.modules.mark_ready(uri)
             return True
 
