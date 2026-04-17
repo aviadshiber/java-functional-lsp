@@ -660,7 +660,13 @@ async def _lazy_start_jdtls(file_uri: str) -> None:
 # they only activate after jdtls starts.
 
 
-async def _ensure_module_and_forward(method: str, params: Any, file_uri: str) -> Any | None:
+async def _ensure_module_and_forward(
+    method: str,
+    params: Any,
+    file_uri: str,
+    *,
+    marks_module_ready: bool = True,
+) -> Any | None:
     """Forward a request to jdtls, ensuring the file's module is loaded.
 
     Uses ``ModuleRegistry`` for adaptive waiting:
@@ -668,8 +674,12 @@ async def _ensure_module_and_forward(method: str, params: Any, file_uri: str) ->
     - **UNKNOWN**: add module, wait until ready (adaptive, not fixed sleep)
     - **ADDED**: module sent but not confirmed — wait until ready
 
-    When a request succeeds, marks the module as READY so subsequent
-    requests skip the wait entirely.
+    When a request that requires full project indexing succeeds, marks the
+    module as READY so subsequent requests skip the wait entirely.
+    Pass ``marks_module_ready=False`` for single-file operations (e.g.
+    ``textDocument/documentHighlight``) that succeed before cross-file
+    indexing is complete — preventing them from prematurely signalling
+    readiness and causing callers/references to return empty results.
     """
     proxy = server._proxy
     if not proxy.is_available:
@@ -688,8 +698,8 @@ async def _ensure_module_and_forward(method: str, params: Any, file_uri: str) ->
     result = await proxy.send_request(method, serialized)
 
     if result is not None:
-        # Success — mark module as ready so future requests are instant.
-        if module_uri:
+        # Success — mark module as ready so future cross-file requests are instant.
+        if marks_module_ready and module_uri:
             proxy.modules.mark_ready(module_uri)
         return result
 
@@ -701,7 +711,7 @@ async def _ensure_module_and_forward(method: str, params: Any, file_uri: str) ->
         await proxy.modules.wait_until_ready(wait_uri, timeout=5.0)
     # Always retry once after waiting — even on timeout the module may be ready.
     result = await proxy.send_request(method, serialized)
-    if result is not None and module_uri:
+    if result is not None and marks_module_ready and module_uri:
         proxy.modules.mark_ready(module_uri)
     return result
 
@@ -856,7 +866,9 @@ async def _on_declaration(params: lsp.DeclarationParams) -> list[lsp.Location] |
 
 async def _on_document_highlight(params: lsp.DocumentHighlightParams) -> list[lsp.DocumentHighlight] | None:
     """Forward documentHighlight request to jdtls."""
-    result = await _ensure_module_and_forward("textDocument/documentHighlight", params, params.text_document.uri)
+    result = await _ensure_module_and_forward(
+        "textDocument/documentHighlight", params, params.text_document.uri, marks_module_ready=False
+    )
     if result is None:
         return None
     try:

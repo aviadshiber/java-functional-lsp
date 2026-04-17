@@ -581,6 +581,32 @@ class TestServerInternals:
         finally:
             srv._proxy.modules.clear()
 
+    async def test_ensure_module_and_forward_no_marks_ready_skips_transition(self) -> None:
+        """marks_module_ready=False does not transition module to READY."""
+        from unittest.mock import AsyncMock, patch
+
+        from java_functional_lsp.proxy import ModuleState
+        from java_functional_lsp.server import _ensure_module_and_forward
+        from java_functional_lsp.server import server as srv
+
+        mock_add = AsyncMock(return_value="file:///mod")
+        raw_highlight = [{"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 3}}}]
+        mock_send = AsyncMock(return_value=raw_highlight)
+        try:
+            with (
+                patch.object(srv._proxy, "add_module_if_new", mock_add),
+                patch.object(srv._proxy, "send_request", mock_send),
+                patch.object(srv._proxy, "_available", True),
+                patch("java_functional_lsp.server._resolve_module_uri", return_value="file:///mod"),
+            ):
+                await _ensure_module_and_forward(
+                    "textDocument/documentHighlight", {}, "file:///mod/F.java", marks_module_ready=False
+                )
+            # Module should NOT be READY — lightweight op does not confirm full indexing.
+            assert srv._proxy.modules.get_state("file:///mod") != ModuleState.READY
+        finally:
+            srv._proxy.modules.clear()
+
     async def test_on_prepare_call_hierarchy_forwards_to_jdtls(self) -> None:
         """_on_prepare_call_hierarchy forwards request and structures result."""
         from unittest.mock import AsyncMock, patch
@@ -776,7 +802,9 @@ class TestServerInternals:
             result = await _on_document_highlight(params)
         assert result is not None
         assert len(result) == 1
-        mock_forward.assert_called_once_with("textDocument/documentHighlight", params, "file:///mod/Foo.java")
+        mock_forward.assert_called_once_with(
+            "textDocument/documentHighlight", params, "file:///mod/Foo.java", marks_module_ready=False
+        )
 
     async def test_on_rename_forwards_and_returns_workspace_edit(self) -> None:
         """_on_rename forwards and structures a WorkspaceEdit."""
