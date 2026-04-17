@@ -581,29 +581,31 @@ class TestServerInternals:
         finally:
             srv._proxy.modules.clear()
 
-    async def test_ensure_module_and_forward_no_marks_ready_skips_transition(self) -> None:
-        """marks_module_ready=False does not transition module to READY."""
+    async def test_ensure_module_and_forward_lightweight_methods_skip_transition(self) -> None:
+        """Methods in _LIGHTWEIGHT_METHODS do not transition module to READY."""
         from unittest.mock import AsyncMock, patch
 
         from java_functional_lsp.proxy import ModuleState
-        from java_functional_lsp.server import _ensure_module_and_forward
+        from java_functional_lsp.server import _LIGHTWEIGHT_METHODS, _ensure_module_and_forward
         from java_functional_lsp.server import server as srv
 
         mock_add = AsyncMock(return_value="file:///mod")
-        raw_highlight = [{"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 3}}}]
-        mock_send = AsyncMock(return_value=raw_highlight)
+        raw_result = [{"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 3}}}]
+        mock_send = AsyncMock(return_value=raw_result)
         try:
-            with (
-                patch.object(srv._proxy, "add_module_if_new", mock_add),
-                patch.object(srv._proxy, "send_request", mock_send),
-                patch.object(srv._proxy, "_available", True),
-                patch("java_functional_lsp.server._resolve_module_uri", return_value="file:///mod"),
-            ):
-                await _ensure_module_and_forward(
-                    "textDocument/documentHighlight", {}, "file:///mod/F.java", marks_module_ready=False
+            for lightweight_method in _LIGHTWEIGHT_METHODS:
+                srv._proxy.modules.clear()
+                with (
+                    patch.object(srv._proxy, "add_module_if_new", mock_add),
+                    patch.object(srv._proxy, "send_request", mock_send),
+                    patch.object(srv._proxy, "_available", True),
+                    patch("java_functional_lsp.server._resolve_module_uri", return_value="file:///mod"),
+                ):
+                    await _ensure_module_and_forward(lightweight_method, {}, "file:///mod/F.java")
+                # Module should NOT be READY — lightweight op does not confirm full indexing.
+                assert srv._proxy.modules.get_state("file:///mod") != ModuleState.READY, (
+                    f"{lightweight_method} should not mark module as READY"
                 )
-            # Module should NOT be READY — lightweight op does not confirm full indexing.
-            assert srv._proxy.modules.get_state("file:///mod") != ModuleState.READY
         finally:
             srv._proxy.modules.clear()
 
@@ -802,9 +804,7 @@ class TestServerInternals:
             result = await _on_document_highlight(params)
         assert result is not None
         assert len(result) == 1
-        mock_forward.assert_called_once_with(
-            "textDocument/documentHighlight", params, "file:///mod/Foo.java", marks_module_ready=False
-        )
+        mock_forward.assert_called_once_with("textDocument/documentHighlight", params, "file:///mod/Foo.java")
 
     async def test_on_rename_forwards_and_returns_workspace_edit(self) -> None:
         """_on_rename forwards and structures a WorkspaceEdit."""
