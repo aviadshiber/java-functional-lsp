@@ -1164,7 +1164,7 @@ class TestLazyStart:
 
         # No notification — module was already added and is already the tightest scope
         proxy.send_notification.assert_not_called()  # type: ignore[attr-defined]
-        assert proxy._workspace_expanded is True
+        assert len(proxy._expanded_groups) > 0
 
     async def test_expand_full_workspace_sends_notification(self) -> None:
         from unittest.mock import AsyncMock
@@ -1177,7 +1177,7 @@ class TestLazyStart:
         proxy.send_notification = AsyncMock()  # type: ignore[assignment]
         await proxy.expand_full_workspace()
         proxy.send_notification.assert_called_once()  # type: ignore[attr-defined]
-        assert proxy._workspace_expanded is True
+        assert len(proxy._expanded_groups) > 0
 
     async def test_expand_full_workspace_removes_initial_module(self, tmp_path: Path) -> None:
         """All modules in _states are removed when expanding to an intermediate group root."""
@@ -1227,7 +1227,7 @@ class TestLazyStart:
         proxy.send_notification = AsyncMock()  # type: ignore[assignment]
         await proxy.expand_full_workspace()
         proxy.send_notification.assert_not_called()  # type: ignore[attr-defined]
-        assert proxy._workspace_expanded is False
+        assert len(proxy._expanded_groups) == 0
 
     async def test_expand_full_workspace_noop_when_already_added(self) -> None:
         from unittest.mock import AsyncMock
@@ -1241,7 +1241,108 @@ class TestLazyStart:
         proxy.send_notification = AsyncMock()  # type: ignore[assignment]
         await proxy.expand_full_workspace()
         proxy.send_notification.assert_not_called()  # type: ignore[attr-defined]
-        assert proxy._workspace_expanded is True
+        assert len(proxy._expanded_groups) > 0
+
+    async def test_add_module_cross_group_expands_new_group(self, tmp_path: Path) -> None:
+        """Navigating to a file in a different Maven group expands that group."""
+        from unittest.mock import AsyncMock
+
+        from java_functional_lsp.proxy import JdtlsProxy
+
+        # Layout: monorepo/group-a/mod-a, monorepo/group-b/mod-b
+        monorepo = tmp_path / "monorepo"
+        group_a = monorepo / "group-a"
+        mod_a = group_a / "mod-a"
+        group_b = monorepo / "group-b"
+        mod_b = group_b / "mod-b"
+        for d in (mod_a, mod_b):
+            d.mkdir(parents=True)
+            (d / "pom.xml").write_text("<project/>")
+        (group_a / "pom.xml").write_text("<project><modules><module>mod-a</module></modules></project>")
+        (group_b / "pom.xml").write_text("<project><modules><module>mod-b</module></modules></project>")
+
+        proxy = JdtlsProxy()
+        proxy._available = True
+        proxy._original_root_uri = monorepo.as_uri()
+        proxy._initial_module_uri = mod_a.as_uri()
+        proxy._expanded_groups.add(group_a.as_uri())  # simulate initial expansion done
+        proxy.modules.mark_added(mod_a.as_uri())
+        proxy.send_notification = AsyncMock()  # type: ignore[assignment]
+
+        file_uri = (mod_b / "src" / "Foo.java").as_uri()
+        # Create the file so _resolve_module_uri can find mod-b's pom.xml
+        (mod_b / "src").mkdir()
+        (mod_b / "src" / "Foo.java").touch()
+
+        result = await proxy.add_module_if_new(file_uri)
+        assert result is not None  # module_uri returned for wait_until_ready
+        proxy.send_notification.assert_called_once()  # type: ignore[attr-defined]
+        call_args = proxy.send_notification.call_args[0]  # type: ignore[attr-defined]
+        event = call_args[1]["event"]
+        assert event["added"][0]["uri"] == group_b.as_uri()
+        assert group_b.as_uri() in proxy._expanded_groups
+        assert len(proxy._expanded_groups) == 2
+
+    async def test_add_module_within_expanded_group_is_noop(self, tmp_path: Path) -> None:
+        """A file within an already-expanded group returns None."""
+        from unittest.mock import AsyncMock
+
+        from java_functional_lsp.proxy import JdtlsProxy
+
+        monorepo = tmp_path / "monorepo"
+        group = monorepo / "group"
+        mod_a = group / "mod-a"
+        mod_b = group / "mod-b"
+        for d in (mod_a, mod_b):
+            d.mkdir(parents=True)
+            (d / "pom.xml").write_text("<project/>")
+        (group / "pom.xml").write_text(
+            "<project><modules><module>mod-a</module><module>mod-b</module></modules></project>"
+        )
+
+        proxy = JdtlsProxy()
+        proxy._available = True
+        proxy._original_root_uri = monorepo.as_uri()
+        proxy._expanded_groups.add(group.as_uri())
+        proxy.send_notification = AsyncMock()  # type: ignore[assignment]
+
+        file_uri = (mod_b / "src" / "Bar.java").as_uri()
+        (mod_b / "src").mkdir()
+        (mod_b / "src" / "Bar.java").touch()
+
+        result = await proxy.add_module_if_new(file_uri)
+        assert result is None
+        proxy.send_notification.assert_not_called()  # type: ignore[attr-defined]
+
+    async def test_add_module_at_cap_refuses_expansion(self, tmp_path: Path) -> None:
+        """Expansion is refused when _MAX_EXPANDED_GROUPS is reached."""
+        from unittest.mock import AsyncMock
+
+        from java_functional_lsp.proxy import _MAX_EXPANDED_GROUPS, JdtlsProxy
+
+        monorepo = tmp_path / "monorepo"
+        new_group = monorepo / "new-group"
+        mod = new_group / "mod"
+        mod.mkdir(parents=True)
+        (mod / "pom.xml").write_text("<project/>")
+        (new_group / "pom.xml").write_text("<project><modules><module>mod</module></modules></project>")
+
+        proxy = JdtlsProxy()
+        proxy._available = True
+        proxy._original_root_uri = monorepo.as_uri()
+        # Fill up to the cap with dummy groups
+        for i in range(_MAX_EXPANDED_GROUPS):
+            proxy._expanded_groups.add(f"file:///fake/group-{i}")
+        proxy.send_notification = AsyncMock()  # type: ignore[assignment]
+
+        file_uri = (mod / "src" / "Baz.java").as_uri()
+        (mod / "src").mkdir()
+        (mod / "src" / "Baz.java").touch()
+
+        result = await proxy.add_module_if_new(file_uri)
+        assert result is None
+        proxy.send_notification.assert_not_called()  # type: ignore[attr-defined]
+        assert len(proxy._expanded_groups) == _MAX_EXPANDED_GROUPS
 
     async def test_ensure_started_no_build_file(self) -> None:
         """ensure_started with no build file should pass module_root_uri=None."""
