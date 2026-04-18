@@ -724,7 +724,7 @@ async def _ensure_module_and_forward(
         return result
 
     # Cold path: add module if unknown, then wait for ready.
-    logger.info("jdtls: %s [cold] module=%s expanded=%s", method, short_mod, proxy._workspace_expanded)
+    logger.info("jdtls: %s [cold] module=%s groups=%d", method, short_mod, len(proxy._expanded_groups))
     new_module_uri = await proxy.add_module_if_new(file_uri)
 
     serialized = _serialize_params(params)

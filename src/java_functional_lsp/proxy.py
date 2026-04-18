@@ -28,6 +28,7 @@ _INITIALIZE_TIMEOUT = 120.0  # seconds — module-scoped init can still be slow 
 _START_RETRY_COOLDOWN = 300.0  # seconds — retry jdtls startup after transient failure
 DEFAULT_JVM_MAX_HEAP = "4g"
 _STDERR_LINE_MAX = 1000
+_MAX_EXPANDED_GROUPS: int = 5  # hard cap on concurrent Maven group workspace folders (prevents jdtls OOM)
 
 #: Minimum Java major version required by jdtls 1.57+. Anything below this
 #: is rejected by the jdtls Python launcher with ``"jdtls requires at least
@@ -374,6 +375,10 @@ class ModuleRegistry:
         if event is not None:
             event.set()
 
+    def uris(self) -> list[str]:
+        """Return all tracked module URIs (any state)."""
+        return list(self._states)
+
     def clear(self) -> None:
         """Reset all state. Used by tests."""
         self._states.clear()
@@ -445,6 +450,7 @@ def _version_key(name: str) -> tuple[int, ...]:
     return tuple(parts)
 
 
+@lru_cache(maxsize=64)
 def _find_maven_group_root(initial_module: Path, workspace_root: Path) -> Path:
     """Return the tightest Maven multi-module parent of *initial_module*.
 
@@ -641,7 +647,7 @@ class JdtlsProxy:
         self._initial_module_uri: str | None = None
         self.modules = ModuleRegistry()
         self.has_lombok = False
-        self._workspace_expanded = False
+        self._expanded_groups: set[str] = set()
         # Merkle snapshot diff: module_uri → (diff | None, current_snapshot)
         # Populated by _kick_module_diff (background task on add_module_if_new).
         # Consumed by server._apply_module_diff after module reaches READY.
@@ -887,33 +893,76 @@ class JdtlsProxy:
                 pass  # result storage is _kick_module_diff's responsibility
 
     async def add_module_if_new(self, file_uri: str) -> str | None:
-        """Add the module containing *file_uri* to jdtls if not already added.
+        """Add the module's Maven group to jdtls if not already expanded.
 
-        Returns the module URI if a new module was added (UNKNOWN → ADDED),
-        or ``None`` if already known or unavailable. The returned URI can be
-        used with ``modules.wait_until_ready()`` for adaptive waiting.
+        When the user navigates to a file in a new Maven group, we add the
+        group root (not the individual module) as a workspace folder.  This
+        gives jdtls the full Maven classpath for cross-module navigation
+        within that group.
 
-        Calls ``modules.mark_added()`` before any ``await`` to prevent
-        duplicate add calls from concurrent coroutines.
+        Returns the module URI if a new group was expanded (for use with
+        ``modules.wait_until_ready()``), or ``None`` if already covered.
+
+        Capped at ``_MAX_EXPANDED_GROUPS`` to prevent jdtls OOM.
         """
-        if not self._available or self._workspace_expanded:
+        if not self._available:
             return None
+        from pygls.uris import from_fs_path, to_fs_path
+
         module_uri = _resolve_module_uri(file_uri)
         if module_uri is None or self.modules.was_added(module_uri):
             return None
+
+        # Resolve the Maven group root for this module.
+        module_path = to_fs_path(module_uri)
+        workspace_path = to_fs_path(self._original_root_uri) if self._original_root_uri else None
+        if module_path and workspace_path:
+            group_root = _find_maven_group_root(Path(module_path), Path(workspace_path))
+            group_uri = from_fs_path(str(group_root)) or module_uri
+        else:
+            group_uri = module_uri
+
+        # Already expanded this group — module is covered, nothing to do.
+        if group_uri in self._expanded_groups:
+            return None
+
+        # Hard cap: refuse expansion beyond the limit.
+        if len(self._expanded_groups) >= _MAX_EXPANDED_GROUPS:
+            logger.warning(
+                "jdtls: refusing to expand group for %s — %d groups already expanded (max %d). Restart IDE to reset.",
+                Path(module_path or module_uri).name,
+                len(self._expanded_groups),
+                _MAX_EXPANDED_GROUPS,
+            )
+            return None
+
+        # Remove individually-added child modules within this group to avoid
+        # double-indexing once the group root covers them.  Must run BEFORE
+        # mark_added so we don't remove the module we're about to add.
+        group_path = Path(to_fs_path(group_uri) or group_uri)
+        removed: list[dict[str, str]] = []
+        for uri in self.modules.uris():
+            if uri == group_uri:
+                continue
+            p = Path(to_fs_path(uri) or uri)
+            if p == group_path or p.is_relative_to(group_path):
+                removed.append({"uri": uri, "name": p.name})
+
         # Mark ADDED before await — atomic in asyncio, prevents duplicate sends.
         self.modules.mark_added(module_uri)
-        from pygls.uris import to_fs_path
+        self.modules.mark_added(group_uri)
+        self._expanded_groups.add(group_uri)
 
-        logger.info("jdtls: adding module %s", _redact_path(to_fs_path(module_uri)))
-        mod_name = Path(to_fs_path(module_uri) or module_uri).name
+        group_name = Path(to_fs_path(group_uri) or group_uri).name
+        logger.info(
+            "jdtls: expanding to group %s (group %d/%d)", group_name, len(self._expanded_groups), _MAX_EXPANDED_GROUPS
+        )
         await self.send_notification(
             _WORKSPACE_DID_CHANGE_FOLDERS,
-            {"event": {"added": [{"uri": module_uri, "name": mod_name}], "removed": []}},
+            {"event": {"added": [{"uri": group_uri, "name": group_name}], "removed": removed}},
         )
-        # Fire-and-forget: compute snapshot diff in background so it is ready
-        # when the module reaches READY state.  Does NOT block the jdtls
-        # readiness timeout (which starts ticking at mark_added above).
+
+        # Fire-and-forget: compute snapshot diff in background.
         diff_task = asyncio.create_task(self._kick_module_diff(module_uri))
         self._proxy_bg_tasks.add(diff_task)
         diff_task.add_done_callback(self._proxy_bg_tasks.discard)
@@ -921,24 +970,16 @@ class JdtlsProxy:
         return module_uri
 
     async def expand_full_workspace(self) -> None:
-        """Expand jdtls workspace to the nearest Maven module-group root.
+        """Expand jdtls workspace to the initial module's Maven group root.
 
-        Instead of expanding all the way to the IDE workspace root (which may
-        contain hundreds of Maven modules and cause jdtls OOM), this walks up
-        from the initial module to find the *nearest* ancestor directory whose
-        ``pom.xml`` declares ``<modules>`` — i.e. the tightest multi-module
-        Maven parent.  This covers sibling modules (the common case for
-        cross-module navigation) without ballooning the index.
-
-        Falls back to the initial module itself when no intermediate
-        multi-module parent is found (e.g. flat modules sitting directly
-        under the workspace root), keeping the jdtls scope as tight as
-        possible.
+        Called once during lazy start.  Subsequent groups are expanded
+        on-demand by ``add_module_if_new()`` as the user navigates to
+        files in other Maven groups.
 
         Removes all individually-added module folders to avoid double-indexing
         with the newly added group root.
         """
-        if self._workspace_expanded or not self._available or not self._original_root_uri:
+        if not self._available or not self._original_root_uri:
             return
         from pygls.uris import from_fs_path, to_fs_path
 
@@ -952,26 +993,31 @@ class JdtlsProxy:
 
         root_path = group_root_path
         root_uri = from_fs_path(root_path) or self._original_root_uri
-        if self.modules.was_added(root_uri):
-            self._workspace_expanded = True
+
+        # Already expanded (e.g. initial module IS the group root, or called twice).
+        if root_uri in self._expanded_groups or self.modules.was_added(root_uri):
+            self._expanded_groups.add(root_uri)
             return
         self.modules.mark_added(root_uri)
 
-        # Remove ALL individually-added modules to prevent double-indexing with
-        # the full root.  This covers both the initial scoped module and any
-        # modules added by add_module_if_new during the ensure_started window.
+        # Remove individually-added modules that are children of the new root.
+        # This covers the initial scoped module and any modules added by
+        # add_module_if_new during the ensure_started window.
+        root_path_obj = Path(root_path)
         removed: list[dict[str, str]] = []
-        for uri in list(self.modules._states):
-            if uri != root_uri:
-                p = to_fs_path(uri) or uri
-                removed.append({"uri": uri, "name": Path(p).name})
+        for uri in self.modules.uris():
+            if uri == root_uri:
+                continue
+            p = Path(to_fs_path(uri) or uri)
+            if p == root_path_obj or p.is_relative_to(root_path_obj):
+                removed.append({"uri": uri, "name": p.name})
 
         logger.info("jdtls: expanding workspace to module group %s", _redact_path(root_path))
         await self.send_notification(
             _WORKSPACE_DID_CHANGE_FOLDERS,
             {"event": {"added": [{"uri": root_uri, "name": Path(root_path).name}], "removed": removed}},
         )
-        self._workspace_expanded = True
+        self._expanded_groups.add(root_uri)
 
     async def stop(self) -> None:
         """Shutdown jdtls subprocess gracefully."""
