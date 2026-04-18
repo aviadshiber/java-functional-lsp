@@ -983,6 +983,13 @@ class TestFindModuleRoot:
 class TestLazyStart:
     """Tests for lazy-start proxy features."""
 
+    @pytest.fixture(autouse=True)
+    def _clear_group_root_cache(self) -> None:  # type: ignore[override]
+        """Clear _find_maven_group_root lru_cache between tests."""
+        from java_functional_lsp.proxy import _find_maven_group_root
+
+        _find_maven_group_root.cache_clear()
+
     def test_check_available_true(self) -> None:
         from java_functional_lsp.proxy import JdtlsProxy
 
@@ -1280,6 +1287,7 @@ class TestLazyStart:
         call_args = proxy.send_notification.call_args[0]  # type: ignore[attr-defined]
         event = call_args[1]["event"]
         assert event["added"][0]["uri"] == group_b.as_uri()
+        assert event["removed"] == []  # no child modules to remove from new group
         assert group_b.as_uri() in proxy._expanded_groups
         assert len(proxy._expanded_groups) == 2
 

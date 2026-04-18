@@ -375,6 +375,10 @@ class ModuleRegistry:
         if event is not None:
             event.set()
 
+    def uris(self) -> list[str]:
+        """Return all tracked module URIs (any state)."""
+        return list(self._states)
+
     def clear(self) -> None:
         """Reset all state. Used by tests."""
         self._states.clear()
@@ -932,20 +936,20 @@ class JdtlsProxy:
             )
             return None
 
-        # Mark individual module ADDED before await — prevents duplicate sends.
-        self.modules.mark_added(module_uri)
-
         # Remove individually-added child modules within this group to avoid
-        # double-indexing once the group root covers them.
-        group_fs = to_fs_path(group_uri) or group_uri
+        # double-indexing once the group root covers them.  Must run BEFORE
+        # mark_added so we don't remove the module we're about to add.
+        group_path = Path(to_fs_path(group_uri) or group_uri)
         removed: list[dict[str, str]] = []
-        for uri in list(self.modules._states):
+        for uri in self.modules.uris():
             if uri == group_uri:
                 continue
-            p = to_fs_path(uri) or uri
-            if p.startswith(group_fs):
-                removed.append({"uri": uri, "name": Path(p).name})
+            p = Path(to_fs_path(uri) or uri)
+            if p == group_path or p.is_relative_to(group_path):
+                removed.append({"uri": uri, "name": p.name})
 
+        # Mark ADDED before await — atomic in asyncio, prevents duplicate sends.
+        self.modules.mark_added(module_uri)
         self.modules.mark_added(group_uri)
         self._expanded_groups.add(group_uri)
 
@@ -996,14 +1000,17 @@ class JdtlsProxy:
             return
         self.modules.mark_added(root_uri)
 
-        # Remove ALL individually-added modules to prevent double-indexing with
-        # the full root.  This covers both the initial scoped module and any
-        # modules added by add_module_if_new during the ensure_started window.
+        # Remove individually-added modules that are children of the new root.
+        # This covers the initial scoped module and any modules added by
+        # add_module_if_new during the ensure_started window.
+        root_path_obj = Path(root_path)
         removed: list[dict[str, str]] = []
-        for uri in list(self.modules._states):
-            if uri != root_uri:
-                p = to_fs_path(uri) or uri
-                removed.append({"uri": uri, "name": Path(p).name})
+        for uri in self.modules.uris():
+            if uri == root_uri:
+                continue
+            p = Path(to_fs_path(uri) or uri)
+            if p == root_path_obj or p.is_relative_to(root_path_obj):
+                removed.append({"uri": uri, "name": p.name})
 
         logger.info("jdtls: expanding workspace to module group %s", _redact_path(root_path))
         await self.send_notification(
