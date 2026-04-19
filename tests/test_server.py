@@ -1586,15 +1586,31 @@ class TestCacheClear:
 
         assert (cache / ".version").read_text() == _compute_cache_marker()
 
-    def test_python_version_bump_preserves_cache(self, tmp_path: Any) -> None:
+    def test_python_version_bump_preserves_cache(self) -> None:
         """Our __version__ is NOT in the cache marker — pip upgrades don't wipe."""
+        from unittest.mock import patch
+
         from java_functional_lsp.proxy import _compute_cache_marker
 
-        marker = _compute_cache_marker()
-        # Marker should not contain our Python package version
-        from java_functional_lsp import __version__
+        marker_before = _compute_cache_marker()
+        with patch("java_functional_lsp.__version__", "99.99.99"):
+            marker_after = _compute_cache_marker()
+        assert marker_before == marker_after, "Changing __version__ must not change the cache marker"
 
-        assert __version__ not in marker
+    def test_different_jdtls_paths_produce_different_markers(self) -> None:
+        """Different resolved jdtls paths produce different cache markers."""
+        from pathlib import Path
+        from unittest.mock import patch
+
+        from java_functional_lsp.proxy import _compute_cache_marker
+
+        with patch("java_functional_lsp.proxy.shutil.which", return_value="/opt/jdtls/1.57/bin/jdtls"):
+            with patch("java_functional_lsp.proxy.Path.resolve", return_value=Path("/opt/jdtls/1.57/bin/jdtls")):
+                marker_a = _compute_cache_marker()
+        with patch("java_functional_lsp.proxy.shutil.which", return_value="/opt/jdtls/1.58/bin/jdtls"):
+            with patch("java_functional_lsp.proxy.Path.resolve", return_value=Path("/opt/jdtls/1.58/bin/jdtls")):
+                marker_b = _compute_cache_marker()
+        assert marker_a != marker_b
 
 
 # Subprocess-based tests — zero mocks, real LSP transport

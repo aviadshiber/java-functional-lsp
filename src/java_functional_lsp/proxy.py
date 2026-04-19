@@ -594,7 +594,7 @@ def _compute_cache_marker() -> str:
         resolved = str(Path(jdtls_path).resolve())
         parts.append(hashlib.sha256(resolved.encode()).hexdigest()[:12])
     parts.append(str(_MIN_JDTLS_JAVA_MAJOR))
-    return "|".join(parts) or "unknown"
+    return "|".join(parts)
 
 
 def _clear_cache_on_version_change(cache_root: Path) -> None:
@@ -693,9 +693,9 @@ def _build_effective_params(
     # Inject jdtls Maven/Gradle settings into initializationOptions.
     # Must be in initializationOptions (not didChangeConfiguration) so they
     # apply before the Maven import scan starts.
-    jdtls_settings = _DEFAULT_JDTLS_SETTINGS.copy()
+    jdtls_settings = copy.deepcopy(_DEFAULT_JDTLS_SETTINGS)
     if config and "jdtls" in config and "settings" in config["jdtls"]:
-        jdtls_settings = config["jdtls"]["settings"]
+        jdtls_settings = copy.deepcopy(config["jdtls"]["settings"])
     init_opts = effective_params.setdefault("initializationOptions", {})
     init_opts["settings"] = jdtls_settings
     logger.debug("jdtls: initializationOptions.settings = %s", jdtls_settings)
