@@ -1547,6 +1547,48 @@ class TestFindLombokJar:
         assert any("does not exist" in r.getMessage() for r in caplog.records)
 
 
+class TestDidChangeConfiguration:
+    """Tests for workspace/didChangeConfiguration forwarding."""
+
+    def test_forwards_to_jdtls_when_available(self) -> None:
+        from unittest.mock import AsyncMock, patch
+
+        import java_functional_lsp.server as srv_mod
+        from java_functional_lsp.server import on_did_change_configuration, server
+
+        srv_mod._last_config_forward = 0.0  # reset cooldown
+        server._proxy._available = True
+        server._proxy.send_notification = AsyncMock()  # type: ignore[assignment]
+        params = lsp.DidChangeConfigurationParams(settings={"java": {"autobuild": {"enabled": True}}})
+        with patch("java_functional_lsp.server._fire_and_forget") as mock_faf:
+            on_did_change_configuration(params)
+            mock_faf.assert_called_once()
+
+    def test_throttled_within_cooldown(self) -> None:
+        from unittest.mock import patch
+
+        import java_functional_lsp.server as srv_mod
+        from java_functional_lsp.server import on_did_change_configuration, server
+
+        server._proxy._available = True
+        srv_mod._last_config_forward = __import__("time").monotonic()  # just sent
+        params = lsp.DidChangeConfigurationParams(settings={})
+        with patch("java_functional_lsp.server._fire_and_forget") as mock_faf:
+            on_did_change_configuration(params)
+            mock_faf.assert_not_called()
+
+    def test_skipped_when_proxy_unavailable(self) -> None:
+        from unittest.mock import patch
+
+        from java_functional_lsp.server import on_did_change_configuration, server
+
+        server._proxy._available = False
+        params = lsp.DidChangeConfigurationParams(settings={})
+        with patch("java_functional_lsp.server._fire_and_forget") as mock_faf:
+            on_did_change_configuration(params)
+            mock_faf.assert_not_called()
+
+
 class TestCacheClear:
     """Tests for _clear_cache_on_version_change() and _compute_cache_marker()."""
 

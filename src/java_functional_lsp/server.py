@@ -635,6 +635,24 @@ async def on_did_close(params: lsp.DidCloseTextDocumentParams) -> None:
     _forward_or_queue("textDocument/didClose", _serialize_params(params))
 
 
+_DIDCHANGE_CONFIG_COOLDOWN = 30.0  # seconds — rate-limit didChangeConfiguration forwarding
+_last_config_forward: float = 0.0
+
+
+@server.feature(lsp.WORKSPACE_DID_CHANGE_CONFIGURATION)
+def on_did_change_configuration(params: lsp.DidChangeConfigurationParams) -> None:
+    """Forward IDE configuration changes to jdtls (rate-limited)."""
+    global _last_config_forward
+    if not server._proxy.is_available:
+        return
+    now = __import__("time").monotonic()
+    if now - _last_config_forward < _DIDCHANGE_CONFIG_COOLDOWN:
+        logger.debug("jdtls: throttling didChangeConfiguration (%.0fs cooldown)", _DIDCHANGE_CONFIG_COOLDOWN)
+        return
+    _last_config_forward = now
+    _fire_and_forget(server._proxy.send_notification("workspace/didChangeConfiguration", _serialize_params(params)))
+
+
 async def _lazy_start_jdtls(file_uri: str) -> None:
     """Background task: start jdtls scoped to the module containing *file_uri*.
 
