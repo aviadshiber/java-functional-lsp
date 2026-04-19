@@ -12,6 +12,7 @@ import logging
 import os
 import re
 import sys
+import time
 from collections.abc import Coroutine
 from pathlib import Path
 from typing import Any
@@ -645,7 +646,7 @@ def on_did_change_configuration(params: lsp.DidChangeConfigurationParams) -> Non
     global _last_config_forward
     if not server._proxy.is_available:
         return
-    now = __import__("time").monotonic()
+    now = time.monotonic()
     if now - _last_config_forward < _DIDCHANGE_CONFIG_COOLDOWN:
         logger.debug("jdtls: throttling didChangeConfiguration (%.0fs cooldown)", _DIDCHANGE_CONFIG_COOLDOWN)
         return

@@ -1571,7 +1571,9 @@ class TestDidChangeConfiguration:
         from java_functional_lsp.server import on_did_change_configuration, server
 
         server._proxy._available = True
-        srv_mod._last_config_forward = __import__("time").monotonic()  # just sent
+        import time
+
+        srv_mod._last_config_forward = time.monotonic()  # just sent
         params = lsp.DidChangeConfigurationParams(settings={})
         with patch("java_functional_lsp.server._fire_and_forget") as mock_faf:
             on_did_change_configuration(params)
