@@ -30,6 +30,27 @@ DEFAULT_JVM_MAX_HEAP = "4g"
 _STDERR_LINE_MAX = 1000
 _MAX_EXPANDED_GROUPS: int = 5  # hard cap on concurrent Maven group workspace folders (prevents jdtls OOM)
 
+# Default jdtls initialization settings.  Sent via initializationOptions.settings
+# so they apply BEFORE the Maven import scan (didChangeConfiguration is too late).
+# Users can override via .java-functional-lsp.json: {"jdtls": {"settings": {...}}}
+_DEFAULT_JDTLS_SETTINGS: dict[str, Any] = {
+    "java": {
+        "import": {
+            "maven": {"enabled": True},
+            "gradle": {"enabled": False},
+            "exclusions": [
+                "**/node_modules/**",
+                "**/.metadata/**",
+                "**/archetype-resources/**",
+                "**/META-INF/maven/**",
+                "**/target/**",
+            ],
+        },
+        "configuration": {"updateBuildConfiguration": "automatic"},
+        "maven": {"downloadSources": False},
+    }
+}
+
 #: Minimum Java major version required by jdtls 1.57+. Anything below this
 #: is rejected by the jdtls Python launcher with ``"jdtls requires at least
 #: Java 21"`` before the server even starts.
@@ -558,25 +579,43 @@ def _wipe_data_dir(data_dir: Path) -> None:
         logger.info("jdtls: wiped data-dir %s after init timeout", _redact_path(str(data_dir)))
 
 
-def _clear_cache_on_version_change(cache_root: Path) -> None:
-    """Clear jdtls data cache when the server version changes.
+def _compute_cache_marker() -> str:
+    """Compute a stable cache marker from jdtls version path + Java version.
 
-    Stores a ``.version`` marker in the cache root. On version mismatch
-    (e.g., Lombok agent added, jdtls config changed), wipes the entire
-    cache so jdtls re-indexes from scratch with the current configuration.
+    Our Python package version changes (pip upgrades) do NOT affect the jdtls
+    Eclipse workspace index — only jdtls binary upgrades or Java version
+    changes do.  Resolves through symlinks so Homebrew Cellar version changes
+    (e.g. ``/opt/homebrew/Cellar/jdtls/1.58.0/...``) are detected even when
+    the wrapper script at ``/opt/homebrew/bin/jdtls`` doesn't change.
     """
-    from . import __version__
+    parts: list[str] = []
+    jdtls_path = shutil.which("jdtls")
+    if jdtls_path:
+        resolved = str(Path(jdtls_path).resolve())
+        parts.append(hashlib.sha256(resolved.encode()).hexdigest()[:12])
+    parts.append(str(_MIN_JDTLS_JAVA_MAJOR))
+    return "|".join(parts) or "unknown"
 
+
+def _clear_cache_on_version_change(cache_root: Path) -> None:
+    """Clear jdtls data cache when the jdtls installation changes.
+
+    Stores a ``.version`` marker in the cache root.  The marker is derived
+    from the resolved jdtls binary path + Java version requirement — NOT
+    from our Python ``__version__``.  This preserves warm caches across
+    java-functional-lsp upgrades (which don't affect the Eclipse index).
+    """
+    current_marker = _compute_cache_marker()
     marker = cache_root / ".version"
     try:
-        if marker.exists() and marker.read_text().strip() == __version__:
+        if marker.exists() and marker.read_text().strip() == current_marker:
             return
-        # Version changed or first run — clear stale caches.
+        # jdtls or Java version changed, or first run — clear stale caches.
         if cache_root.exists():
             shutil.rmtree(cache_root)
-            logger.info("jdtls: cleared stale cache (version changed to %s)", __version__)
+            logger.info("jdtls: cleared stale cache (marker changed to %s)", current_marker)
         cache_root.mkdir(parents=True, exist_ok=True)
-        marker.write_text(__version__)
+        marker.write_text(current_marker)
     except OSError as e:
         logger.warning("jdtls: failed to manage cache version marker: %s", e)
 
@@ -620,6 +659,48 @@ def _find_lombok_jar(config: Mapping[str, Any] | None = None) -> str | None:
         return str(fallback)
 
     return None
+
+
+def _build_effective_params(
+    init_params: dict[str, Any],
+    module_root_uri: str | None,
+    original_root: str,
+    config: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    """Build the ``initialize`` request params for jdtls.
+
+    Deep-copies *init_params*, scopes to *module_root_uri* if provided,
+    injects workspaceFolders capability, and injects Maven/Gradle settings
+    from *config* (or defaults) into ``initializationOptions.settings``.
+    """
+    from pygls.uris import to_fs_path
+
+    effective_params = copy.deepcopy(init_params)
+    if module_root_uri:
+        effective_params["rootUri"] = module_root_uri
+        effective_params["rootPath"] = to_fs_path(module_root_uri)
+        logger.info(
+            "jdtls: scoping to module %s (full root: %s)",
+            _redact_path(module_root_uri),
+            _redact_path(original_root),
+        )
+
+    # Inject workspaceFolders capability for later expansion.
+    caps = effective_params.setdefault("capabilities", {})
+    ws = caps.setdefault("workspace", {})
+    ws["workspaceFolders"] = True
+
+    # Inject jdtls Maven/Gradle settings into initializationOptions.
+    # Must be in initializationOptions (not didChangeConfiguration) so they
+    # apply before the Maven import scan starts.
+    jdtls_settings = _DEFAULT_JDTLS_SETTINGS.copy()
+    if config and "jdtls" in config and "settings" in config["jdtls"]:
+        jdtls_settings = config["jdtls"]["settings"]
+    init_opts = effective_params.setdefault("initializationOptions", {})
+    init_opts["settings"] = jdtls_settings
+    logger.debug("jdtls: initializationOptions.settings = %s", jdtls_settings)
+
+    return effective_params
 
 
 class JdtlsProxy:
@@ -724,23 +805,7 @@ class JdtlsProxy:
         data_dir = cache_root / data_hash
         data_dir.mkdir(parents=True, exist_ok=True)
 
-        # Deep copy to avoid mutating server._init_params.
-        effective_params = copy.deepcopy(init_params)
-        if module_root_uri:
-            effective_params["rootUri"] = module_root_uri
-            from pygls.uris import to_fs_path
-
-            effective_params["rootPath"] = to_fs_path(module_root_uri)
-            logger.info(
-                "jdtls: scoping to module %s (full root: %s)",
-                _redact_path(module_root_uri),
-                _redact_path(original_root),
-            )
-
-        # Inject workspaceFolders capability for later expansion.
-        caps = effective_params.setdefault("capabilities", {})
-        ws = caps.setdefault("workspace", {})
-        ws["workspaceFolders"] = True
+        effective_params = _build_effective_params(init_params, module_root_uri, original_root, config)
 
         jdtls_cmd: list[str] = [
             jdtls_path,
