@@ -242,7 +242,37 @@ The server auto-discovers `lombok.jar` from these locations (first match wins):
 3. **Maven cache** — auto-discovered from `~/.m2/repository/org/projectlombok/lombok/`
 4. **Dedicated directory** — `~/.jdtls-libs/lombok.jar`
 
-If Lombok is used in your project but the jar isn't found, the server logs a warning. The jdtls cache is automatically cleared on version upgrade, so adding Lombok support takes effect immediately after `brew upgrade`.
+If Lombok is used in your project but the jar isn't found, the server logs a warning.
+
+### jdtls settings
+
+The server sends Maven/Gradle settings to jdtls at startup via `initializationOptions.settings`. Defaults are optimized for Maven monorepos (Maven enabled, Gradle disabled, build artifact exclusions). Override via `.java-functional-lsp.json`:
+
+```json
+{
+  "jdtls": {
+    "settings": {
+      "java": {
+        "import": {
+          "maven": { "enabled": true },
+          "gradle": { "enabled": true },
+          "exclusions": ["**/node_modules/**", "**/target/**"]
+        },
+        "configuration": { "updateBuildConfiguration": "automatic" },
+        "maven": { "downloadSources": true }
+      }
+    }
+  }
+}
+```
+
+Custom settings fully replace the defaults (no merge). See the [jdtls Preferences reference](https://github.com/eclipse-jdtls/eclipse.jdt.ls/blob/main/org.eclipse.jdt.ls.core/src/org/eclipse/jdt/ls/core/internal/preferences/Preferences.java) for all available keys.
+
+### jdtls cache
+
+The jdtls Eclipse workspace index is cached in `~/.cache/jdtls-data/`. Warm starts (~10-20s) reuse this cache; cold starts (60-120s) rebuild from scratch. The cache is automatically invalidated when jdtls or Java is upgraded, but **not** when java-functional-lsp is upgraded — our Python code changes don't affect the Eclipse index.
+
+To force a clean rebuild: `rm -rf ~/.cache/jdtls-data/`
 
 ### Suppressing jdtls diagnostics
 
