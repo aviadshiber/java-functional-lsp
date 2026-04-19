@@ -1548,48 +1548,69 @@ class TestFindLombokJar:
 
 
 class TestCacheClear:
-    """Tests for _clear_cache_on_version_change()."""
+    """Tests for _clear_cache_on_version_change() and _compute_cache_marker()."""
 
     def test_clears_on_version_mismatch(self, tmp_path: Any) -> None:
-        from java_functional_lsp.proxy import _clear_cache_on_version_change
+        from java_functional_lsp.proxy import _clear_cache_on_version_change, _compute_cache_marker
 
         cache = tmp_path / "jdtls-data"
         cache.mkdir()
         stale_dir = cache / "abc123"
         stale_dir.mkdir()
-        (cache / ".version").write_text("0.7.9")
+        (cache / ".version").write_text("old-stale-marker")
 
         _clear_cache_on_version_change(cache)
 
         assert not stale_dir.exists(), "Stale data-dir should be cleared"
         assert cache.exists(), "Cache root should be recreated"
-        from java_functional_lsp import __version__
+        assert (cache / ".version").read_text() == _compute_cache_marker()
 
-        assert (cache / ".version").read_text() == __version__
-
-    def test_keeps_cache_on_same_version(self, tmp_path: Any) -> None:
-        from java_functional_lsp import __version__
-        from java_functional_lsp.proxy import _clear_cache_on_version_change
+    def test_keeps_cache_on_same_marker(self, tmp_path: Any) -> None:
+        from java_functional_lsp.proxy import _clear_cache_on_version_change, _compute_cache_marker
 
         cache = tmp_path / "jdtls-data"
         cache.mkdir()
         existing_dir = cache / "abc123"
         existing_dir.mkdir()
-        (cache / ".version").write_text(__version__)
+        (cache / ".version").write_text(_compute_cache_marker())
 
         _clear_cache_on_version_change(cache)
 
         assert existing_dir.exists(), "Existing data-dir should be preserved"
 
     def test_creates_marker_on_first_run(self, tmp_path: Any) -> None:
-        from java_functional_lsp.proxy import _clear_cache_on_version_change
+        from java_functional_lsp.proxy import _clear_cache_on_version_change, _compute_cache_marker
 
         cache = tmp_path / "jdtls-data"
         _clear_cache_on_version_change(cache)
 
-        from java_functional_lsp import __version__
+        assert (cache / ".version").read_text() == _compute_cache_marker()
 
-        assert (cache / ".version").read_text() == __version__
+    def test_python_version_bump_preserves_cache(self) -> None:
+        """Our __version__ is NOT in the cache marker — pip upgrades don't wipe."""
+        from unittest.mock import patch
+
+        from java_functional_lsp.proxy import _compute_cache_marker
+
+        marker_before = _compute_cache_marker()
+        with patch("java_functional_lsp.__version__", "99.99.99"):
+            marker_after = _compute_cache_marker()
+        assert marker_before == marker_after, "Changing __version__ must not change the cache marker"
+
+    def test_different_jdtls_paths_produce_different_markers(self) -> None:
+        """Different resolved jdtls paths produce different cache markers."""
+        from pathlib import Path
+        from unittest.mock import patch
+
+        from java_functional_lsp.proxy import _compute_cache_marker
+
+        with patch("java_functional_lsp.proxy.shutil.which", return_value="/opt/jdtls/1.57/bin/jdtls"):
+            with patch("java_functional_lsp.proxy.Path.resolve", return_value=Path("/opt/jdtls/1.57/bin/jdtls")):
+                marker_a = _compute_cache_marker()
+        with patch("java_functional_lsp.proxy.shutil.which", return_value="/opt/jdtls/1.58/bin/jdtls"):
+            with patch("java_functional_lsp.proxy.Path.resolve", return_value=Path("/opt/jdtls/1.58/bin/jdtls")):
+                marker_b = _compute_cache_marker()
+        assert marker_a != marker_b
 
 
 # Subprocess-based tests — zero mocks, real LSP transport

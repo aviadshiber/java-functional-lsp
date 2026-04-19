@@ -1417,6 +1417,58 @@ class TestLazyStart:
 # ---------------------------------------------------------------------------
 
 
+class TestBuildEffectiveParams:
+    """Tests for _build_effective_params."""
+
+    def test_defaults_injected_when_no_config(self) -> None:
+        from java_functional_lsp.proxy import _build_effective_params
+
+        result = _build_effective_params({"rootUri": "file:///ws"}, None, "file:///ws", None)
+        settings = result["initializationOptions"]["settings"]
+        assert settings["java"]["import"]["maven"]["enabled"] is True
+        assert settings["java"]["import"]["gradle"]["enabled"] is False
+        assert "**/target/**" in settings["java"]["import"]["exclusions"]
+
+    def test_config_override_replaces_defaults(self) -> None:
+        from java_functional_lsp.proxy import _build_effective_params
+
+        custom = {"java": {"custom": "value"}}
+        config = {"jdtls": {"settings": custom}}
+        result = _build_effective_params({"rootUri": "file:///ws"}, None, "file:///ws", config)
+        settings = result["initializationOptions"]["settings"]
+        assert settings == {"java": {"custom": "value"}}
+        assert "import" not in settings.get("java", {})
+
+    def test_does_not_mutate_original_init_params(self) -> None:
+        from java_functional_lsp.proxy import _build_effective_params
+
+        original = {"rootUri": "file:///ws", "capabilities": {}}
+        _build_effective_params(original, "file:///mod", "file:///ws", None)
+        assert "initializationOptions" not in original
+        assert original["rootUri"] == "file:///ws"
+
+    def test_module_root_uri_scopes_root(self) -> None:
+        from java_functional_lsp.proxy import _build_effective_params
+
+        result = _build_effective_params({"rootUri": "file:///ws"}, "file:///mod", "file:///ws", None)
+        assert result["rootUri"] == "file:///mod"
+
+    def test_workspace_folders_capability_always_set(self) -> None:
+        from java_functional_lsp.proxy import _build_effective_params
+
+        result = _build_effective_params({"rootUri": "file:///ws"}, None, "file:///ws", None)
+        assert result["capabilities"]["workspace"]["workspaceFolders"] is True
+
+    def test_deepcopy_prevents_default_mutation(self) -> None:
+        from java_functional_lsp.proxy import _DEFAULT_JDTLS_SETTINGS, _build_effective_params
+
+        result = _build_effective_params({"rootUri": "file:///ws"}, None, "file:///ws", None)
+        # Mutate the returned settings
+        result["initializationOptions"]["settings"]["java"]["import"]["exclusions"].append("MUTATED")
+        # Module-level defaults must be unchanged
+        assert "MUTATED" not in _DEFAULT_JDTLS_SETTINGS["java"]["import"]["exclusions"]
+
+
 class TestWipeDataDir:
     def test_wipe_removes_directory(self, tmp_path: Path) -> None:
         """Directory is removed and info is logged."""
