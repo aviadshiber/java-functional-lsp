@@ -13,6 +13,7 @@ import os
 import re
 import sys
 import time
+from collections import OrderedDict
 from collections.abc import Coroutine
 from pathlib import Path
 from typing import Any
@@ -20,7 +21,7 @@ from typing import Any
 from lsprotocol import types as lsp
 from lsprotocol.converters import get_converter
 from pygls.lsp.server import LanguageServer
-from pygls.uris import to_fs_path
+from pygls.uris import from_fs_path, to_fs_path
 
 from .analyzers.base import Analyzer, Severity, get_parser, is_excluded, is_suppressed
 from .analyzers.base import Diagnostic as LintDiagnostic
@@ -62,6 +63,34 @@ _JDTLS_SKIP_CLIENTS = ("IntelliJ", "JetBrains")
 #: go-to-definition, references, etc.
 _converter = get_converter()
 
+# Cap on _session_opened_uris: a session navigating many files still bounds memory.
+# 4096 comfortably covers even aggressive monorepo navigation.
+_MAX_OPENED_URIS = 4096
+
+
+def _normalize_uri(uri: str) -> str:
+    """Canonicalize a file:// URI so equivalent paths compare equal.
+
+    Round-trips through pygls.uris to normalize URL encoding differences
+    (``%20`` vs literal space, ``%3A`` vs ``:``, trailing slashes, double
+    slashes) between what the client sends and what jdtls echoes back.
+
+    Non-file URIs (``jdt://``, ``untitled://``, etc.) are returned unchanged —
+    they're never stored in ``_session_opened_uris`` so they'll fall through the gate
+    regardless. Case-insensitive filesystems (macOS HFS+, NTFS) are not
+    normalized here: attempting that would require ``Path.resolve()``, which
+    would stat the filesystem and follow symlinks — too expensive for a hot
+    path that runs on every jdtls publish. On Windows, drive-letter case
+    (``C:`` vs ``c:``) is similarly not normalized.
+    """
+    if not uri.startswith("file:"):
+        return uri
+    fs = to_fs_path(uri)
+    if fs is None:
+        return uri
+    normalized = from_fs_path(fs)
+    return normalized if normalized is not None else uri
+
 
 class JavaFunctionalLspServer(LanguageServer):
     def __init__(self) -> None:
@@ -76,6 +105,33 @@ class JavaFunctionalLspServer(LanguageServer):
         self._skip_jdtls: bool = False
         self._skip_jdtls_registration: bool = False
         self._init_generation: int = 0
+        # URIs the client has opened at least once this session (normalized form).
+        # Jdtls indexes the whole workspace and publishes diagnostics for files the
+        # client never touched; we only republish for URIs present here so unrelated
+        # modules don't flood the client. Cumulative (not cleared on didClose) to
+        # survive the async race between didClose and late jdtls publishes.
+        # Bounded LRU: insertion-ordered, oldest evicted on overflow so a long
+        # session navigating many files can't grow the set unboundedly.
+        # Reset on initialize.
+        self._session_opened_uris: OrderedDict[str, None] = OrderedDict()
+
+    def _record_opened(self, uri: str) -> None:
+        """Record *uri* as opened this session, evicting the oldest entry at cap.
+
+        Stores the normalized form so gate lookups in ``_on_jdtls_diagnostics``
+        can use a fast raw-first check without redundant normalization.
+        """
+        uri = _normalize_uri(uri)
+        if uri in self._session_opened_uris:
+            self._session_opened_uris.move_to_end(uri)
+            return
+        self._session_opened_uris[uri] = None
+        # Size check uses > so the dict stabilises at exactly _MAX_OPENED_URIS
+        # entries after the pop: we insert first (reaching MAX+1 momentarily),
+        # then evict. The transient overshoot is invisible to other callers
+        # because asyncio is single-threaded and no await intervenes here.
+        if len(self._session_opened_uris) > _MAX_OPENED_URIS:
+            self._session_opened_uris.popitem(last=False)
 
     def _on_jdtls_diagnostics(self, uri: str, diagnostics: list[Any]) -> None:
         """Called when jdtls publishes diagnostics — merge with custom and re-publish.
@@ -108,10 +164,25 @@ class JavaFunctionalLspServer(LanguageServer):
                     # First READY transition only — subsequent diagnostics for the same
                     # module are no-ops to avoid spawning O(files) redundant tasks.
                     _fire_and_forget(_apply_module_diff(self._proxy, module_uri))
+        # Only republish for files the client has opened at any point this
+        # session (cumulative). Jdtls scans the whole workspace; without this
+        # guard, diagnostics for 200+ unrelated modules leak out as
+        # <new-diagnostics> tags (see #71). Non-file URIs (jdt://, untitled://,
+        # etc.) are never recorded by _record_opened so they're dropped here.
+        #
+        # Two-phase lookup: check the raw URI first (O(1), no allocation) since
+        # jdtls typically echoes URIs in the same form as the client — the fast
+        # path avoids the to_fs_path/from_fs_path round-trip on every publish.
+        # Fall back to the normalized form only on a miss to handle encoding
+        # mismatches (e.g., client sends literal space, jdtls echoes %20).
+        if uri not in self._session_opened_uris and _normalize_uri(uri) not in self._session_opened_uris:
+            return
         try:
             _analyze_and_publish(uri)
         except FileNotFoundError:
-            pass  # Virtual jdtls file (e.g., decompiled source in jdtls-data); skip silently.
+            # The file was in the opened-URIs set but vanished from disk
+            # between didOpen and this late jdtls publish. Benign.
+            pass
         except Exception as e:
             logger.error("Error re-publishing diagnostics for %s: %s", uri, e)
 
@@ -390,6 +461,7 @@ def on_initialize(params: lsp.InitializeParams) -> lsp.InitializeResult:
     server._skip_jdtls = False
     server._skip_jdtls_registration = False
     server._init_generation += 1
+    server._session_opened_uris.clear()
     _jdtls_capabilities_registered = False
 
     jdtls_override = os.environ.get("JAVA_FUNCTIONAL_LSP_JDTLS", "").strip().lower()
@@ -578,6 +650,9 @@ async def on_did_open(params: lsp.DidOpenTextDocumentParams) -> None:
     didOpen response isn't delayed by jdtls cold-start.
     """
     uri = params.text_document.uri
+    # Must precede any await: same-loop jdtls diagnostic callbacks need to
+    # observe this URI before they arrive to avoid the publish getting gated.
+    server._record_opened(uri)
 
     if server._skip_jdtls:
         # Skip all jdtls forwarding — custom diagnostics only.

@@ -173,6 +173,27 @@ def _ensure_workspace() -> None:
 class TestServerInternals:
     """Direct-call tests for server.py helpers — provides in-process coverage."""
 
+    @pytest.fixture(autouse=True)
+    def _reset_server_state(self) -> Any:
+        """Reset mutable singleton state on ``server`` before and after every
+        test. Guarantees (a) a test that crashes between .add and .discard
+        can't leak into its successor, and (b) residue from another test
+        module (notably ``test_merkle_proxy``) can't leak into this class."""
+        import java_functional_lsp.server as srv_mod
+        from java_functional_lsp.server import server
+
+        def _reset() -> None:
+            server._session_opened_uris.clear()
+            server._proxy.modules._states.clear()
+            server._skip_jdtls = False
+            server._skip_jdtls_registration = False
+            server._init_generation = 0
+            srv_mod._jdtls_capabilities_registered = False
+
+        _reset()
+        yield
+        _reset()
+
     def test_load_config_no_workspace(self) -> None:
         from java_functional_lsp.server import _load_config
 
@@ -281,6 +302,7 @@ class TestServerInternals:
                 uri=uri, language_id="java", version=1, text="class T { String f() { return null; } }"
             ),
         )
+        server._record_opened(uri)
         try:
             with patch.object(server, "text_document_publish_diagnostics") as mock_pub:
                 server._on_jdtls_diagnostics(uri, [])
@@ -289,6 +311,7 @@ class TestServerInternals:
                 assert "null-return" in codes
         finally:
             server.workspace.remove_text_document(uri)
+            server._session_opened_uris.pop(uri, None)
 
     def test_on_jdtls_diagnostics_non_project_skips_ready(self) -> None:
         """A publishDiagnostics batch with code-16 must NOT mark the module READY."""
@@ -322,6 +345,7 @@ class TestServerInternals:
 
         server._proxy.modules.clear()
         uri = "file:///mod/Pr.java"
+        server._record_opened(uri)
         real_diag = {
             "code": "268435844",
             "message": "Some unused import",
@@ -329,14 +353,406 @@ class TestServerInternals:
             "severity": 2,
             "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 1}},
         }
+        try:
+            with (
+                patch("java_functional_lsp.server._resolve_module_uri", return_value="file:///mod"),
+                patch("java_functional_lsp.server._analyze_and_publish") as mock_pub,
+                patch("java_functional_lsp.server._fire_and_forget"),
+            ):
+                server._on_jdtls_diagnostics(uri, [real_diag])
+                mock_pub.assert_called_once_with(uri)
+            assert server._proxy.modules.get_state("file:///mod") == ModuleState.READY
+        finally:
+            server._proxy.modules.clear()
+            server._session_opened_uris.pop(uri, None)
+
+    def test_on_jdtls_diagnostics_skips_publish_for_unopened_uri(self) -> None:
+        """Jdtls diagnostics for files the client never opened must not republish (#71)."""
+        from unittest.mock import patch
+
+        from java_functional_lsp.proxy import ModuleState
+        from java_functional_lsp.server import server
+
+        server._proxy.modules.clear()
+        uri = "file:///other/Module/Foo.java"
+        # Sanity-check: autouse fixture guarantees a clean set; explicit for readability.
+        assert uri not in server._session_opened_uris
+        real_diag = {
+            "code": "268435844",
+            "message": "Some unused import",
+            "source": "Java",
+            "severity": 2,
+            "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 1}},
+        }
+        try:
+            with (
+                patch("java_functional_lsp.server._resolve_module_uri", return_value="file:///other/Module"),
+                patch("java_functional_lsp.server._analyze_and_publish") as mock_pub,
+                patch("java_functional_lsp.server._fire_and_forget"),
+            ):
+                server._on_jdtls_diagnostics(uri, [real_diag])
+                mock_pub.assert_not_called()
+            # Module-READY bookkeeping must still run even when the publish is gated.
+            assert server._proxy.modules.get_state("file:///other/Module") == ModuleState.READY
+        finally:
+            server._proxy.modules.clear()
+
+    async def test_on_did_open_records_uri(self) -> None:
+        """on_did_open must add the URI to the session's opened-URIs set."""
+        from unittest.mock import patch
+
+        from java_functional_lsp.server import on_did_open, server
+
+        _ensure_workspace()
+        uri = "file:///test/Opened.java"
+        server._session_opened_uris.pop(uri, None)
+        old_skip = server._skip_jdtls
+        server._skip_jdtls = True  # avoid exercising jdtls paths
+        try:
+            with patch("java_functional_lsp.server._analyze_and_publish"):
+                await on_did_open(
+                    lsp.DidOpenTextDocumentParams(
+                        text_document=lsp.TextDocumentItem(
+                            uri=uri, language_id="java", version=1, text="class Opened {}"
+                        )
+                    )
+                )
+            assert uri in server._session_opened_uris
+        finally:
+            server._session_opened_uris.pop(uri, None)
+            server._skip_jdtls = old_skip
+
+    async def test_on_did_open_stores_normalized_form(self) -> None:
+        """on_did_open must store the normalized URI, not the raw client form.
+
+        _record_opened normalizes before storing.  If the client sends a URI
+        with a literal space and jdtls echoes it with ``%20``, the gate lookup
+        must still pass — which only works if the stored key is the normalized
+        form.
+        """
+        from unittest.mock import patch
+
+        from java_functional_lsp.server import _normalize_uri, on_did_open, server
+
+        _ensure_workspace()
+        raw_uri = "file:///test/has space.java"
+        normalized_uri = _normalize_uri(raw_uri)
+        assert normalized_uri != raw_uri, "test setup: raw and normalized must differ"
+        for u in (raw_uri, normalized_uri):
+            server._session_opened_uris.pop(u, None)
+        old_skip = server._skip_jdtls
+        server._skip_jdtls = True
+        try:
+            with patch("java_functional_lsp.server._analyze_and_publish"):
+                await on_did_open(
+                    lsp.DidOpenTextDocumentParams(
+                        text_document=lsp.TextDocumentItem(
+                            uri=raw_uri, language_id="java", version=1, text="class S {}"
+                        )
+                    )
+                )
+            # Raw form must NOT be stored; normalized form MUST be.
+            assert raw_uri not in server._session_opened_uris
+            assert normalized_uri in server._session_opened_uris
+        finally:
+            for u in (raw_uri, normalized_uri):
+                server._session_opened_uris.pop(u, None)
+            server._skip_jdtls = old_skip
+
+    def test_on_initialize_clears_opened_uris(self) -> None:
+        """Re-initialize must reset the session's opened-URIs set."""
+        from java_functional_lsp.server import on_initialize, server
+
+        server._record_opened("file:///stale/Leftover.java")
+        on_initialize(
+            lsp.InitializeParams(
+                process_id=1,
+                root_uri="file:///tmp",
+                capabilities=lsp.ClientCapabilities(),
+            )
+        )
+        assert not server._session_opened_uris
+
+    def test_opened_uris_evicts_oldest_at_cap(self) -> None:
+        """_record_opened enforces a FIFO cap so the set can't grow unbounded."""
+        from unittest.mock import patch
+
+        from java_functional_lsp.server import server
+
+        server._session_opened_uris.clear()
+        try:
+            with patch("java_functional_lsp.server._MAX_OPENED_URIS", 3):
+                for i in range(3):
+                    server._record_opened(f"file:///u/F{i}.java")
+                assert list(server._session_opened_uris) == [
+                    "file:///u/F0.java",
+                    "file:///u/F1.java",
+                    "file:///u/F2.java",
+                ]
+                # Fourth insert must evict the oldest.
+                server._record_opened("file:///u/F3.java")
+                assert list(server._session_opened_uris) == [
+                    "file:///u/F1.java",
+                    "file:///u/F2.java",
+                    "file:///u/F3.java",
+                ]
+                # Re-opening an existing URI moves it to the end, no eviction.
+                server._record_opened("file:///u/F1.java")
+                assert list(server._session_opened_uris) == [
+                    "file:///u/F2.java",
+                    "file:///u/F3.java",
+                    "file:///u/F1.java",
+                ]
+        finally:
+            server._session_opened_uris.clear()
+
+    def test_opened_uris_cap_one_always_evicts_previous(self) -> None:
+        """With cap=1, every new URI evicts the previous one."""
+        from unittest.mock import patch
+
+        from java_functional_lsp.server import server
+
+        server._session_opened_uris.clear()
+        try:
+            with patch("java_functional_lsp.server._MAX_OPENED_URIS", 1):
+                server._record_opened("file:///u/A.java")
+                assert list(server._session_opened_uris) == ["file:///u/A.java"]
+                server._record_opened("file:///u/B.java")
+                assert list(server._session_opened_uris) == ["file:///u/B.java"]
+                # Re-opening the sole entry is a no-op (move_to_end, no eviction).
+                server._record_opened("file:///u/B.java")
+                assert list(server._session_opened_uris) == ["file:///u/B.java"]
+        finally:
+            server._session_opened_uris.clear()
+
+    def test_opened_uris_burst_never_exceeds_cap(self) -> None:
+        """Inserting N >> cap items must leave the dict at exactly cap entries."""
+        from unittest.mock import patch
+
+        from java_functional_lsp.server import server
+
+        server._session_opened_uris.clear()
+        cap = 5
+        burst = 50
+        try:
+            with patch("java_functional_lsp.server._MAX_OPENED_URIS", cap):
+                for i in range(burst):
+                    server._record_opened(f"file:///u/F{i}.java")
+                assert len(server._session_opened_uris) == cap
+                # Must contain the last `cap` inserted URIs.
+                assert list(server._session_opened_uris) == [f"file:///u/F{i}.java" for i in range(burst - cap, burst)]
+        finally:
+            server._session_opened_uris.clear()
+
+    async def test_on_did_close_preserves_opened_uris(self) -> None:
+        """Cumulative design: didClose must NOT evict — late jdtls publishes still go through."""
+        from unittest.mock import patch
+
+        from java_functional_lsp.server import on_did_close, server
+
+        _ensure_workspace()
+        uri = "file:///test/Closed.java"
+        server._record_opened(uri)
+        old_skip = server._skip_jdtls
+        server._skip_jdtls = True
+        try:
+            with patch.object(server, "text_document_publish_diagnostics"):
+                await on_did_close(
+                    lsp.DidCloseTextDocumentParams(
+                        text_document=lsp.TextDocumentIdentifier(uri=uri),
+                    )
+                )
+            assert uri in server._session_opened_uris
+        finally:
+            server._session_opened_uris.pop(uri, None)
+            server._skip_jdtls = old_skip
+
+    async def test_on_did_close_preserves_opened_uris_jdtls_available(self) -> None:
+        """Cumulative design holds when jdtls IS available (not just the skip path)."""
+        from unittest.mock import AsyncMock, PropertyMock, patch
+
+        from java_functional_lsp.server import on_did_close, server
+
+        _ensure_workspace()
+        uri = "file:///test/ClosedLive.java"
+        server._record_opened(uri)
+        old_skip = server._skip_jdtls
+        server._skip_jdtls = False
+        try:
+            with (
+                patch.object(server, "text_document_publish_diagnostics"),
+                patch.object(type(server._proxy), "is_available", new_callable=PropertyMock, return_value=True),
+                patch.object(server._proxy, "send_notification", new=AsyncMock()),
+            ):
+                await on_did_close(
+                    lsp.DidCloseTextDocumentParams(
+                        text_document=lsp.TextDocumentIdentifier(uri=uri),
+                    )
+                )
+            assert uri in server._session_opened_uris
+        finally:
+            server._session_opened_uris.pop(uri, None)
+            server._skip_jdtls = old_skip
+
+    async def test_on_did_open_records_uri_before_first_await(self) -> None:
+        """Records the URI before yielding to the event loop.
+
+        Jdtls dispatches diagnostics on the same loop as ``on_did_open``. If
+        the record happened after the first ``await``, a diagnostic batch that
+        lands between the ``await`` and the record would be gated out. The
+        pre-await record is the only thing that guarantees same-loop
+        correctness — regression-guard it here.
+        """
+        from unittest.mock import AsyncMock, PropertyMock, patch
+
+        from java_functional_lsp.server import on_did_open, server
+
+        _ensure_workspace()
+        uri = "file:///test/PreAwait.java"
+        server._session_opened_uris.pop(uri, None)
+
+        observed_before_await: dict[str, bool] = {}
+
+        async def _spy_send(*_args: Any, **_kwargs: Any) -> None:
+            # This spy is injected as server._proxy.send_notification, which is
+            # the first ``await`` reached in the is_available=True branch of
+            # on_did_open (line: `await server._proxy.send_notification(...)`).
+            # If the URI was recorded before that point it must already be in
+            # the set. If a future refactor moves an ``await`` earlier in
+            # on_did_open, this spy must be updated to hook that new first
+            # await so the ordering guarantee is still tested.
+            observed_before_await["present"] = uri in server._session_opened_uris
+
+        old_skip = server._skip_jdtls
+        server._skip_jdtls = False
+        try:
+            with (
+                patch("java_functional_lsp.server._analyze_and_publish"),
+                patch.object(type(server._proxy), "is_available", new_callable=PropertyMock, return_value=True),
+                patch.object(server._proxy, "send_notification", new=AsyncMock(side_effect=_spy_send)),
+                patch.object(server._proxy, "add_module_if_new", new=AsyncMock()),
+            ):
+                await on_did_open(
+                    lsp.DidOpenTextDocumentParams(
+                        text_document=lsp.TextDocumentItem(uri=uri, language_id="java", version=1, text="class P {}")
+                    )
+                )
+            assert observed_before_await.get("present") is True, (
+                "URI must be recorded before on_did_open yields to the event loop"
+            )
+        finally:
+            server._session_opened_uris.pop(uri, None)
+            server._skip_jdtls = old_skip
+
+    async def test_on_did_open_records_uri_before_first_await_queue_mode(self) -> None:
+        """URI is recorded before any background task starts in queue (lazy-start) mode.
+
+        In the queue mode path (jdtls on PATH but not yet started), there is no
+        early ``await`` before ``_analyze_and_publish`` — the record must still
+        happen synchronously before the coroutine first yields.  This test
+        verifies that the ``_record_opened`` call precedes any async work by
+        checking the set state directly after the call, with jdtls startup mocked
+        out so no background coroutine fires.
+        """
+        from unittest.mock import AsyncMock, PropertyMock, patch
+
+        from java_functional_lsp.server import on_did_open, server
+
+        _ensure_workspace()
+        uri = "file:///test/QueueMode.java"
+        server._session_opened_uris.pop(uri, None)
+        old_skip = server._skip_jdtls
+        server._skip_jdtls = False
+        try:
+            with (
+                patch("java_functional_lsp.server._analyze_and_publish"),
+                # Simulate jdtls not yet available but on PATH and not failed.
+                patch.object(type(server._proxy), "is_available", new_callable=PropertyMock, return_value=False),
+                patch.object(server._proxy, "_jdtls_on_path", True),
+                patch.object(server._proxy, "_start_failed", False),
+                patch.object(server._proxy, "_lazy_start_fired", False),
+                patch.object(server._proxy, "queue_notification"),
+                # Prevent the real lazy-start background task from firing.
+                patch("java_functional_lsp.server._lazy_start_jdtls", new=AsyncMock()),
+                patch("java_functional_lsp.server._fire_and_forget"),
+            ):
+                await on_did_open(
+                    lsp.DidOpenTextDocumentParams(
+                        text_document=lsp.TextDocumentItem(uri=uri, language_id="java", version=1, text="class Q {}")
+                    )
+                )
+            # URI must be present regardless of which branch on_did_open took.
+            assert uri in server._session_opened_uris
+        finally:
+            server._session_opened_uris.pop(uri, None)
+            server._skip_jdtls = old_skip
+
+    def test_on_jdtls_diagnostics_non_project_unopened_skips_both(self) -> None:
+        """A code-16 batch for an unopened URI skips READY *and* publish.
+
+        Covers the interaction of two independent gates: the code-16 guard on
+        module-READY bookkeeping, and the opened-URIs gate on republishing.
+        Neither should fire.
+        """
+        from unittest.mock import patch
+
+        from java_functional_lsp.proxy import ModuleState
+        from java_functional_lsp.server import server
+
+        server._proxy.modules.clear()
+        uri = "file:///other/Module/Stranger.java"
+        # Sanity-check: autouse fixture guarantees a clean set; explicit for readability.
+        assert uri not in server._session_opened_uris
+        non_project_diag = {
+            "code": "16",
+            "message": "Stranger.java is a non-project file, only syntax errors are reported",
+            "source": "Java",
+            "severity": 2,
+            "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 1}},
+        }
         with (
-            patch("java_functional_lsp.server._resolve_module_uri", return_value="file:///mod"),
-            patch("java_functional_lsp.server._analyze_and_publish"),
+            patch("java_functional_lsp.server._resolve_module_uri", return_value="file:///other/Module"),
+            patch("java_functional_lsp.server._analyze_and_publish") as mock_pub,
             patch("java_functional_lsp.server._fire_and_forget"),
         ):
-            server._on_jdtls_diagnostics(uri, [real_diag])
-        assert server._proxy.modules.get_state("file:///mod") == ModuleState.READY
+            server._on_jdtls_diagnostics(uri, [non_project_diag])
+        mock_pub.assert_not_called()
+        assert server._proxy.modules.get_state("file:///other/Module") != ModuleState.READY
+
+    def test_normalize_uri_passes_through_file_uri(self) -> None:
+        from java_functional_lsp.server import _normalize_uri
+
+        assert _normalize_uri("file:///a/B.java") == "file:///a/B.java"
+
+    def test_normalize_uri_unifies_space_encoding(self) -> None:
+        """A literal space and %20 must canonicalize to the same URI."""
+        from java_functional_lsp.server import _normalize_uri
+
+        assert _normalize_uri("file:///a/has space.java") == _normalize_uri("file:///a/has%20space.java")
+
+    def test_normalize_uri_passes_through_non_file_scheme(self) -> None:
+        """Non-file URIs (jdt://, untitled://) are returned unchanged."""
+        from java_functional_lsp.server import _normalize_uri
+
+        assert _normalize_uri("jdt://contents/foo.Bar") == "jdt://contents/foo.Bar"
+        assert _normalize_uri("untitled://Untitled-1") == "untitled://Untitled-1"
+
+    def test_on_jdtls_diagnostics_matches_opened_uri_across_encodings(self) -> None:
+        """Gate compares URIs via _normalize_uri so %20 vs literal space still matches."""
+        from unittest.mock import patch
+
+        from java_functional_lsp.server import server
+
         server._proxy.modules.clear()
+        # Client records with literal space; jdtls echoes with %20. These must match.
+        server._record_opened("file:///a/has space.java")
+        with (
+            patch("java_functional_lsp.server._resolve_module_uri", return_value=None),
+            patch("java_functional_lsp.server._analyze_and_publish") as mock_pub,
+            patch("java_functional_lsp.server._fire_and_forget"),
+        ):
+            server._on_jdtls_diagnostics("file:///a/has%20space.java", [])
+        mock_pub.assert_called_once_with("file:///a/has%20space.java")
 
     def test_init_capabilities_exclude_jdtls_features(self) -> None:
         """Static capabilities must NOT include hover/definition/references/completion/documentSymbol.
