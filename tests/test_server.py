@@ -173,6 +173,24 @@ def _ensure_workspace() -> None:
 class TestServerInternals:
     """Direct-call tests for server.py helpers — provides in-process coverage."""
 
+    @pytest.fixture(autouse=True)
+    def _reset_server_state(self) -> Any:
+        """Reset mutable singleton state on ``server`` before and after every
+        test. Guarantees (a) a test that crashes between .add and .discard
+        can't leak into its successor, and (b) residue from another test
+        module (notably ``test_merkle_proxy``) can't leak into this class."""
+        from java_functional_lsp.server import server
+
+        def _reset() -> None:
+            server._opened_uris.clear()
+            server._proxy.modules._states.clear()
+            server._skip_jdtls = False
+            server._skip_jdtls_registration = False
+
+        _reset()
+        yield
+        _reset()
+
     def test_load_config_no_workspace(self) -> None:
         from java_functional_lsp.server import _load_config
 
@@ -469,6 +487,121 @@ class TestServerInternals:
         finally:
             server._opened_uris.pop(uri, None)
             server._skip_jdtls = old_skip
+
+    async def test_on_did_open_records_uri_before_first_await(self) -> None:
+        """Records the URI before yielding to the event loop.
+
+        Jdtls dispatches diagnostics on the same loop as ``on_did_open``. If
+        the record happened after the first ``await``, a diagnostic batch that
+        lands between the ``await`` and the record would be gated out. The
+        pre-await record is the only thing that guarantees same-loop
+        correctness — regression-guard it here.
+        """
+        from unittest.mock import AsyncMock, PropertyMock, patch
+
+        from java_functional_lsp.server import on_did_open, server
+
+        _ensure_workspace()
+        uri = "file:///test/PreAwait.java"
+        server._opened_uris.pop(uri, None)
+
+        observed_before_await: dict[str, bool] = {}
+
+        async def _spy_send(*_args: Any, **_kwargs: Any) -> None:
+            # Runs at the first await inside on_did_open. If the URI was
+            # recorded before this point, it must already be in the set.
+            observed_before_await["present"] = uri in server._opened_uris
+
+        old_skip = server._skip_jdtls
+        server._skip_jdtls = False
+        try:
+            with (
+                patch("java_functional_lsp.server._analyze_and_publish"),
+                patch.object(
+                    type(server._proxy), "is_available", new_callable=PropertyMock, return_value=True
+                ),
+                patch.object(server._proxy, "send_notification", new=AsyncMock(side_effect=_spy_send)),
+                patch.object(server._proxy, "add_module_if_new", new=AsyncMock()),
+            ):
+                await on_did_open(
+                    lsp.DidOpenTextDocumentParams(
+                        text_document=lsp.TextDocumentItem(
+                            uri=uri, language_id="java", version=1, text="class P {}"
+                        )
+                    )
+                )
+            assert observed_before_await.get("present") is True, (
+                "URI must be recorded before on_did_open yields to the event loop"
+            )
+        finally:
+            server._opened_uris.pop(uri, None)
+            server._skip_jdtls = old_skip
+
+    def test_on_jdtls_diagnostics_non_project_unopened_skips_both(self) -> None:
+        """A code-16 batch for an unopened URI skips READY *and* publish.
+
+        Covers the interaction of two independent gates: the code-16 guard on
+        module-READY bookkeeping, and the opened-URIs gate on republishing.
+        Neither should fire.
+        """
+        from unittest.mock import patch
+
+        from java_functional_lsp.proxy import ModuleState
+        from java_functional_lsp.server import server
+
+        server._proxy.modules.clear()
+        uri = "file:///other/Module/Stranger.java"
+        assert uri not in server._opened_uris
+        non_project_diag = {
+            "code": "16",
+            "message": "Stranger.java is a non-project file, only syntax errors are reported",
+            "source": "Java",
+            "severity": 2,
+            "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 1}},
+        }
+        with (
+            patch("java_functional_lsp.server._resolve_module_uri", return_value="file:///other/Module"),
+            patch("java_functional_lsp.server._analyze_and_publish") as mock_pub,
+            patch("java_functional_lsp.server._fire_and_forget"),
+        ):
+            server._on_jdtls_diagnostics(uri, [non_project_diag])
+        mock_pub.assert_not_called()
+        assert server._proxy.modules.get_state("file:///other/Module") != ModuleState.READY
+
+    def test_normalize_uri_passes_through_file_uri(self) -> None:
+        from java_functional_lsp.server import _normalize_uri
+
+        assert _normalize_uri("file:///a/B.java") == "file:///a/B.java"
+
+    def test_normalize_uri_unifies_space_encoding(self) -> None:
+        """A literal space and %20 must canonicalize to the same URI."""
+        from java_functional_lsp.server import _normalize_uri
+
+        assert _normalize_uri("file:///a/has space.java") == _normalize_uri("file:///a/has%20space.java")
+
+    def test_normalize_uri_passes_through_non_file_scheme(self) -> None:
+        """Non-file URIs (jdt://, untitled://) are returned unchanged."""
+        from java_functional_lsp.server import _normalize_uri
+
+        assert _normalize_uri("jdt://contents/foo.Bar") == "jdt://contents/foo.Bar"
+        assert _normalize_uri("untitled://Untitled-1") == "untitled://Untitled-1"
+
+    def test_on_jdtls_diagnostics_matches_opened_uri_across_encodings(self) -> None:
+        """Gate compares URIs via _normalize_uri so %20 vs literal space still matches."""
+        from unittest.mock import patch
+
+        from java_functional_lsp.server import server
+
+        server._proxy.modules.clear()
+        # Client records with literal space; jdtls echoes with %20. These must match.
+        server._record_opened("file:///a/has space.java")
+        with (
+            patch("java_functional_lsp.server._resolve_module_uri", return_value=None),
+            patch("java_functional_lsp.server._analyze_and_publish") as mock_pub,
+            patch("java_functional_lsp.server._fire_and_forget"),
+        ):
+            server._on_jdtls_diagnostics("file:///a/has%20space.java", [])
+        mock_pub.assert_called_once_with("file:///a/has%20space.java")
 
     def test_init_capabilities_exclude_jdtls_features(self) -> None:
         """Static capabilities must NOT include hover/definition/references/completion/documentSymbol.

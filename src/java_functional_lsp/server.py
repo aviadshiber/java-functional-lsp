@@ -21,7 +21,7 @@ from typing import Any
 from lsprotocol import types as lsp
 from lsprotocol.converters import get_converter
 from pygls.lsp.server import LanguageServer
-from pygls.uris import to_fs_path
+from pygls.uris import from_fs_path, to_fs_path
 
 from .analyzers.base import Analyzer, Severity, get_parser, is_excluded, is_suppressed
 from .analyzers.base import Diagnostic as LintDiagnostic
@@ -89,6 +89,7 @@ class JavaFunctionalLspServer(LanguageServer):
 
     def _record_opened(self, uri: str) -> None:
         """Record *uri* as opened this session, evicting the oldest entry at cap."""
+        uri = _normalize_uri(uri)
         if uri in self._opened_uris:
             self._opened_uris.move_to_end(uri)
             return
@@ -127,15 +128,19 @@ class JavaFunctionalLspServer(LanguageServer):
                     # First READY transition only — subsequent diagnostics for the same
                     # module are no-ops to avoid spawning O(files) redundant tasks.
                     _fire_and_forget(_apply_module_diff(self._proxy, module_uri))
-        # Only republish for files the client opened this session. Jdtls scans
-        # the whole workspace; without this guard, diagnostics for 200+
-        # unrelated modules leak out as <new-diagnostics> tags (see #71).
-        if uri not in self._opened_uris:
+        # Only republish for files the client has opened at any point this
+        # session (cumulative). Jdtls scans the whole workspace; without this
+        # guard, diagnostics for 200+ unrelated modules leak out as
+        # <new-diagnostics> tags (see #71). Non-file URIs (jdt://, untitled://,
+        # etc.) are never recorded by _record_opened so they're dropped here.
+        if _normalize_uri(uri) not in self._opened_uris:
             return
         try:
             _analyze_and_publish(uri)
         except FileNotFoundError:
-            pass  # Virtual jdtls file (e.g., decompiled source in jdtls-data); skip silently.
+            # The file was in the opened-URIs set but vanished from disk
+            # between didOpen and this late jdtls publish. Benign.
+            pass
         except Exception as e:
             logger.error("Error re-publishing diagnostics for %s: %s", uri, e)
 
@@ -150,6 +155,29 @@ _DEBOUNCE_SECONDS = 0.15
 # Cap on _opened_uris: a session navigating many files still bounds memory.
 # 4096 comfortably covers even aggressive monorepo navigation.
 _MAX_OPENED_URIS = 4096
+
+
+def _normalize_uri(uri: str) -> str:
+    """Canonicalize a file:// URI so equivalent paths compare equal.
+
+    Round-trips through pygls.uris to normalize URL encoding differences
+    (``%20`` vs literal space, ``%3A`` vs ``:``, trailing slashes, double
+    slashes) between what the client sends and what jdtls echoes back.
+
+    Non-file URIs (``jdt://``, ``untitled://``, etc.) are returned unchanged —
+    they're never stored in ``_opened_uris`` so they'll fall through the gate
+    regardless. Case-insensitive filesystems (macOS HFS+, NTFS) are not
+    normalized here: attempting that would require ``Path.resolve()``, which
+    would stat the filesystem and follow symlinks — too expensive for a hot
+    path that runs on every jdtls publish.
+    """
+    if not uri.startswith("file:"):
+        return uri
+    fs = to_fs_path(uri)
+    if fs is None:
+        return uri
+    normalized = from_fs_path(fs)
+    return normalized if normalized is not None else uri
 
 
 def _fire_and_forget(coro: Coroutine[Any, Any, Any]) -> None:
