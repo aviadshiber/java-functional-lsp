@@ -281,7 +281,7 @@ class TestServerInternals:
                 uri=uri, language_id="java", version=1, text="class T { String f() { return null; } }"
             ),
         )
-        server._opened_uris.add(uri)
+        server._record_opened(uri)
         try:
             with patch.object(server, "text_document_publish_diagnostics") as mock_pub:
                 server._on_jdtls_diagnostics(uri, [])
@@ -290,7 +290,7 @@ class TestServerInternals:
                 assert "null-return" in codes
         finally:
             server.workspace.remove_text_document(uri)
-            server._opened_uris.discard(uri)
+            server._opened_uris.pop(uri, None)
 
     def test_on_jdtls_diagnostics_non_project_skips_ready(self) -> None:
         """A publishDiagnostics batch with code-16 must NOT mark the module READY."""
@@ -324,7 +324,7 @@ class TestServerInternals:
 
         server._proxy.modules.clear()
         uri = "file:///mod/Pr.java"
-        server._opened_uris.add(uri)
+        server._record_opened(uri)
         real_diag = {
             "code": "268435844",
             "message": "Some unused import",
@@ -343,7 +343,7 @@ class TestServerInternals:
             assert server._proxy.modules.get_state("file:///mod") == ModuleState.READY
         finally:
             server._proxy.modules.clear()
-            server._opened_uris.discard(uri)
+            server._opened_uris.pop(uri, None)
 
     def test_on_jdtls_diagnostics_skips_publish_for_unopened_uri(self) -> None:
         """Jdtls diagnostics for files the client never opened must not republish (#71)."""
@@ -383,7 +383,7 @@ class TestServerInternals:
 
         _ensure_workspace()
         uri = "file:///test/Opened.java"
-        server._opened_uris.discard(uri)
+        server._opened_uris.pop(uri, None)
         old_skip = server._skip_jdtls
         server._skip_jdtls = True  # avoid exercising jdtls paths
         try:
@@ -397,14 +397,14 @@ class TestServerInternals:
                 )
             assert uri in server._opened_uris
         finally:
-            server._opened_uris.discard(uri)
+            server._opened_uris.pop(uri, None)
             server._skip_jdtls = old_skip
 
     def test_on_initialize_clears_opened_uris(self) -> None:
         """Re-initialize must reset the session's opened-URIs set."""
         from java_functional_lsp.server import on_initialize, server
 
-        server._opened_uris.add("file:///stale/Leftover.java")
+        server._record_opened("file:///stale/Leftover.java")
         on_initialize(
             lsp.InitializeParams(
                 process_id=1,
@@ -412,7 +412,63 @@ class TestServerInternals:
                 capabilities=lsp.ClientCapabilities(),
             )
         )
-        assert server._opened_uris == set()
+        assert not server._opened_uris
+
+    def test_opened_uris_evicts_oldest_at_cap(self) -> None:
+        """_record_opened enforces a FIFO cap so the set can't grow unbounded."""
+        from unittest.mock import patch
+
+        from java_functional_lsp.server import server
+
+        server._opened_uris.clear()
+        try:
+            with patch("java_functional_lsp.server._MAX_OPENED_URIS", 3):
+                for i in range(3):
+                    server._record_opened(f"file:///u/F{i}.java")
+                assert list(server._opened_uris) == [
+                    "file:///u/F0.java",
+                    "file:///u/F1.java",
+                    "file:///u/F2.java",
+                ]
+                # Fourth insert must evict the oldest.
+                server._record_opened("file:///u/F3.java")
+                assert list(server._opened_uris) == [
+                    "file:///u/F1.java",
+                    "file:///u/F2.java",
+                    "file:///u/F3.java",
+                ]
+                # Re-opening an existing URI moves it to the end, no eviction.
+                server._record_opened("file:///u/F1.java")
+                assert list(server._opened_uris) == [
+                    "file:///u/F2.java",
+                    "file:///u/F3.java",
+                    "file:///u/F1.java",
+                ]
+        finally:
+            server._opened_uris.clear()
+
+    async def test_on_did_close_preserves_opened_uris(self) -> None:
+        """Cumulative design: didClose must NOT evict — late jdtls publishes still go through."""
+        from unittest.mock import patch
+
+        from java_functional_lsp.server import on_did_close, server
+
+        _ensure_workspace()
+        uri = "file:///test/Closed.java"
+        server._record_opened(uri)
+        old_skip = server._skip_jdtls
+        server._skip_jdtls = True
+        try:
+            with patch.object(server, "text_document_publish_diagnostics"):
+                await on_did_close(
+                    lsp.DidCloseTextDocumentParams(
+                        text_document=lsp.TextDocumentIdentifier(uri=uri),
+                    )
+                )
+            assert uri in server._opened_uris
+        finally:
+            server._opened_uris.pop(uri, None)
+            server._skip_jdtls = old_skip
 
     def test_init_capabilities_exclude_jdtls_features(self) -> None:
         """Static capabilities must NOT include hover/definition/references/completion/documentSymbol.

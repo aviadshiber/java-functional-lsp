@@ -13,6 +13,7 @@ import os
 import re
 import sys
 import time
+from collections import OrderedDict
 from collections.abc import Coroutine
 from pathlib import Path
 from typing import Any
@@ -78,11 +79,22 @@ class JavaFunctionalLspServer(LanguageServer):
         self._init_generation: int = 0
         # URIs the client has opened at least once this session. Jdtls indexes
         # the whole workspace and publishes diagnostics for files the client
-        # never touched; we only republish for URIs present in this set so
-        # unrelated modules don't flood the client. Cumulative (not cleared on
-        # didClose) to survive the async race between didClose and late jdtls
-        # publishes. Reset on initialize.
-        self._opened_uris: set[str] = set()
+        # never touched; we only republish for URIs present here so unrelated
+        # modules don't flood the client. Cumulative (not cleared on didClose)
+        # to survive the async race between didClose and late jdtls publishes.
+        # Bounded LRU: insertion-ordered, oldest evicted on overflow so a long
+        # session navigating many files can't grow the set unboundedly.
+        # Reset on initialize.
+        self._opened_uris: OrderedDict[str, None] = OrderedDict()
+
+    def _record_opened(self, uri: str) -> None:
+        """Record *uri* as opened this session, evicting the oldest entry at cap."""
+        if uri in self._opened_uris:
+            self._opened_uris.move_to_end(uri)
+            return
+        self._opened_uris[uri] = None
+        if len(self._opened_uris) > _MAX_OPENED_URIS:
+            self._opened_uris.popitem(last=False)
 
     def _on_jdtls_diagnostics(self, uri: str, diagnostics: list[Any]) -> None:
         """Called when jdtls publishes diagnostics — merge with custom and re-publish.
@@ -135,6 +147,9 @@ _pending: dict[str, asyncio.Task[None]] = {}
 # Background tasks (prevent GC of fire-and-forget tasks)
 _bg_tasks: set[asyncio.Task[None]] = set()
 _DEBOUNCE_SECONDS = 0.15
+# Cap on _opened_uris: a session navigating many files still bounds memory.
+# 4096 comfortably covers even aggressive monorepo navigation.
+_MAX_OPENED_URIS = 4096
 
 
 def _fire_and_forget(coro: Coroutine[Any, Any, Any]) -> None:
@@ -591,7 +606,9 @@ async def on_did_open(params: lsp.DidOpenTextDocumentParams) -> None:
     didOpen response isn't delayed by jdtls cold-start.
     """
     uri = params.text_document.uri
-    server._opened_uris.add(uri)
+    # Must precede any await: same-loop jdtls diagnostic callbacks need to
+    # observe this URI before they arrive to avoid the publish getting gated.
+    server._record_opened(uri)
 
     if server._skip_jdtls:
         # Skip all jdtls forwarding — custom diagnostics only.
