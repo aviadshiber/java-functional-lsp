@@ -281,6 +281,7 @@ class TestServerInternals:
                 uri=uri, language_id="java", version=1, text="class T { String f() { return null; } }"
             ),
         )
+        server._opened_uris.add(uri)
         try:
             with patch.object(server, "text_document_publish_diagnostics") as mock_pub:
                 server._on_jdtls_diagnostics(uri, [])
@@ -289,6 +290,7 @@ class TestServerInternals:
                 assert "null-return" in codes
         finally:
             server.workspace.remove_text_document(uri)
+            server._opened_uris.discard(uri)
 
     def test_on_jdtls_diagnostics_non_project_skips_ready(self) -> None:
         """A publishDiagnostics batch with code-16 must NOT mark the module READY."""
@@ -322,6 +324,7 @@ class TestServerInternals:
 
         server._proxy.modules.clear()
         uri = "file:///mod/Pr.java"
+        server._opened_uris.add(uri)
         real_diag = {
             "code": "268435844",
             "message": "Some unused import",
@@ -329,14 +332,87 @@ class TestServerInternals:
             "severity": 2,
             "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 1}},
         }
-        with (
-            patch("java_functional_lsp.server._resolve_module_uri", return_value="file:///mod"),
-            patch("java_functional_lsp.server._analyze_and_publish"),
-            patch("java_functional_lsp.server._fire_and_forget"),
-        ):
-            server._on_jdtls_diagnostics(uri, [real_diag])
-        assert server._proxy.modules.get_state("file:///mod") == ModuleState.READY
+        try:
+            with (
+                patch("java_functional_lsp.server._resolve_module_uri", return_value="file:///mod"),
+                patch("java_functional_lsp.server._analyze_and_publish") as mock_pub,
+                patch("java_functional_lsp.server._fire_and_forget"),
+            ):
+                server._on_jdtls_diagnostics(uri, [real_diag])
+                mock_pub.assert_called_once_with(uri)
+            assert server._proxy.modules.get_state("file:///mod") == ModuleState.READY
+        finally:
+            server._proxy.modules.clear()
+            server._opened_uris.discard(uri)
+
+    def test_on_jdtls_diagnostics_skips_publish_for_unopened_uri(self) -> None:
+        """Jdtls diagnostics for files the client never opened must not republish (#71)."""
+        from unittest.mock import patch
+
+        from java_functional_lsp.proxy import ModuleState
+        from java_functional_lsp.server import server
+
         server._proxy.modules.clear()
+        uri = "file:///other/Module/Foo.java"
+        assert uri not in server._opened_uris
+        real_diag = {
+            "code": "268435844",
+            "message": "Some unused import",
+            "source": "Java",
+            "severity": 2,
+            "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 1}},
+        }
+        try:
+            with (
+                patch("java_functional_lsp.server._resolve_module_uri", return_value="file:///other/Module"),
+                patch("java_functional_lsp.server._analyze_and_publish") as mock_pub,
+                patch("java_functional_lsp.server._fire_and_forget"),
+            ):
+                server._on_jdtls_diagnostics(uri, [real_diag])
+                mock_pub.assert_not_called()
+            # Module-READY bookkeeping must still run even when the publish is gated.
+            assert server._proxy.modules.get_state("file:///other/Module") == ModuleState.READY
+        finally:
+            server._proxy.modules.clear()
+
+    async def test_on_did_open_records_uri(self) -> None:
+        """on_did_open must add the URI to the session's opened-URIs set."""
+        from unittest.mock import patch
+
+        from java_functional_lsp.server import on_did_open, server
+
+        _ensure_workspace()
+        uri = "file:///test/Opened.java"
+        server._opened_uris.discard(uri)
+        old_skip = server._skip_jdtls
+        server._skip_jdtls = True  # avoid exercising jdtls paths
+        try:
+            with patch("java_functional_lsp.server._analyze_and_publish"):
+                await on_did_open(
+                    lsp.DidOpenTextDocumentParams(
+                        text_document=lsp.TextDocumentItem(
+                            uri=uri, language_id="java", version=1, text="class Opened {}"
+                        )
+                    )
+                )
+            assert uri in server._opened_uris
+        finally:
+            server._opened_uris.discard(uri)
+            server._skip_jdtls = old_skip
+
+    def test_on_initialize_clears_opened_uris(self) -> None:
+        """Re-initialize must reset the session's opened-URIs set."""
+        from java_functional_lsp.server import on_initialize, server
+
+        server._opened_uris.add("file:///stale/Leftover.java")
+        on_initialize(
+            lsp.InitializeParams(
+                process_id=1,
+                root_uri="file:///tmp",
+                capabilities=lsp.ClientCapabilities(),
+            )
+        )
+        assert server._opened_uris == set()
 
     def test_init_capabilities_exclude_jdtls_features(self) -> None:
         """Static capabilities must NOT include hover/definition/references/completion/documentSymbol.

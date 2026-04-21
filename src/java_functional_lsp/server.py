@@ -76,6 +76,13 @@ class JavaFunctionalLspServer(LanguageServer):
         self._skip_jdtls: bool = False
         self._skip_jdtls_registration: bool = False
         self._init_generation: int = 0
+        # URIs the client has opened at least once this session. Jdtls indexes
+        # the whole workspace and publishes diagnostics for files the client
+        # never touched; we only republish for URIs present in this set so
+        # unrelated modules don't flood the client. Cumulative (not cleared on
+        # didClose) to survive the async race between didClose and late jdtls
+        # publishes. Reset on initialize.
+        self._opened_uris: set[str] = set()
 
     def _on_jdtls_diagnostics(self, uri: str, diagnostics: list[Any]) -> None:
         """Called when jdtls publishes diagnostics — merge with custom and re-publish.
@@ -108,6 +115,11 @@ class JavaFunctionalLspServer(LanguageServer):
                     # First READY transition only — subsequent diagnostics for the same
                     # module are no-ops to avoid spawning O(files) redundant tasks.
                     _fire_and_forget(_apply_module_diff(self._proxy, module_uri))
+        # Only republish for files the client opened this session. Jdtls scans
+        # the whole workspace; without this guard, diagnostics for 200+
+        # unrelated modules leak out as <new-diagnostics> tags (see #71).
+        if uri not in self._opened_uris:
+            return
         try:
             _analyze_and_publish(uri)
         except FileNotFoundError:
@@ -390,6 +402,7 @@ def on_initialize(params: lsp.InitializeParams) -> lsp.InitializeResult:
     server._skip_jdtls = False
     server._skip_jdtls_registration = False
     server._init_generation += 1
+    server._opened_uris.clear()
     _jdtls_capabilities_registered = False
 
     jdtls_override = os.environ.get("JAVA_FUNCTIONAL_LSP_JDTLS", "").strip().lower()
@@ -578,6 +591,7 @@ async def on_did_open(params: lsp.DidOpenTextDocumentParams) -> None:
     didOpen response isn't delayed by jdtls cold-start.
     """
     uri = params.text_document.uri
+    server._opened_uris.add(uri)
 
     if server._skip_jdtls:
         # Skip all jdtls forwarding — custom diagnostics only.
