@@ -517,17 +517,13 @@ class TestServerInternals:
         try:
             with (
                 patch("java_functional_lsp.server._analyze_and_publish"),
-                patch.object(
-                    type(server._proxy), "is_available", new_callable=PropertyMock, return_value=True
-                ),
+                patch.object(type(server._proxy), "is_available", new_callable=PropertyMock, return_value=True),
                 patch.object(server._proxy, "send_notification", new=AsyncMock(side_effect=_spy_send)),
                 patch.object(server._proxy, "add_module_if_new", new=AsyncMock()),
             ):
                 await on_did_open(
                     lsp.DidOpenTextDocumentParams(
-                        text_document=lsp.TextDocumentItem(
-                            uri=uri, language_id="java", version=1, text="class P {}"
-                        )
+                        text_document=lsp.TextDocumentItem(uri=uri, language_id="java", version=1, text="class P {}")
                     )
                 )
             assert observed_before_await.get("present") is True, (
