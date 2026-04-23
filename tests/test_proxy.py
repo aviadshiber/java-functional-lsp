@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import shutil
 import subprocess
 import time
@@ -1514,6 +1515,12 @@ class TestWipeDataDir:
             mock_logger.info.assert_called_once()
             mock_logger.warning.assert_not_called()
 
+    def test_wipe_nonexistent_dir_does_not_raise(self, tmp_path: Path) -> None:
+        """Calling wipe on a non-existent dir is safe."""
+        from java_functional_lsp.proxy import _wipe_data_dir
+
+        _wipe_data_dir(tmp_path / "ghost")  # should not raise
+
 
 class TestEvictLruWorkspaces:
     """Tests for _evict_lru_workspaces — count-based LRU eviction of jdtls workspace dirs."""
@@ -1524,8 +1531,6 @@ class TestEvictLruWorkspaces:
         d = cache_root / name
         d.mkdir()
         ts = time.time() - mtime_age_days * 86400.0
-        import os
-
         os.utime(d, (ts, ts))
         return d
 
@@ -1560,8 +1565,6 @@ class TestEvictLruWorkspaces:
 
     def test_dotfiles_never_evicted(self, tmp_path: Path) -> None:
         """.version and other dotfiles are excluded from eviction."""
-        import os
-
         from java_functional_lsp.proxy import _evict_lru_workspaces
 
         marker = tmp_path / ".version"
@@ -1572,10 +1575,19 @@ class TestEvictLruWorkspaces:
         _evict_lru_workspaces(tmp_path, max_size=0)
         assert marker.exists()
 
+    def test_dotdirs_never_evicted(self, tmp_path: Path) -> None:
+        """Dotfile directories (e.g. .hidden/) are excluded from eviction."""
+        from java_functional_lsp.proxy import _evict_lru_workspaces
+
+        hidden_dir = tmp_path / ".hidden"
+        hidden_dir.mkdir()
+        old_ts = time.time() - 999 * 86400.0
+        os.utime(hidden_dir, (old_ts, old_ts))
+        _evict_lru_workspaces(tmp_path, max_size=0)
+        assert hidden_dir.exists()
+
     def test_non_directory_entries_ignored(self, tmp_path: Path) -> None:
         """Plain files in cache_root are never removed."""
-        import os
-
         from java_functional_lsp.proxy import _evict_lru_workspaces
 
         stray = tmp_path / "stray.txt"
@@ -1585,28 +1597,53 @@ class TestEvictLruWorkspaces:
         _evict_lru_workspaces(tmp_path, max_size=0)
         assert stray.exists()
 
-    def test_stat_error_skipped_gracefully(self, tmp_path: Path) -> None:
-        """OSError during stat is skipped; other dirs are still evicted."""
+    def test_symlinks_never_evicted(self, tmp_path: Path) -> None:
+        """Symlinks in cache_root are excluded — shutil.rmtree must not follow them."""
         from java_functional_lsp.proxy import _evict_lru_workspaces
 
-        self._make_workspace(tmp_path, "aabbccdd1111", mtime_age_days=10)
-        bad_name = "aabbccdd2222"
-        self._make_workspace(tmp_path, bad_name, mtime_age_days=5)
+        # Target is a dotdir (excluded from candidates) so it is never evicted.
+        # This prevents the symlink from going dangling during the test.
+        target = tmp_path / ".hidden_target"
+        target.mkdir()
+        link = tmp_path / "aabbccdd1111"
+        link.symlink_to(target)
+        old_ts = time.time() - 999 * 86400.0
+        os.utime(link, (old_ts, old_ts))
+        _evict_lru_workspaces(tmp_path, max_size=0)
+        assert link.exists()  # symlink itself must survive
+        assert target.exists()  # target must not be deleted
 
-        original_stat = Path.stat
+    def test_dir_mtime_returns_inf_on_oserror(self, tmp_path: Path) -> None:
+        """_dir_mtime returns float('inf') when stat() fails — non-zero sentinel."""
+        from java_functional_lsp.proxy import _dir_mtime
 
-        def patched_stat(self_path: Path, **kw: Any) -> Any:
-            if self_path.name == bad_name:
-                raise OSError("permission denied")
-            return original_stat(self_path, **kw)
+        assert _dir_mtime(tmp_path / "nonexistent") == float("inf")
 
-        with patch.object(Path, "stat", patched_stat):
-            # good is oldest by mtime; bad errors on stat → treated as mtime=0 (oldest)
-            # max_size=1 → 1 dir evicted; bad gets mtime=0 so it sorts oldest, gets evicted
-            # good also has mtime older than the third hypothetical newest, but here
-            # we just want to confirm no crash and good is processed.
+    def test_stat_error_conservatively_keeps_dir(self, tmp_path: Path) -> None:
+        """Dir whose _dir_mtime returns inf is sorted as newest — conservatively kept.
+
+        Patching _dir_mtime directly (not Path.stat) avoids interfering with
+        is_dir() which also calls stat() internally.
+        """
+        from java_functional_lsp.proxy import _evict_lru_workspaces
+
+        older = self._make_workspace(tmp_path, "aabbccdd1111", mtime_age_days=10)
+        kept_dir = self._make_workspace(tmp_path, "aabbccdd2222", mtime_age_days=5)
+
+        original_dir_mtime = proxy_mod._dir_mtime
+
+        def patched_dir_mtime(path: Path) -> float:
+            if path.name == kept_dir.name:
+                return float("inf")
+            return original_dir_mtime(path)
+
+        with patch("java_functional_lsp.proxy._dir_mtime", patched_dir_mtime):
+            # kept_dir: _dir_mtime returns inf → sorted as newest → kept
+            # older: mtime=10 days ago → sorted as oldest → evicted
             _evict_lru_workspaces(tmp_path, max_size=1)
-        # No exception — that is the primary assertion
+
+        assert kept_dir.exists()  # conservatively kept (inf mtime)
+        assert not older.exists()  # evicted as the oldest accessible dir
 
     def test_rmtree_error_logged_and_continued(self, tmp_path: Path) -> None:
         """OSError on rmtree emits a warning and continues evicting remaining dirs."""
@@ -1660,8 +1697,58 @@ class TestEvictLruWorkspaces:
         for d in dirs[-3:]:
             assert d.exists()
 
-    def test_wipe_nonexistent_dir_does_not_raise(self, tmp_path: Path) -> None:
-        """Calling wipe on a non-existent dir is safe."""
-        from java_functional_lsp.proxy import _wipe_data_dir
 
-        _wipe_data_dir(tmp_path / "ghost")  # should not raise
+class TestParseMaxWorkspaces:
+    """Tests for _parse_max_workspaces — config validation for the LRU cap."""
+
+    def test_none_config_returns_default(self) -> None:
+        from java_functional_lsp.proxy import _WORKSPACE_CACHE_MAX_SIZE, _parse_max_workspaces
+
+        assert _parse_max_workspaces(None) == _WORKSPACE_CACHE_MAX_SIZE
+
+    def test_empty_config_returns_default(self) -> None:
+        from java_functional_lsp.proxy import _WORKSPACE_CACHE_MAX_SIZE, _parse_max_workspaces
+
+        assert _parse_max_workspaces({}) == _WORKSPACE_CACHE_MAX_SIZE
+
+    def test_missing_cache_key_returns_default(self) -> None:
+        from java_functional_lsp.proxy import _WORKSPACE_CACHE_MAX_SIZE, _parse_max_workspaces
+
+        assert _parse_max_workspaces({"jdtls": {}}) == _WORKSPACE_CACHE_MAX_SIZE
+
+    def test_valid_value_is_returned(self) -> None:
+        from java_functional_lsp.proxy import _parse_max_workspaces
+
+        assert _parse_max_workspaces({"cache": {"maxWorkspaces": 5}}) == 5
+        assert _parse_max_workspaces({"cache": {"maxWorkspaces": 1}}) == 1
+        assert _parse_max_workspaces({"cache": {"maxWorkspaces": 100}}) == 100
+
+    def test_string_integer_is_accepted(self) -> None:
+        """A string that represents a valid integer (e.g. from JSON) is parsed."""
+        from java_functional_lsp.proxy import _parse_max_workspaces
+
+        assert _parse_max_workspaces({"cache": {"maxWorkspaces": "7"}}) == 7
+
+    def test_invalid_string_returns_default_with_warning(self) -> None:
+        from java_functional_lsp.proxy import _WORKSPACE_CACHE_MAX_SIZE, _parse_max_workspaces
+
+        with patch("java_functional_lsp.proxy.logger") as mock_logger:
+            result = _parse_max_workspaces({"cache": {"maxWorkspaces": "bad"}})
+        assert result == _WORKSPACE_CACHE_MAX_SIZE
+        mock_logger.warning.assert_called_once()
+
+    def test_zero_returns_default_with_warning(self) -> None:
+        from java_functional_lsp.proxy import _WORKSPACE_CACHE_MAX_SIZE, _parse_max_workspaces
+
+        with patch("java_functional_lsp.proxy.logger") as mock_logger:
+            result = _parse_max_workspaces({"cache": {"maxWorkspaces": 0}})
+        assert result == _WORKSPACE_CACHE_MAX_SIZE
+        mock_logger.warning.assert_called_once()
+
+    def test_negative_returns_default_with_warning(self) -> None:
+        from java_functional_lsp.proxy import _WORKSPACE_CACHE_MAX_SIZE, _parse_max_workspaces
+
+        with patch("java_functional_lsp.proxy.logger") as mock_logger:
+            result = _parse_max_workspaces({"cache": {"maxWorkspaces": -1}})
+        assert result == _WORKSPACE_CACHE_MAX_SIZE
+        mock_logger.warning.assert_called_once()
