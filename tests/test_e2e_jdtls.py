@@ -68,6 +68,10 @@ pytestmark = [
 # so a hung jdtls doesn't wedge the suite.
 _E2E_TEST_TIMEOUT_SEC = 120
 _JDTLS_PARSE_WAIT_SEC = 2.5
+# Max wall-clock seconds to poll for a non-empty documentSymbol result.
+# macOS CI runners are slower than Linux; 60s accommodates cold-start variance.
+_JDTLS_SYMBOL_POLL_TIMEOUT_SEC = 60
+_JDTLS_SYMBOL_POLL_INTERVAL_SEC = 1.0
 
 _HELLO_JAVA = """\
 public class Hello {
@@ -260,7 +264,16 @@ class TestJdtlsEndToEnd:
             assert "textDocument" in serialized, f"_serialize_params emitted wrong field names: {serialized.keys()}"
             assert "text_document" not in serialized
 
-            result = await proxy.send_request("textDocument/documentSymbol", serialized)
+            # Poll until jdtls returns a non-empty symbol list or we time out.
+            # A fixed sleep is unreliable on macOS CI where jdtls cold-start
+            # can reach 20s; polling adapts to the actual indexing speed.
+            deadline = asyncio.get_event_loop().time() + _JDTLS_SYMBOL_POLL_TIMEOUT_SEC
+            result = None
+            while asyncio.get_event_loop().time() < deadline:
+                result = await proxy.send_request("textDocument/documentSymbol", serialized)
+                if result:
+                    break
+                await asyncio.sleep(_JDTLS_SYMBOL_POLL_INTERVAL_SEC)
 
         # Primary assertion: jdtls returned something. With a correctly-shaped
         # request, jdtls always returns a list (possibly empty) for a parsable
@@ -274,7 +287,8 @@ class TestJdtlsEndToEnd:
         assert isinstance(result, list)
         # Hello.java declares a top-level class, so we expect at least one symbol.
         assert len(result) > 0, (
-            "jdtls returned an empty symbol list for a file with a top-level class. "
+            "jdtls returned an empty symbol list for a file with a top-level class "
+            f"after polling for {_JDTLS_SYMBOL_POLL_TIMEOUT_SEC}s. "
             "Either jdtls didn't finish parsing or the file wasn't opened correctly."
         )
 
