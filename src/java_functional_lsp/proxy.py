@@ -29,6 +29,7 @@ _START_RETRY_COOLDOWN = 300.0  # seconds — retry jdtls startup after transient
 DEFAULT_JVM_MAX_HEAP = "4g"
 _STDERR_LINE_MAX = 1000
 _MAX_EXPANDED_GROUPS: int = 5  # hard cap on concurrent Maven group workspace folders (prevents jdtls OOM)
+_WORKSPACE_CACHE_MAX_SIZE: int = 10  # default LRU cap — override via {"cache": {"maxWorkspaces": N}}
 
 # Default jdtls initialization settings.  Sent via initializationOptions.settings
 # so they apply BEFORE the Maven import scan (didChangeConfiguration is too late).
@@ -563,6 +564,87 @@ def _compute_module_diff(
     return (diff, current)
 
 
+def _dir_mtime(path: Path) -> float:
+    """Return ``st_mtime`` of *path*, or ``float('inf')`` on any OSError.
+
+    Returning infinity on error sorts the directory as the *newest* entry,
+    so stat-inaccessible directories are conservatively kept rather than
+    silently evicted.
+    """
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return float("inf")
+
+
+def _parse_max_workspaces(config: Mapping[str, Any] | None) -> int:
+    """Parse and validate ``cache.maxWorkspaces`` from the project config.
+
+    Returns *_WORKSPACE_CACHE_MAX_SIZE* when the key is absent, when the value
+    cannot be converted to ``int``, or when the result is not positive.  Logs a
+    warning in each error case so the user can diagnose the misconfiguration.
+    """
+    raw = (config or {}).get("cache", {}).get("maxWorkspaces")
+    if raw is None:
+        return _WORKSPACE_CACHE_MAX_SIZE
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        logger.warning(
+            "jdtls: invalid cache.maxWorkspaces %r — using default %d",
+            raw,
+            _WORKSPACE_CACHE_MAX_SIZE,
+        )
+        return _WORKSPACE_CACHE_MAX_SIZE
+    if value <= 0:
+        logger.warning(
+            "jdtls: cache.maxWorkspaces must be >= 1, got %d — using default %d",
+            value,
+            _WORKSPACE_CACHE_MAX_SIZE,
+        )
+        return _WORKSPACE_CACHE_MAX_SIZE
+    return value
+
+
+def _evict_lru_workspaces(cache_root: Path, *, max_size: int = _WORKSPACE_CACHE_MAX_SIZE) -> None:
+    """Evict least-recently-used jdtls workspace directories when count exceeds *max_size*.
+
+    Implements Caffeine's ``maximumSize`` eviction policy for a filesystem cache.
+    Directories are ordered by ``st_mtime`` (last modification time), which is a
+    reliable proxy for last-used time because jdtls always writes to its workspace
+    on startup.  On macOS APFS (``noatime`` default) ``atime`` is not updated on
+    reads, so ``mtime`` is used exclusively.
+
+    The *max_size* most-recently-modified real directories are kept; the rest are
+    removed.  Dotfiles (e.g. ``.version``), symlinks, and non-directory entries
+    are excluded from the eviction candidates.
+
+    A directory whose ``stat()`` raises ``OSError`` is treated as the *newest*
+    entry (``float('inf')`` mtime) so it is conservatively kept.
+
+    Runs in the executor thread (``_blocking_startup``) — never blocks the event loop.
+
+    Users can tune the cap via ``.java-functional-lsp.json``:
+    ``{"cache": {"maxWorkspaces": 20}}``
+    """
+    if not cache_root.is_dir():
+        return
+    try:
+        dirs = [d for d in cache_root.iterdir() if d.is_dir() and not d.is_symlink() and not d.name.startswith(".")]
+    except OSError as e:
+        logger.warning("jdtls: cannot scan cache root for eviction: %s", e)
+        return
+    if len(dirs) <= max_size:
+        return
+    dirs.sort(key=_dir_mtime, reverse=True)  # newest first
+    for stale in dirs[max_size:]:
+        try:
+            shutil.rmtree(stale)
+            logger.info("jdtls: evicted workspace cache %s (LRU)", stale.name)
+        except OSError as e:
+            logger.warning("jdtls: failed to evict workspace cache %s: %s", stale.name, e)
+
+
 def _wipe_data_dir(data_dir: Path) -> None:
     """Remove *data_dir* so the next jdtls startup gets a clean cold start.
 
@@ -793,6 +875,8 @@ class JdtlsProxy:
 
         def _blocking_startup() -> tuple[dict[str, str], str | None]:
             _clear_cache_on_version_change(cache_root)
+            max_workspaces = _parse_max_workspaces(config)
+            _evict_lru_workspaces(cache_root, max_size=max_workspaces)
             return build_jdtls_env(), _find_lombok_jar(config)
 
         loop = asyncio.get_running_loop()
