@@ -2234,3 +2234,88 @@ class TestLspLifecycle:
         assert uri in lsp_client._published, "Timed out waiting for updated diagnostics after didChange"  # type: ignore[attr-defined]
         new_diags = lsp_client._published[uri]  # type: ignore[attr-defined]
         assert len(new_diags) == 0, f"Expected zero diagnostics after fixing, got {[d.code for d in new_diags]}"
+
+
+class TestM2EMarkerFilter:
+    """Tests for built-in suppression of Eclipse/M2E lifecycle markers."""
+
+    def test_code_zero_string_is_suppressed(self) -> None:
+        from java_functional_lsp.server import _is_m2e_marker
+
+        assert _is_m2e_marker({"code": "0", "message": "some message"}) is True
+
+    def test_code_zero_int_is_suppressed(self) -> None:
+        from java_functional_lsp.server import _is_m2e_marker
+
+        assert _is_m2e_marker({"code": 0, "message": "some message"}) is True
+
+    def test_m2e_source_is_suppressed(self) -> None:
+        from java_functional_lsp.server import _is_m2e_marker
+
+        assert _is_m2e_marker({"code": "100", "source": "org.eclipse.m2e", "message": "anything"}) is True
+
+    def test_plugin_execution_message_is_suppressed(self) -> None:
+        from java_functional_lsp.server import _is_m2e_marker
+
+        diag = {
+            "message": "Plugin execution not covered by lifecycle configuration: org.apache.maven.plugins:maven-antrun-plugin:3.1.0:run"
+        }
+        assert _is_m2e_marker(diag) is True
+
+    def test_prerequisite_message_is_suppressed(self) -> None:
+        from java_functional_lsp.server import _is_m2e_marker
+
+        diag = {"message": "The project cannot be built until its prerequisite com.example-core is built."}
+        assert _is_m2e_marker(diag) is True
+
+    def test_failed_mojo_message_is_suppressed(self) -> None:
+        from java_functional_lsp.server import _is_m2e_marker
+
+        diag = {"message": "Failed to execute mojo org.apache.maven.plugins:maven-dependency-plugin:3.6.0:copy-dependencies"}
+        assert _is_m2e_marker(diag) is True
+
+    def test_non_project_code_16_is_not_suppressed(self) -> None:
+        """Code 16 (jdtls non-project) must not be caught by the M2E filter."""
+        from java_functional_lsp.server import _is_m2e_marker
+
+        diag = {"code": "16", "source": "jdtls", "message": "File not on the classpath"}
+        assert _is_m2e_marker(diag) is False
+
+    def test_real_java_error_is_not_suppressed(self) -> None:
+        from java_functional_lsp.server import _is_m2e_marker
+
+        diag = {"code": "100", "source": "jdtls", "message": "The method foo() is undefined for the type Bar"}
+        assert _is_m2e_marker(diag) is False
+
+    def test_missing_fields_do_not_raise(self) -> None:
+        from java_functional_lsp.server import _is_m2e_marker
+
+        assert _is_m2e_marker({}) is False
+
+    def test_m2e_marker_excluded_from_run_analysis(self) -> None:
+        """_run_analysis must drop M2E markers from jdtls cached diagnostics."""
+        from unittest.mock import patch
+
+        from java_functional_lsp.server import _run_analysis
+
+        m2e_diag = {"code": "0", "source": "org.eclipse.m2e", "message": "Plugin execution not covered by lifecycle configuration: ..."}
+        real_diag = {
+            "code": "50",
+            "source": "jdtls",
+            "message": "The method foo() is undefined",
+            "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 5}},
+            "severity": 1,
+        }
+
+        with patch("java_functional_lsp.server.server") as mock_server:
+            mock_server._proxy.is_available = True
+            mock_server._proxy.get_cached_diagnostics.return_value = [m2e_diag, real_diag]
+            mock_server._user_suppress_patterns = []
+            mock_server._config = {}
+            mock_server._parser = __import__("java_functional_lsp.analyzers.base", fromlist=["get_parser"]).get_parser()
+
+            result = _run_analysis("public class Foo {}", "file:///test/Foo.java")
+
+        codes = [str(d.code) for d in result if d.source == "jdtls"]
+        assert "0" not in codes, "M2E marker (code=0) should be filtered out"
+        assert "50" in codes, "Real jdtls diagnostic should still be present"
