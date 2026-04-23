@@ -369,6 +369,24 @@ def _jdtls_raw_to_lsp_diagnostics(raw_diagnostics: list[Any]) -> list[lsp.Diagno
 
 _MAX_PATTERN_LENGTH = 500  # Cap regex length to mitigate ReDoS from pathological patterns
 
+_M2E_SOURCES: frozenset[str] = frozenset({"org.eclipse.m2e"})
+_M2E_MESSAGE_PATTERNS: re.Pattern[str] = re.compile(
+    r"Plugin execution not covered by lifecycle configuration"
+    r"|The project cannot be built until its prerequisite"
+    r"|Failed to execute mojo"
+)
+
+
+def _is_m2e_marker(diag: dict[str, Any]) -> bool:
+    """Return True if the diagnostic is an Eclipse/M2E lifecycle marker (not a Java error)."""
+    if str(diag.get("code", "")) == "0":
+        return True
+    if diag.get("source", "") in _M2E_SOURCES:
+        return True
+    if _M2E_MESSAGE_PATTERNS.search(diag.get("message", "")):
+        return True
+    return False
+
 
 def _compile_user_patterns(config: dict[str, Any]) -> list[re.Pattern[str]]:
     """Compile user-defined suppressJdtlsPatterns from config."""
@@ -417,7 +435,9 @@ def _run_analysis(source: str, uri: str) -> list[lsp.Diagnostic]:
     if server._proxy.is_available:
         try:
             raw = server._proxy.get_cached_diagnostics(uri)
-            raw = [d for d in raw if not _is_jdtls_suppressed(d, server._user_suppress_patterns)]
+            raw = [
+                d for d in raw if not _is_m2e_marker(d) and not _is_jdtls_suppressed(d, server._user_suppress_patterns)
+            ]
             jdtls_diags = _jdtls_raw_to_lsp_diagnostics(raw)
         except Exception as e:
             logger.warning("jdtls diagnostic processing failed for %s: %s", uri, e)
