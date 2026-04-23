@@ -435,7 +435,9 @@ def _run_analysis(source: str, uri: str) -> list[lsp.Diagnostic]:
     if server._proxy.is_available:
         try:
             raw = server._proxy.get_cached_diagnostics(uri)
-            raw = [d for d in raw if not _is_m2e_marker(d) and not _is_jdtls_suppressed(d, server._user_suppress_patterns)]
+            raw = [
+                d for d in raw if not _is_m2e_marker(d) and not _is_jdtls_suppressed(d, server._user_suppress_patterns)
+            ]
             jdtls_diags = _jdtls_raw_to_lsp_diagnostics(raw)
         except Exception as e:
             logger.warning("jdtls diagnostic processing failed for %s: %s", uri, e)

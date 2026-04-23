@@ -2257,9 +2257,7 @@ class TestM2EMarkerFilter:
     def test_plugin_execution_message_is_suppressed(self) -> None:
         from java_functional_lsp.server import _is_m2e_marker
 
-        diag = {
-            "message": "Plugin execution not covered by lifecycle configuration: org.apache.maven.plugins:maven-antrun-plugin:3.1.0:run"
-        }
+        diag = {"message": "Plugin execution not covered by lifecycle configuration: maven-antrun-plugin:3.1.0:run"}
         assert _is_m2e_marker(diag) is True
 
     def test_prerequisite_message_is_suppressed(self) -> None:
@@ -2271,7 +2269,7 @@ class TestM2EMarkerFilter:
     def test_failed_mojo_message_is_suppressed(self) -> None:
         from java_functional_lsp.server import _is_m2e_marker
 
-        diag = {"message": "Failed to execute mojo org.apache.maven.plugins:maven-dependency-plugin:3.6.0:copy-dependencies"}
+        diag = {"message": "Failed to execute mojo org.apache.maven.plugins:maven-dependency-plugin:3.6.0"}
         assert _is_m2e_marker(diag) is True
 
     def test_non_project_code_16_is_not_suppressed(self) -> None:
@@ -2298,7 +2296,11 @@ class TestM2EMarkerFilter:
 
         from java_functional_lsp.server import _run_analysis
 
-        m2e_diag = {"code": "0", "source": "org.eclipse.m2e", "message": "Plugin execution not covered by lifecycle configuration: ..."}
+        m2e_diag = {
+            "code": "0",
+            "source": "org.eclipse.m2e",
+            "message": "Plugin execution not covered by lifecycle configuration",
+        }
         real_diag = {
             "code": "50",
             "source": "jdtls",
