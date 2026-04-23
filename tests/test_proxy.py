@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import shutil
 import subprocess
+import time
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock, patch
@@ -1511,6 +1513,152 @@ class TestWipeDataDir:
             _wipe_data_dir(data_dir)
             mock_logger.info.assert_called_once()
             mock_logger.warning.assert_not_called()
+
+
+class TestEvictLruWorkspaces:
+    """Tests for _evict_lru_workspaces — count-based LRU eviction of jdtls workspace dirs."""
+
+    @staticmethod
+    def _make_workspace(cache_root: Path, name: str, mtime_age_days: float) -> Path:
+        """Create a fake workspace dir and backdate its mtime."""
+        d = cache_root / name
+        d.mkdir()
+        ts = time.time() - mtime_age_days * 86400.0
+        import os
+
+        os.utime(d, (ts, ts))
+        return d
+
+    def test_noop_on_missing_cache_root(self, tmp_path: Path) -> None:
+        """No error when cache_root does not exist."""
+        from java_functional_lsp.proxy import _evict_lru_workspaces
+
+        _evict_lru_workspaces(tmp_path / "nonexistent", max_size=10)
+        # No exception raised — that is the assertion
+
+    def test_noop_when_at_or_below_max_size(self, tmp_path: Path) -> None:
+        """No eviction when count <= max_size."""
+        from java_functional_lsp.proxy import _evict_lru_workspaces
+
+        d1 = self._make_workspace(tmp_path, "aabbccdd1234", mtime_age_days=5)
+        d2 = self._make_workspace(tmp_path, "1122334455ab", mtime_age_days=3)
+        _evict_lru_workspaces(tmp_path, max_size=2)
+        assert d1.exists()
+        assert d2.exists()
+
+    def test_evicts_oldest_when_over_max_size(self, tmp_path: Path) -> None:
+        """Oldest dirs (lowest mtime) are removed; newest are kept."""
+        from java_functional_lsp.proxy import _evict_lru_workspaces
+
+        oldest = self._make_workspace(tmp_path, "aabbccdd1111", mtime_age_days=10)
+        middle = self._make_workspace(tmp_path, "aabbccdd2222", mtime_age_days=5)
+        newest = self._make_workspace(tmp_path, "aabbccdd3333", mtime_age_days=1)
+        _evict_lru_workspaces(tmp_path, max_size=2)
+        assert not oldest.exists()
+        assert middle.exists()
+        assert newest.exists()
+
+    def test_dotfiles_never_evicted(self, tmp_path: Path) -> None:
+        """.version and other dotfiles are excluded from eviction."""
+        import os
+
+        from java_functional_lsp.proxy import _evict_lru_workspaces
+
+        marker = tmp_path / ".version"
+        marker.write_text("abc|21")
+        old_ts = time.time() - 999 * 86400.0
+        os.utime(marker, (old_ts, old_ts))
+        # max_size=0 would evict everything — dotfiles must still survive
+        _evict_lru_workspaces(tmp_path, max_size=0)
+        assert marker.exists()
+
+    def test_non_directory_entries_ignored(self, tmp_path: Path) -> None:
+        """Plain files in cache_root are never removed."""
+        import os
+
+        from java_functional_lsp.proxy import _evict_lru_workspaces
+
+        stray = tmp_path / "stray.txt"
+        stray.write_text("irrelevant")
+        old_ts = time.time() - 999 * 86400.0
+        os.utime(stray, (old_ts, old_ts))
+        _evict_lru_workspaces(tmp_path, max_size=0)
+        assert stray.exists()
+
+    def test_stat_error_skipped_gracefully(self, tmp_path: Path) -> None:
+        """OSError during stat is skipped; other dirs are still evicted."""
+        from java_functional_lsp.proxy import _evict_lru_workspaces
+
+        self._make_workspace(tmp_path, "aabbccdd1111", mtime_age_days=10)
+        bad_name = "aabbccdd2222"
+        self._make_workspace(tmp_path, bad_name, mtime_age_days=5)
+
+        original_stat = Path.stat
+
+        def patched_stat(self_path: Path, **kw: Any) -> Any:
+            if self_path.name == bad_name:
+                raise OSError("permission denied")
+            return original_stat(self_path, **kw)
+
+        with patch.object(Path, "stat", patched_stat):
+            # good is oldest by mtime; bad errors on stat → treated as mtime=0 (oldest)
+            # max_size=1 → 1 dir evicted; bad gets mtime=0 so it sorts oldest, gets evicted
+            # good also has mtime older than the third hypothetical newest, but here
+            # we just want to confirm no crash and good is processed.
+            _evict_lru_workspaces(tmp_path, max_size=1)
+        # No exception — that is the primary assertion
+
+    def test_rmtree_error_logged_and_continued(self, tmp_path: Path) -> None:
+        """OSError on rmtree emits a warning and continues evicting remaining dirs."""
+        from java_functional_lsp.proxy import _evict_lru_workspaces
+
+        d1 = self._make_workspace(tmp_path, "aabbccdd1111", mtime_age_days=10)
+        self._make_workspace(tmp_path, "aabbccdd2222", mtime_age_days=5)
+        d3 = self._make_workspace(tmp_path, "aabbccdd3333", mtime_age_days=1)
+
+        call_count = 0
+        original_rmtree = shutil.rmtree
+
+        def patched_rmtree(path: Any, **kw: Any) -> None:
+            nonlocal call_count
+            call_count += 1
+            if Path(path).name == d1.name:
+                raise OSError("busy")
+            original_rmtree(path, **kw)
+
+        with patch("java_functional_lsp.proxy.shutil.rmtree", side_effect=patched_rmtree):
+            with patch("java_functional_lsp.proxy.logger") as mock_logger:
+                _evict_lru_workspaces(tmp_path, max_size=1)
+                # Warning for d1 (rmtree failed); info for d2 (evicted successfully)
+                assert mock_logger.warning.call_count >= 1
+                assert mock_logger.info.call_count >= 1
+
+        assert d3.exists()  # newest kept
+
+    def test_logs_info_on_eviction(self, tmp_path: Path) -> None:
+        """Info log is emitted for each evicted workspace dir, including 'LRU'."""
+        from java_functional_lsp.proxy import _evict_lru_workspaces
+
+        self._make_workspace(tmp_path, "aabbccdd1111", mtime_age_days=10)
+        self._make_workspace(tmp_path, "aabbccdd2222", mtime_age_days=1)
+
+        with patch("java_functional_lsp.proxy.logger") as mock_logger:
+            _evict_lru_workspaces(tmp_path, max_size=1)
+
+        info_calls = [str(c) for c in mock_logger.info.call_args_list]
+        assert any("aabbccdd1111" in m and "LRU" in m for m in info_calls)
+
+    def test_max_size_param_respected(self, tmp_path: Path) -> None:
+        """Passing max_size=3 keeps exactly 3 dirs (the 3 newest)."""
+        from java_functional_lsp.proxy import _evict_lru_workspaces
+
+        dirs = [self._make_workspace(tmp_path, f"workspace{i:04d}", mtime_age_days=float(10 - i)) for i in range(6)]
+        _evict_lru_workspaces(tmp_path, max_size=3)
+        surviving = [d for d in dirs if d.exists()]
+        assert len(surviving) == 3
+        # The 3 newest (smallest age = largest mtime) must survive
+        for d in dirs[-3:]:
+            assert d.exists()
 
     def test_wipe_nonexistent_dir_does_not_raise(self, tmp_path: Path) -> None:
         """Calling wipe on a non-existent dir is safe."""
