@@ -130,8 +130,15 @@ async def _open_and_wait_for_diagnostics(
     an asyncio.Event that on_publish signals, then await it with wait_for so the
     full timeout is always respected — even when the event loop is transiently
     busy (e.g. jdtls subprocess creation on a slow macOS runner).
+
+    Note: the server always emits publishDiagnostics for every opened file
+    (including clean ones with zero findings) synchronously inside on_did_open,
+    before jdtls is involved. The event is therefore guaranteed to fire on the
+    first — and correct — notification for each URI in this test setup.
     """
     client._published.pop(uri, None)  # type: ignore[attr-defined]
+    # Register event before sending didOpen — no await between these two lines,
+    # so on_publish cannot fire and miss the registration.
     event = asyncio.Event()
     client._diag_events[uri] = event  # type: ignore[attr-defined]
 
@@ -149,11 +156,15 @@ async def _open_and_wait_for_diagnostics(
     try:
         await asyncio.wait_for(event.wait(), timeout=timeout)
     except asyncio.TimeoutError:
+        # pytest.fail() raises Failed (a BaseException subclass);
+        # the finally block below still runs before the exception propagates.
         pytest.fail(f"Timed out waiting for publishDiagnostics on {uri}")
     finally:
         client._diag_events.pop(uri, None)  # type: ignore[attr-defined]
 
-    return client._published.get(uri, [])  # type: ignore[attr-defined]
+    # on_publish stores to _published before setting the event, so the key
+    # is guaranteed to exist here — use direct access to surface any violation.
+    return client._published[uri]  # type: ignore[attr-defined]
 
 
 # --------------------------------------------------------------------------
@@ -2086,7 +2097,7 @@ class TestCacheClear:
 # --------------------------------------------------------------------------
 
 
-@pytest.mark.timeout(60)
+@pytest.mark.timeout(60)  # covers fixture setup (subprocess spawn + initialize handshake) on slow macOS runners
 class TestLspLifecycle:
     """Full LSP lifecycle tests via real stdio transport — zero mocks."""
 
