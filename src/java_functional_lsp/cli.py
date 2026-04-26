@@ -7,6 +7,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from . import __version__
 from .analyzers.base import Analyzer, Diagnostic, Severity, get_parser, is_excluded
 from .analyzers.exception_checker import ExceptionChecker
 from .analyzers.functional_checker import FunctionalChecker
@@ -69,7 +70,8 @@ def format_diagnostic(path: Path, d: Diagnostic) -> str:
 _USAGE = """\
 Usage: java-functional-lsp check <file.java> [file2.java ...]
        java-functional-lsp check --dir <directory>
-       java-functional-lsp          (start LSP server on stdio)"""
+       java-functional-lsp          (start LSP server on stdio)
+       java-functional-lsp --version"""
 
 
 def _collect_files(args: list[str]) -> list[Path]:
@@ -101,6 +103,10 @@ def main() -> None:
 
     if args and args[0] in ("-h", "--help"):
         print(_USAGE)
+        sys.exit(0)
+
+    if args and args[0] in ("-v", "--version"):
+        print(f"java-functional-lsp {__version__}")
         sys.exit(0)
 
     if not args or args[0] != "check":

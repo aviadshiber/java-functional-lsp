@@ -79,3 +79,19 @@ class TestHelp:
                 main()
         assert exc.value.code == 0
         assert "check" in capsys.readouterr().out
+
+
+class TestVersion:
+    def test_version_flag(self, capsys: pytest.CaptureFixture[str]) -> None:
+        with patch("sys.argv", ["java-functional-lsp", "--version"]):
+            with pytest.raises(SystemExit) as exc:
+                main()
+        assert exc.value.code == 0
+        assert "java-functional-lsp" in capsys.readouterr().out
+
+    def test_version_short_flag(self, capsys: pytest.CaptureFixture[str]) -> None:
+        with patch("sys.argv", ["java-functional-lsp", "-v"]):
+            with pytest.raises(SystemExit) as exc:
+                main()
+        assert exc.value.code == 0
+        assert "java-functional-lsp" in capsys.readouterr().out
