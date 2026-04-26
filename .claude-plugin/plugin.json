@@ -1,5 +1,16 @@
 {
   "name": "java-functional-lsp",
   "description": "Java LSP with functional programming rules enforcement — null safety, immutability, no exceptions, Spring best practices. Wraps jdtls for full Java language support.",
-  "version": "0.4.1"
+  "version": "0.4.2",
+  "lspServers": {
+    "java-functional": {
+      "command": "java-functional-lsp",
+      "extensionToLanguage": {
+        ".java": "java"
+      },
+      "startupTimeout": 120000,
+      "restartOnCrash": true,
+      "maxRestarts": 5
+    }
+  }
 }
