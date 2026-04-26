@@ -71,10 +71,15 @@ async def lsp_client(tmp_path: Any) -> LanguageClient:  # type: ignore[misc]
 
     # Collect published diagnostics so tests can assert on them.
     client._published: dict[str, list[lsp.Diagnostic]] = {}  # type: ignore[attr-defined]
+    # Per-URI events signalled by on_publish — used by _open_and_wait_for_diagnostics.
+    client._diag_events: dict[str, asyncio.Event] = {}  # type: ignore[attr-defined]
 
     @client.feature(lsp.TEXT_DOCUMENT_PUBLISH_DIAGNOSTICS)
     def on_publish(params: lsp.PublishDiagnosticsParams) -> None:
         client._published[params.uri] = list(params.diagnostics)  # type: ignore[attr-defined]
+        evt = client._diag_events.get(params.uri)  # type: ignore[attr-defined]
+        if evt is not None:
+            evt.set()
 
     await client.start_io(sys.executable, "-m", "java_functional_lsp")
 
@@ -121,10 +126,14 @@ async def _open_and_wait_for_diagnostics(
 ) -> list[lsp.Diagnostic]:
     """Open a document and wait until publishDiagnostics arrives for its URI.
 
-    The server publishes diagnostics asynchronously after didOpen. We poll
-    the client's collected notifications until the URI appears or timeout.
+    The server publishes diagnostics asynchronously after didOpen. We register
+    an asyncio.Event that on_publish signals, then await it with wait_for so the
+    full timeout is always respected — even when the event loop is transiently
+    busy (e.g. jdtls subprocess creation on a slow macOS runner).
     """
     client._published.pop(uri, None)  # type: ignore[attr-defined]
+    event = asyncio.Event()
+    client._diag_events[uri] = event  # type: ignore[attr-defined]
 
     client.text_document_did_open(
         lsp.DidOpenTextDocumentParams(
@@ -137,14 +146,14 @@ async def _open_and_wait_for_diagnostics(
         )
     )
 
-    deadline = asyncio.get_running_loop().time() + timeout
-    while asyncio.get_running_loop().time() < deadline:
-        if uri in client._published:  # type: ignore[attr-defined]
-            return client._published[uri]  # type: ignore[attr-defined]
-        await asyncio.sleep(0.1)
+    try:
+        await asyncio.wait_for(event.wait(), timeout=timeout)
+    except asyncio.TimeoutError:
+        pytest.fail(f"Timed out waiting for publishDiagnostics on {uri}")
+    finally:
+        client._diag_events.pop(uri, None)  # type: ignore[attr-defined]
 
-    pytest.fail(f"Timed out waiting for publishDiagnostics on {uri}")
-    return []  # unreachable, but satisfies type checker
+    return client._published.get(uri, [])  # type: ignore[attr-defined]
 
 
 # --------------------------------------------------------------------------
@@ -2077,7 +2086,7 @@ class TestCacheClear:
 # --------------------------------------------------------------------------
 
 
-@pytest.mark.timeout(30)
+@pytest.mark.timeout(60)
 class TestLspLifecycle:
     """Full LSP lifecycle tests via real stdio transport — zero mocks."""
 
