@@ -84,7 +84,7 @@ The server automatically detects JetBrains IDEs and disables the jdtls proxy —
 ### No diagnostics appear
 - Ensure the file mapping is set to Language: `Java`, Language ID: `java`
 - Check that `.java-functional-lsp.json` doesn't have rules set to `"off"`
-- Try restarting the language server: **Tools** → **Language Servers** → **Restart**
+- Try restarting the language server: **Language Servers** (search it in intellij Actions [Double Shift on keyboard]) → click on java-functional-lsp → **Restart**
 - If diagnostics worked before but stopped, the jdtls proxy may be interfering. Set `JAVA_FUNCTIONAL_LSP_JDTLS=off` in the server command environment to force-disable jdtls. The server auto-detects JetBrains IDEs and disables jdtls by default (since IntelliJ provides native Java support), but this can be overridden with `JAVA_FUNCTIONAL_LSP_JDTLS=on`.
 
 ### PATH not found

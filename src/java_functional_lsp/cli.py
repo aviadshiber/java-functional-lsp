@@ -66,14 +66,41 @@ def format_diagnostic(path: Path, d: Diagnostic) -> str:
     return f"{path}:{d.line + 1}:{d.col}: [{sym}] {d.code}: {d.message}"
 
 
+_USAGE = """\
+Usage: java-functional-lsp check <file.java> [file2.java ...]
+       java-functional-lsp check --dir <directory>
+       java-functional-lsp          (start LSP server on stdio)"""
+
+
+def _collect_files(args: list[str]) -> list[Path]:
+    """Resolve CLI args to a list of .java paths."""
+    files: list[Path] = []
+    if args and args[0] == "--dir":
+        if len(args) < 2:
+            print("Error: --dir requires a directory path", file=sys.stderr)
+            sys.exit(1)
+        directory = Path(args[1])
+        if not directory.is_dir():
+            print(f"Error: {directory} is not a directory", file=sys.stderr)
+            sys.exit(1)
+        return sorted(directory.rglob("*.java"))
+    for arg in args:
+        p = Path(arg)
+        if p.is_file():
+            files.append(p)
+        elif p.is_dir():
+            files.extend(sorted(p.rglob("*.java")))
+        else:
+            print(f"Warning: {arg} not found, skipping", file=sys.stderr)
+    return files
+
+
 def main() -> None:
     """CLI entry point: java-functional-lsp check <files...>"""
     args = sys.argv[1:]
 
     if args and args[0] in ("-h", "--help"):
-        print("Usage: java-functional-lsp check <file.java> [file2.java ...]")
-        print("       java-functional-lsp check --dir <directory>")
-        print("       java-functional-lsp          (start LSP server on stdio)")
+        print(_USAGE)
         sys.exit(0)
 
     if not args or args[0] != "check":
@@ -85,34 +112,16 @@ def main() -> None:
 
     args = args[1:]  # skip "check"
 
-    # Collect files
-    files: list[Path] = []
-    if args and args[0] == "--dir":
-        if len(args) < 2:
-            print("Error: --dir requires a directory path", file=sys.stderr)
-            sys.exit(1)
-        directory = Path(args[1])
-        if not directory.is_dir():
-            print(f"Error: {directory} is not a directory", file=sys.stderr)
-            sys.exit(1)
-        files = sorted(directory.rglob("*.java"))
-    else:
-        for arg in args:
-            p = Path(arg)
-            if p.is_file():
-                files.append(p)
-            elif p.is_dir():
-                files.extend(sorted(p.rglob("*.java")))
-            else:
-                print(f"Warning: {arg} not found, skipping", file=sys.stderr)
+    if args and args[0] in ("-h", "--help"):
+        print(_USAGE)
+        sys.exit(0)
 
+    files = _collect_files(args)
     if not files:
         print("No .java files found", file=sys.stderr)
         sys.exit(1)
 
-    # Load config from first file's directory
     config = load_config(files[0])
-
     total_diags = 0
     excludes: list[str] = config.get("excludes", [])
     for path in files:

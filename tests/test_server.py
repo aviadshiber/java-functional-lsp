@@ -109,12 +109,17 @@ async def lsp_client(tmp_path: Any) -> LanguageClient:  # type: ignore[misc]
     try:
         yield client
     finally:
+        # Teardown with timeouts: the server subprocess may be mid-jdtls-startup
+        # on a slow CI runner, causing shutdown_async or stop to hang indefinitely.
         try:
-            await client.shutdown_async(None)
+            await asyncio.wait_for(client.shutdown_async(None), timeout=5.0)
             client.exit(None)
         except Exception:
             pass
-        await client.stop()
+        try:
+            await asyncio.wait_for(client.stop(), timeout=5.0)
+        except Exception:
+            pass
 
 
 async def _open_and_wait_for_diagnostics(
