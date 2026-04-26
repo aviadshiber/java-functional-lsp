@@ -112,10 +112,7 @@ To release a new version:
 
 ## Enabling LSP in Claude Code
 
-LSP support requires `ENABLE_LSP_TOOL=1` in `~/.claude/settings.json`:
-```json
-{ "env": { "ENABLE_LSP_TOOL": "1" } }
-```
+Declare `lspServers` in `~/.claude/settings.json` or in `plugin.json` — Claude Code enables the LSP tool automatically when `lspServers` is configured. `ENABLE_LSP_TOOL=1` is no longer needed.
 
 For containers or CI, add a `.lsp.json` at the project root instead of installing the plugin:
 ```json
@@ -130,7 +127,7 @@ Fix any violations immediately — do not explain, just apply the fix.
 
 ## Troubleshooting
 
-- **No diagnostics in Claude Code**: Ensure `ENABLE_LSP_TOOL=1` is set, restart Claude Code
+- **No diagnostics in Claude Code**: Ensure `lspServers` is configured (in `plugin.json` or `settings.json`), restart Claude Code
 - **"java-functional-lsp not found"**: Run `brew install aviadshiber/tap/java-functional-lsp`
 - **No completions/hover**: Install jdtls: `brew install jdtls` (requires JDK 21+)
 - **Too many warnings**: Create `.java-functional-lsp.json` with `excludes` or per-rule severity
