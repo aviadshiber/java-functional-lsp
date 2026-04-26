@@ -4,8 +4,11 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Any
+from unittest.mock import patch
 
-from java_functional_lsp.cli import check_file, format_diagnostic, load_config
+import pytest
+
+from java_functional_lsp.cli import check_file, format_diagnostic, load_config, main
 
 
 class TestCheckFile:
@@ -53,3 +56,26 @@ class TestLoadConfig:
     def test_missing_config(self, tmp_path: Path) -> None:
         config = load_config(tmp_path / "Test.java")
         assert config == {}
+
+
+class TestHelp:
+    def test_top_level_help(self, capsys: pytest.CaptureFixture[str]) -> None:
+        with patch("sys.argv", ["java-functional-lsp", "--help"]):
+            with pytest.raises(SystemExit) as exc:
+                main()
+        assert exc.value.code == 0
+        assert "check" in capsys.readouterr().out
+
+    def test_check_subcommand_help(self, capsys: pytest.CaptureFixture[str]) -> None:
+        with patch("sys.argv", ["java-functional-lsp", "check", "--help"]):
+            with pytest.raises(SystemExit) as exc:
+                main()
+        assert exc.value.code == 0
+        assert "check" in capsys.readouterr().out
+
+    def test_check_short_help(self, capsys: pytest.CaptureFixture[str]) -> None:
+        with patch("sys.argv", ["java-functional-lsp", "check", "-h"]):
+            with pytest.raises(SystemExit) as exc:
+                main()
+        assert exc.value.code == 0
+        assert "check" in capsys.readouterr().out
