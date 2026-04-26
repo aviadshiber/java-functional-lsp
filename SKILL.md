@@ -119,7 +119,7 @@ LSP support requires `ENABLE_LSP_TOOL=1` in `~/.claude/settings.json`:
 
 For containers or CI, add a `.lsp.json` at the project root instead of installing the plugin:
 ```json
-{ "java-functional": { "command": "java-functional-lsp", "extensionToLanguage": { ".java": "java" } } }
+{ "java-functional": { "command": "java-functional-lsp", "extensionToLanguage": { ".java": "java" }, "startupTimeout": 120000, "restartOnCrash": true, "maxRestarts": 5 } }
 ```
 
 To nudge Claude to act on diagnostics, add to your project's `CLAUDE.md`:
