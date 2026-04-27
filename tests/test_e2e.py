@@ -10,6 +10,8 @@ from typing import Any
 
 import pytest
 
+from java_functional_lsp.capabilities.registry import REGISTRY
+
 
 def _encode_lsp(obj: dict[str, Any]) -> bytes:
     """Encode a JSON-RPC message with Content-Length header."""
@@ -191,31 +193,23 @@ class TestE2EInitialize:
         assert "java-functional" in info.get("name", "").lower()
 
 
-# Wire-format JSON keys for every jdtls-dependent provider in REGISTRY.
-# Kept in sync with src/java_functional_lsp/capabilities/registry.py: each
-# CapabilityEntry.static_field is camelCase'd by lsprotocol's converter on the
-# wire. If REGISTRY grows, this set should too — the assertion in
-# `test_initialize_with_empty_caps_advertises_all_jdtls_features_statically`
-# would otherwise silently let the new feature regress for Claude Code-style
-# clients.
-_JDTLS_PROVIDER_KEYS: frozenset[str] = frozenset(
-    {
-        "completionProvider",
-        "hoverProvider",
-        "definitionProvider",
-        "referencesProvider",
-        "documentSymbolProvider",
-        "callHierarchyProvider",
-        "signatureHelpProvider",
-        "implementationProvider",
-        "typeDefinitionProvider",
-        "declarationProvider",
-        "documentHighlightProvider",
-        "renameProvider",
-        "typeHierarchyProvider",
-        "workspaceSymbolProvider",
-    }
-)
+def _snake_field_to_wire(field: str) -> str:
+    """Convert a ServerCapabilities snake_case field name to the camelCase JSON key.
+
+    Mirrors lsprotocol's converter, which renames `hover_provider` → `hoverProvider`
+    on serialization. Keeping this local (vs importing the converter) avoids
+    coupling tests to lsprotocol internals.
+    """
+    head, *tail = field.split("_")
+    return head + "".join(part.capitalize() for part in tail)
+
+
+# Derived from REGISTRY (single source of truth) so adding a new CapabilityEntry
+# automatically extends the regression assertion in
+# `test_initialize_with_empty_caps_advertises_all_jdtls_features_statically`.
+# A hand-maintained mirror would silently let new features regress for
+# Claude Code-style clients that ignore client/registerCapability.
+_JDTLS_PROVIDER_KEYS: frozenset[str] = frozenset(_snake_field_to_wire(entry.static_field) for entry in REGISTRY)
 
 
 def _initialize_with_caps(

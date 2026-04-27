@@ -15,6 +15,7 @@ client does not advertise support.
 from __future__ import annotations
 
 from collections.abc import Mapping
+from functools import cache
 from typing import Any
 
 import lsprotocol.types as lsp
@@ -64,7 +65,13 @@ def _read_dynamic_registration(node: Any) -> bool:
     return bool(getattr(node, "dynamic_registration", None))
 
 
+@cache
 def _snake_to_camel(key: str) -> str:
-    """`text_document` -> `textDocument`. Idempotent for already-camel names."""
+    """`text_document` -> `textDocument`. Idempotent for already-camel names.
+
+    Cached because the LSP key space is bounded (~20 field names) but this is
+    called per-segment, per-entry, per-initialize when a client sends raw-dict
+    capabilities — repeated string allocation otherwise.
+    """
     head, *tail = key.split("_")
     return head + "".join(part.capitalize() for part in tail)

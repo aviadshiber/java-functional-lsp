@@ -173,7 +173,10 @@ REGISTRY: tuple[CapabilityEntry, ...] = (
         lsp_method=lsp.WORKSPACE_SYMBOL,
         static_field="workspace_symbol_provider",
         client_cap_path=("workspace", "symbol"),
-        registration_options_factory=lsp.WorkspaceSymbolRegistrationOptions,
+        # Lambda kept (vs bare class) for consistency with the other entries' Callable[[], Any]
+        # contract — defends against a silent semantic change if WorkspaceSymbolRegistrationOptions
+        # ever gains a required constructor arg.
+        registration_options_factory=lambda: lsp.WorkspaceSymbolRegistrationOptions(),  # noqa: PLW0108
         static_value_factory=lambda: True,
     ),
 )

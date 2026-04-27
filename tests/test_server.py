@@ -195,6 +195,41 @@ def _ensure_workspace() -> None:
         )
 
 
+def _build_caps_with_dynamic(path: tuple[str, ...]) -> lsp.ClientCapabilities:
+    """Build a ClientCapabilities tree with dynamic_registration=True at the given path.
+
+    `path` mirrors `CapabilityEntry.client_cap_path`. Examples:
+      ("text_document", "hover") → ClientCapabilities with
+          text_document.hover.dynamic_registration = True
+      ("workspace", "symbol") → ClientCapabilities with
+          workspace.symbol.dynamic_registration = True
+
+    The leaf class is discovered by inspecting the parent's type hints (rather
+    than guessing class names) — lsprotocol's naming has irregular cases like
+    `references` → `ReferenceClientCapabilities` (singular) and
+    `workspace.symbol` → `WorkspaceSymbolClientCapabilities` (prefixed root).
+    """
+    import typing
+
+    if path[0] == "text_document":
+        parent_class: type = lsp.TextDocumentClientCapabilities
+        root_kwarg = "text_document"
+    elif path[0] == "workspace":
+        parent_class = lsp.WorkspaceClientCapabilities
+        root_kwarg = "workspace"
+    else:
+        raise ValueError(f"Unsupported client_cap_path root: {path[0]!r}")
+
+    leaf_attr = path[-1]
+    hints = typing.get_type_hints(parent_class)
+    type_hint = hints[leaf_attr]
+    non_none_args = [arg for arg in typing.get_args(type_hint) if arg is not type(None)]
+    leaf_class = non_none_args[0] if non_none_args else type_hint
+
+    leaf = leaf_class(dynamic_registration=True)
+    return lsp.ClientCapabilities(**{root_kwarg: parent_class(**{leaf_attr: leaf})})
+
+
 class TestServerInternals:
     """Direct-call tests for server.py helpers — provides in-process coverage."""
 
@@ -779,38 +814,53 @@ class TestServerInternals:
             server._on_jdtls_diagnostics("file:///a/has%20space.java", [])
         mock_pub.assert_called_once_with("file:///a/has%20space.java")
 
-    def test_init_capabilities_exclude_jdtls_features_when_client_supports_dynamic(self) -> None:
-        """When the client claims dynamicRegistration, jdtls features are deferred (PR #44 invariant).
+    @pytest.mark.parametrize(
+        "entry",
+        list(__import__("java_functional_lsp.capabilities.registry", fromlist=["REGISTRY"]).REGISTRY),
+        ids=lambda e: e.id_suffix,
+    )
+    def test_init_capabilities_exclude_jdtls_feature_when_client_supports_dynamic(self, entry: Any) -> None:
+        """When the client claims dynamicRegistration for one feature, ONLY that feature is deferred.
 
-        Clients like VS Code and IntelliJ-LSP4IJ declare dynamic-registration support;
-        they will pick up our handlers via the later client/registerCapability call,
-        so the static InitializeResult must NOT include hover/definition/etc. Otherwise
-        the IDE's own diagnostic tooltips get suppressed during jdtls warm-up.
+        Parametrized over every CapabilityEntry in REGISTRY so each new jdtls
+        capability gets coverage automatically. For each entry we:
+          1. Construct ClientCapabilities with dynamic_registration=True at the
+             entry's client_cap_path (and nowhere else).
+          2. Assert the entry's static_field is omitted (so the IDE's own
+             diagnostic tooltips are not suppressed during jdtls warm-up — the
+             PR #44 invariant).
+          3. Assert every OTHER entry is still advertised statically (per-feature
+             negotiation, not all-or-nothing).
         """
+        from java_functional_lsp.capabilities.registry import REGISTRY
         from java_functional_lsp.server import on_initialize
 
-        text_doc_caps = lsp.TextDocumentClientCapabilities(
-            hover=lsp.HoverClientCapabilities(dynamic_registration=True),
-            definition=lsp.DefinitionClientCapabilities(dynamic_registration=True),
-            references=lsp.ReferenceClientCapabilities(dynamic_registration=True),
-            completion=lsp.CompletionClientCapabilities(dynamic_registration=True),
-            document_symbol=lsp.DocumentSymbolClientCapabilities(dynamic_registration=True),
-        )
+        caps = _build_caps_with_dynamic(entry.client_cap_path)
         result = on_initialize(
             lsp.InitializeParams(
                 process_id=1,
                 root_uri="file:///tmp",
-                capabilities=lsp.ClientCapabilities(text_document=text_doc_caps),
+                capabilities=caps,
             )
         )
-        caps = result.capabilities
-        assert caps.code_action_provider is not None
-        assert caps.text_document_sync is not None
-        assert caps.hover_provider is None
-        assert caps.definition_provider is None
-        assert caps.references_provider is None
-        assert caps.completion_provider is None
-        assert caps.document_symbol_provider is None
+        server_caps = result.capabilities
+
+        assert getattr(server_caps, entry.static_field) is None, (
+            f"{entry.id_suffix}: client claimed dynamicRegistration, "
+            f"but server still advertised {entry.static_field} statically — "
+            "this would suppress the IDE's diagnostic tooltips during jdtls warm-up."
+        )
+
+        for other in REGISTRY:
+            if other.id_suffix == entry.id_suffix:
+                continue
+            assert getattr(server_caps, other.static_field) is not None, (
+                f"While testing {entry.id_suffix}: {other.static_field} was unexpectedly omitted "
+                "(per-feature negotiation should not affect siblings)."
+            )
+
+        assert server_caps.code_action_provider is not None
+        assert server_caps.text_document_sync is not None
 
     def test_init_capabilities_static_when_client_lacks_dynamic_registration(self) -> None:
         """Clients that don't claim dynamicRegistration get static advertisement.
