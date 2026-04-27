@@ -34,6 +34,14 @@ from .analyzers.functional_checker import FunctionalChecker
 from .analyzers.mutation_checker import MutationChecker
 from .analyzers.null_checker import NullChecker
 from .analyzers.spring_checker import SpringChecker
+from .capabilities import (
+    REGISTRY,
+    CapabilityEntry,
+    CapabilityNegotiator,
+    ClientCapabilityProbe,
+    HandlerWiring,
+    StaticCapabilityBuilder,
+)
 from .fixes import get_fix, get_fix_registry_keys
 from .proxy import JdtlsProxy, _module_snapshot_path, _resolve_module_uri
 
@@ -109,6 +117,10 @@ class JavaFunctionalLspServer(LanguageServer):
         self._skip_jdtls: bool = False
         self._skip_jdtls_registration: bool = False
         self._init_generation: int = 0
+        # Capability entries the negotiator decided to register dynamically
+        # (client claimed dynamicRegistration support). Populated in
+        # on_initialize and consumed by _register_jdtls_capabilities.
+        self._dynamic_features: tuple[CapabilityEntry, ...] = ()
         # URIs the client has opened at least once this session (normalized form).
         # Jdtls indexes the whole workspace and publishes diagnostics for files the
         # client never touched; we only republish for URIs present here so unrelated
@@ -507,23 +519,21 @@ def on_initialize(params: lsp.InitializeParams) -> lsp.InitializeResult:
             client_name,
         )
 
-    return lsp.InitializeResult(
-        capabilities=lsp.ServerCapabilities(
-            text_document_sync=lsp.TextDocumentSyncOptions(
-                open_close=True,
-                change=lsp.TextDocumentSyncKind.Full,
-                save=lsp.SaveOptions(include_text=True),
-            ),
-            # Only advertise capabilities we own (custom diagnostics + code actions).
-            # jdtls-dependent features (hover, definition, references, completion,
-            # documentSymbol) are registered dynamically after jdtls starts — see
-            # on_initialized(). This prevents us from claiming hover when jdtls
-            # isn't ready, which would suppress the IDE's diagnostic tooltips.
-            code_action_provider=lsp.CodeActionOptions(
-                code_action_kinds=[lsp.CodeActionKind.QuickFix],
-            ),
-        )
-    )
+    # Per-feature capability negotiation. Clients that claim LSP dynamicRegistration
+    # support get the dynamic path (preserves PR #44 behavior — IDE keeps showing
+    # its own diagnostic tooltips while jdtls warms up). Clients that don't
+    # (notably Claude Code 2.1.x, which ignores client/registerCapability for
+    # routing) get static advertisement so their LSP routing picks up our handlers.
+    probe = ClientCapabilityProbe(params)
+    negotiation = CapabilityNegotiator(probe).negotiate()
+    server._dynamic_features = negotiation.dynamic
+
+    # Wire pygls handlers eagerly for static-advertised features so they dispatch
+    # immediately. Dynamic features have their handlers wired later in
+    # _register_jdtls_capabilities, after jdtls warm-up.
+    HandlerWiring(server, _JDTLS_HANDLERS).wire_eager(negotiation.static)
+
+    return lsp.InitializeResult(capabilities=StaticCapabilityBuilder().build(negotiation.static))
 
 
 @server.feature(lsp.INITIALIZED)
@@ -542,84 +552,61 @@ async def on_initialized(_: lsp.InitializedParams) -> None:
         logger.info("jdtls not on PATH — running with custom rules only")
 
 
-_JAVA_SELECTOR = [lsp.TextDocumentFilterLanguage(language="java")]
-
 _JDTLS_REG_PREFIX = "jdtls-"
 
-# jdtls-dependent capabilities registered dynamically after the proxy starts.
-# Each entry: (id_suffix, LSP method, registration options class, extra kwargs).
-_JDTLS_CAPABILITIES: list[tuple[str, str, type[Any], dict[str, Any]]] = [
-    ("completion", lsp.TEXT_DOCUMENT_COMPLETION, lsp.CompletionRegistrationOptions, {"trigger_characters": ["."]}),
-    ("hover", lsp.TEXT_DOCUMENT_HOVER, lsp.HoverRegistrationOptions, {}),
-    ("definition", lsp.TEXT_DOCUMENT_DEFINITION, lsp.DefinitionRegistrationOptions, {}),
-    ("references", lsp.TEXT_DOCUMENT_REFERENCES, lsp.ReferenceRegistrationOptions, {}),
-    ("document-symbol", lsp.TEXT_DOCUMENT_DOCUMENT_SYMBOL, lsp.DocumentSymbolRegistrationOptions, {}),
-    ("call-hierarchy", lsp.TEXT_DOCUMENT_PREPARE_CALL_HIERARCHY, lsp.CallHierarchyRegistrationOptions, {}),
-    (
-        "signature-help",
-        lsp.TEXT_DOCUMENT_SIGNATURE_HELP,
-        lsp.SignatureHelpRegistrationOptions,
-        {"trigger_characters": ["(", ","], "retrigger_characters": [")"]},
-    ),
-    ("implementation", lsp.TEXT_DOCUMENT_IMPLEMENTATION, lsp.ImplementationRegistrationOptions, {}),
-    ("type-definition", lsp.TEXT_DOCUMENT_TYPE_DEFINITION, lsp.TypeDefinitionRegistrationOptions, {}),
-    ("declaration", lsp.TEXT_DOCUMENT_DECLARATION, lsp.DeclarationRegistrationOptions, {}),
-    ("document-highlight", lsp.TEXT_DOCUMENT_DOCUMENT_HIGHLIGHT, lsp.DocumentHighlightRegistrationOptions, {}),
-    ("rename", lsp.TEXT_DOCUMENT_RENAME, lsp.RenameRegistrationOptions, {"prepare_provider": True}),
-    ("type-hierarchy", lsp.TEXT_DOCUMENT_PREPARE_TYPE_HIERARCHY, lsp.TypeHierarchyRegistrationOptions, {}),
-    ("workspace-symbol", lsp.WORKSPACE_SYMBOL, lsp.WorkspaceSymbolRegistrationOptions, {}),
-]
-
-# Maps LSP method → handler function for dynamic registration.
+# Maps LSP method → handler function. Populated below (see _JDTLS_HANDLERS.update
+# at the bottom of this file). Read by HandlerWiring during on_initialize (for
+# static-advertised features) and again by _register_jdtls_capabilities (for
+# dynamic features). The split is decided by CapabilityNegotiator.
 _JDTLS_HANDLERS: dict[str, Any] = {}
 
 # Set after first successful registration to prevent FeatureAlreadyRegisteredError.
 _jdtls_capabilities_registered = False
 
 
-def _build_jdtls_registrations() -> list[lsp.Registration]:
-    """Build LSP Registration objects for jdtls-dependent capabilities."""
+def _build_jdtls_registrations(entries: tuple[CapabilityEntry, ...] = REGISTRY) -> list[lsp.Registration]:
+    """Build LSP Registration objects for the given capability entries.
+
+    Used by _register_jdtls_capabilities to send client/registerCapability for
+    dynamic-path features. Each Registration carries the LSP method id, a unique
+    id (jdtls-<suffix>), and the unstructured registration options.
+    """
     result = []
-    for suffix, method, opts_cls, extra in _JDTLS_CAPABILITIES:
-        field_names = {f.name for f in getattr(opts_cls, "__attrs_attrs__", [])}
-        kwargs: dict[str, Any] = {**extra}
-        if "document_selector" in field_names:
-            kwargs["document_selector"] = _JAVA_SELECTOR
+    for entry in entries:
         result.append(
             lsp.Registration(
-                id=f"{_JDTLS_REG_PREFIX}{suffix}",
-                method=method,
-                register_options=_converter.unstructure(opts_cls(**kwargs)),
+                id=f"{_JDTLS_REG_PREFIX}{entry.id_suffix}",
+                method=entry.lsp_method,
+                register_options=_converter.unstructure(entry.registration_options_factory()),
             )
         )
     return result
 
 
 async def _register_jdtls_capabilities() -> None:
-    """Dynamically register jdtls-dependent capabilities after the proxy starts.
+    """Send client/registerCapability for the entries the negotiator marked dynamic.
 
-    We don't advertise these in the static InitializeResult because doing so
-    would make the IDE defer hover/definition/etc to us even before jdtls is
-    ready, which suppresses the IDE's built-in diagnostic tooltips.
+    Static-advertised features were already wired up during on_initialize. This
+    function only handles the dynamic subset — features whose clients claimed
+    LSP dynamicRegistration support, where deferring advertisement until jdtls
+    is warm preserves the IDE's own diagnostic tooltips (PR #44 invariant).
 
-    Idempotent: safe to call multiple times (e.g., proxy restart).
-    Uses a generation counter to detect stale registrations from a prior
-    initialize cycle (defensive against non-standard re-initialization).
+    Idempotent: safe to call multiple times. Uses a generation counter to
+    detect stale registrations from a prior initialize cycle.
     """
     global _jdtls_capabilities_registered
     if _jdtls_capabilities_registered:
         return
 
     generation = server._init_generation
+    entries = server._dynamic_features
 
     try:
-        # Register handlers so pygls dispatches incoming requests to them.
-        for method, handler in _JDTLS_HANDLERS.items():
-            server.feature(method)(handler)
+        HandlerWiring(server, _JDTLS_HANDLERS).wire_lazy(entries)
 
-        # Tell the client we now support these capabilities.
-        registrations = _build_jdtls_registrations()
-        await server.client_register_capability_async(lsp.RegistrationParams(registrations=registrations))
+        registrations = _build_jdtls_registrations(entries)
+        if registrations:
+            await server.client_register_capability_async(lsp.RegistrationParams(registrations=registrations))
 
         # Bail if a re-initialize happened while we were awaiting.
         if generation != server._init_generation:
@@ -627,11 +614,11 @@ async def _register_jdtls_capabilities() -> None:
             return
 
         _jdtls_capabilities_registered = True
-        logger.info(
-            "jdtls capabilities registered: completion, hover, definition, references, symbol, "
-            "call-hierarchy, signature-help, implementation, type-definition, declaration, "
-            "document-highlight, rename, type-hierarchy, workspace-symbol"
-        )
+        if entries:
+            suffixes = ", ".join(e.id_suffix for e in entries)
+            logger.info("jdtls capabilities registered dynamically: %s", suffixes)
+        else:
+            logger.info("No dynamic jdtls capabilities to register (all advertised statically)")
     except Exception:
         logger.warning("Failed to dynamically register jdtls capabilities", exc_info=True)
 

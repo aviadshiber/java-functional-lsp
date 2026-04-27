@@ -779,19 +779,28 @@ class TestServerInternals:
             server._on_jdtls_diagnostics("file:///a/has%20space.java", [])
         mock_pub.assert_called_once_with("file:///a/has%20space.java")
 
-    def test_init_capabilities_exclude_jdtls_features(self) -> None:
-        """Static capabilities must NOT include hover/definition/references/completion/documentSymbol.
+    def test_init_capabilities_exclude_jdtls_features_when_client_supports_dynamic(self) -> None:
+        """When the client claims dynamicRegistration, jdtls features are deferred (PR #44 invariant).
 
-        These are registered dynamically after jdtls starts, so the IDE doesn't
-        suppress diagnostic tooltips while jdtls is unavailable.
+        Clients like VS Code and IntelliJ-LSP4IJ declare dynamic-registration support;
+        they will pick up our handlers via the later client/registerCapability call,
+        so the static InitializeResult must NOT include hover/definition/etc. Otherwise
+        the IDE's own diagnostic tooltips get suppressed during jdtls warm-up.
         """
         from java_functional_lsp.server import on_initialize
 
+        text_doc_caps = lsp.TextDocumentClientCapabilities(
+            hover=lsp.HoverClientCapabilities(dynamic_registration=True),
+            definition=lsp.DefinitionClientCapabilities(dynamic_registration=True),
+            references=lsp.ReferenceClientCapabilities(dynamic_registration=True),
+            completion=lsp.CompletionClientCapabilities(dynamic_registration=True),
+            document_symbol=lsp.DocumentSymbolClientCapabilities(dynamic_registration=True),
+        )
         result = on_initialize(
             lsp.InitializeParams(
                 process_id=1,
                 root_uri="file:///tmp",
-                capabilities=lsp.ClientCapabilities(),
+                capabilities=lsp.ClientCapabilities(text_document=text_doc_caps),
             )
         )
         caps = result.capabilities
@@ -802,6 +811,33 @@ class TestServerInternals:
         assert caps.references_provider is None
         assert caps.completion_provider is None
         assert caps.document_symbol_provider is None
+
+    def test_init_capabilities_static_when_client_lacks_dynamic_registration(self) -> None:
+        """Clients that don't claim dynamicRegistration get static advertisement.
+
+        This is the Claude Code 2.1.x case — the client ignores
+        client/registerCapability for routing decisions. The server must list
+        every jdtls feature in the InitializeResult so the client's LSP router
+        picks them up.
+        """
+        from java_functional_lsp.server import on_initialize
+
+        result = on_initialize(
+            lsp.InitializeParams(
+                process_id=1,
+                root_uri="file:///tmp",
+                capabilities=lsp.ClientCapabilities(),  # no dynamicRegistration claims
+            )
+        )
+        caps = result.capabilities
+        assert caps.code_action_provider is not None
+        assert caps.text_document_sync is not None
+        assert caps.hover_provider is True
+        assert caps.definition_provider is True
+        assert caps.references_provider is True
+        assert caps.completion_provider is not None  # CompletionOptions object
+        assert caps.document_symbol_provider is True
+        assert caps.workspace_symbol_provider is True
 
     def test_build_jdtls_registrations(self) -> None:
         """_build_jdtls_registrations returns one Registration per jdtls capability, each scoped to java files."""
@@ -856,6 +892,7 @@ class TestServerInternals:
         from unittest.mock import AsyncMock, MagicMock, patch
 
         import java_functional_lsp.server as srv_mod
+        from java_functional_lsp.capabilities import REGISTRY
         from java_functional_lsp.server import server as srv
 
         # Patch both server.feature (to avoid FeatureAlreadyRegisteredError on
@@ -863,7 +900,9 @@ class TestServerInternals:
         mock_reg = AsyncMock(side_effect=Exception("no"))
         mock_feature = MagicMock(return_value=lambda fn: fn)
         old_flag = srv_mod._jdtls_capabilities_registered
+        old_dyn = getattr(srv, "_dynamic_features", ())
         srv_mod._jdtls_capabilities_registered = False
+        srv._dynamic_features = REGISTRY  # type: ignore[attr-defined]
         try:
             with (
                 caplog.at_level(logging.WARNING, logger="java_functional_lsp.server"),
@@ -873,6 +912,7 @@ class TestServerInternals:
                 await srv_mod._register_jdtls_capabilities()
         finally:
             srv_mod._jdtls_capabilities_registered = old_flag
+            srv._dynamic_features = old_dyn  # type: ignore[attr-defined]
         assert any("Failed to dynamically register" in r.getMessage() for r in caplog.records)
 
     async def test_register_jdtls_capabilities_happy_path(self, caplog: Any) -> None:
@@ -881,13 +921,22 @@ class TestServerInternals:
         from unittest.mock import AsyncMock, MagicMock, patch
 
         import java_functional_lsp.server as srv_mod
+        from java_functional_lsp.capabilities import REGISTRY, all_methods
         from java_functional_lsp.server import server as srv
 
         mock_reg = AsyncMock(return_value=None)
         registered_methods: list[str] = []
         mock_feature = MagicMock(side_effect=lambda m: registered_methods.append(m) or (lambda fn: fn))
         old_flag = srv_mod._jdtls_capabilities_registered
+        old_dyn = getattr(srv, "_dynamic_features", ())
+        # The HandlerWiring idempotency guard probes pygls' _features map and skips
+        # already-registered methods. Earlier tests in the same process can leave
+        # those entries populated; remove them so wire_lazy actually invokes the
+        # mocked srv.feature and we can observe the calls.
+        feature_map = srv.protocol.fm._features  # type: ignore[attr-defined]
+        evicted = {m: feature_map.pop(m) for m in all_methods(REGISTRY) if m in feature_map}
         srv_mod._jdtls_capabilities_registered = False
+        srv._dynamic_features = REGISTRY  # type: ignore[attr-defined]
         try:
             with (
                 caplog.at_level(logging.INFO, logger="java_functional_lsp.server"),
@@ -897,6 +946,8 @@ class TestServerInternals:
                 await srv_mod._register_jdtls_capabilities()
         finally:
             srv_mod._jdtls_capabilities_registered = old_flag
+            srv._dynamic_features = old_dyn  # type: ignore[attr-defined]
+            feature_map.update(evicted)
         # Handlers were registered for all methods (including call hierarchy)
         assert lsp.TEXT_DOCUMENT_HOVER in registered_methods
         assert lsp.TEXT_DOCUMENT_COMPLETION in registered_methods
@@ -2107,22 +2158,25 @@ class TestLspLifecycle:
     """Full LSP lifecycle tests via real stdio transport — zero mocks."""
 
     async def test_initialize_reports_capabilities(self, lsp_client: LanguageClient) -> None:
-        """Server advertises codeActionProvider and textDocumentSync but NOT jdtls features.
+        """Server advertises codeActionProvider, textDocumentSync, and jdtls features statically.
 
-        jdtls-dependent capabilities (hover, definition, references, completion,
-        documentSymbol) are registered dynamically after jdtls starts, so they
-        should NOT appear in the static InitializeResult.
+        The lsp_client fixture initializes without claiming dynamicRegistration for
+        any jdtls-gated feature. Per the LSP spec, the server must therefore
+        advertise those features in the static InitializeResult — otherwise
+        clients that ignore client/registerCapability (Claude Code 2.1.x) would
+        never route requests to us.
         """
         caps = lsp_client._server_capabilities  # type: ignore[attr-defined]
         assert caps is not None
         assert caps.code_action_provider is not None
         assert caps.text_document_sync is not None
-        # jdtls features are NOT statically advertised (registered dynamically)
-        assert caps.hover_provider is None
-        assert caps.definition_provider is None
-        assert caps.references_provider is None
-        assert caps.completion_provider is None
-        assert caps.document_symbol_provider is None
+        # jdtls features ARE statically advertised since the client did not
+        # claim dynamicRegistration support.
+        assert caps.hover_provider is True
+        assert caps.definition_provider is True
+        assert caps.references_provider is True
+        assert caps.completion_provider is not None  # CompletionOptions
+        assert caps.document_symbol_provider is True
 
     async def test_null_return_diagnostic_published(self, lsp_client: LanguageClient) -> None:
         """didOpen a file with ``return null`` → server publishes null-return diagnostic."""
