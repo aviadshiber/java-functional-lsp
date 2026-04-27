@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import os
 import sys
+from collections.abc import AsyncGenerator
 from typing import Any
 
 import pytest
@@ -61,7 +62,7 @@ public class Clean {
 
 
 @pytest.fixture
-async def lsp_client(tmp_path: Any) -> LanguageClient:  # type: ignore[misc]
+async def lsp_client(tmp_path: Any) -> AsyncGenerator[LanguageClient, None]:
     """Spawn the real java-functional-lsp server and return an initialized client.
 
     Uses pygls ``LanguageClient.start_io`` to connect via stdio — the exact
@@ -75,7 +76,7 @@ async def lsp_client(tmp_path: Any) -> LanguageClient:  # type: ignore[misc]
     client._diag_events: dict[str, asyncio.Event] = {}  # type: ignore[attr-defined]
 
     @client.feature(lsp.TEXT_DOCUMENT_PUBLISH_DIAGNOSTICS)
-    def on_publish(params: lsp.PublishDiagnosticsParams) -> None:
+    def _on_publish(params: lsp.PublishDiagnosticsParams) -> None:  # pyright: ignore[reportUnusedFunction]
         client._published[params.uri] = list(params.diagnostics)  # type: ignore[attr-defined]
         evt = client._diag_events.get(params.uri)  # type: ignore[attr-defined]
         if evt is not None:
@@ -673,7 +674,7 @@ class TestServerInternals:
 
         observed_before_await: dict[str, bool] = {}
 
-        async def _spy_send(*_args: Any, **_kwargs: Any) -> None:
+        async def _spy_send(*_args: Any, **_kwargs: Any) -> None:  # pyright: ignore[reportUnusedParameter]
             # This spy is injected as server._proxy.send_notification, which is
             # the first ``await`` reached in the is_available=True branch of
             # on_did_open (line: `await server._proxy.send_notification(...)`).
@@ -1131,7 +1132,7 @@ class TestServerInternals:
         mock_add = AsyncMock(return_value="file:///mod")
         mock_send = AsyncMock(side_effect=[None, {"result": "ok"}])
 
-        async def mock_wait(uri: str, timeout: float = 30.0) -> bool:  # type: ignore[reportUnusedParameter]
+        async def mock_wait(uri: str, timeout: float = 30.0) -> bool:  # pyright: ignore[reportUnusedParameter]
             srv._proxy.modules.mark_ready(uri)
             return True
 
