@@ -16,7 +16,11 @@ import time
 from collections import OrderedDict
 from collections.abc import Coroutine
 from pathlib import Path
-from typing import Any
+from threading import Event
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from typing import BinaryIO
 
 from lsprotocol import types as lsp
 from lsprotocol.converters import get_converter
@@ -1204,10 +1208,46 @@ def on_code_action(params: lsp.CodeActionParams) -> list[lsp.CodeAction] | None:
 # --- Entry point ---
 
 
+class _EternalStdinBuffer:
+    """Wraps sys.stdin.buffer so EOF never propagates to the pygls reader.
+
+    Claude Code (ENABLE_LSP_TOOL, versions ≤ 0.2.x) closes the LSP subprocess's
+    stdin pipe immediately after process startup — before sending any LSP messages.
+    pygls sees EOF on the first readline() and shuts down the server.
+
+    This wrapper intercepts that EOF: instead of returning b'' (which pygls's
+    run_async() treats as a signal to break its read loop and shut down), it
+    blocks the calling thread indefinitely via threading.Event.wait().
+
+    pygls uses a ThreadPoolExecutor for stdin reads (run_in_executor), so
+    blocking one thread does not stall the asyncio event loop — all other
+    coroutines (jdtls proxy, diagnostics publishing, etc.) remain responsive.
+
+    When Claude Code is fixed upstream, this class becomes a transparent pass-
+    through: data before EOF is forwarded unchanged; only the EOF itself is swallowed.
+    """
+
+    def __init__(self, buf: BinaryIO) -> None:
+        self._buf = buf
+        self._eof_gate = Event()  # never set — waits block forever
+
+    def readline(self) -> bytes:
+        line = self._buf.readline()
+        if not line:
+            self._eof_gate.wait()  # block forever instead of returning b''
+        return line
+
+    def read(self, n: int) -> bytes:
+        data = self._buf.read(n)
+        if not data:
+            self._eof_gate.wait()
+        return data
+
+
 def main() -> None:
     """Entry point for the LSP server."""
     logging.basicConfig(level=logging.INFO, format="%(name)s %(levelname)s: %(message)s")
-    server.start_io()
+    server.start_io(stdin=_EternalStdinBuffer(sys.stdin.buffer))  # type: ignore[arg-type]
 
 
 if __name__ == "__main__":
