@@ -1,3 +1,3 @@
 """java-functional-lsp: A Java LSP server enforcing functional programming best practices."""
 
-__version__ = "0.9.17"
+__version__ = "0.9.18"
