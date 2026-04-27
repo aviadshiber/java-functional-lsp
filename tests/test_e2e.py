@@ -10,6 +10,8 @@ from typing import Any
 
 import pytest
 
+from java_functional_lsp.capabilities.registry import REGISTRY
+
 
 def _encode_lsp(obj: dict[str, Any]) -> bytes:
     """Encode a JSON-RPC message with Content-Length header."""
@@ -189,6 +191,152 @@ class TestE2EInitialize:
         assert response is not None
         info = response["result"].get("serverInfo", {})
         assert "java-functional" in info.get("name", "").lower()
+
+
+def _snake_field_to_wire(field: str) -> str:
+    """Convert a ServerCapabilities snake_case field name to the camelCase JSON key.
+
+    Mirrors lsprotocol's converter, which renames `hover_provider` → `hoverProvider`
+    on serialization. Keeping this local (vs importing the converter) avoids
+    coupling tests to lsprotocol internals.
+    """
+    head, *tail = field.split("_")
+    return head + "".join(part.capitalize() for part in tail)
+
+
+# Derived from REGISTRY (single source of truth) so adding a new CapabilityEntry
+# automatically extends the regression assertion in
+# `test_initialize_with_empty_caps_advertises_all_jdtls_features_statically`.
+# A hand-maintained mirror would silently let new features regress for
+# Claude Code-style clients that ignore client/registerCapability.
+_JDTLS_PROVIDER_KEYS: frozenset[str] = frozenset(_snake_field_to_wire(entry.static_field) for entry in REGISTRY)
+
+
+def _initialize_with_caps(
+    proc: subprocess.Popen[bytes], capabilities: dict[str, Any], root_uri: str = "file:///tmp"
+) -> dict[str, Any]:
+    """Send `initialize` + `initialized` with arbitrary client capabilities, return the raw response."""
+    _send(
+        proc,
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {"processId": None, "capabilities": capabilities, "rootUri": root_uri},
+        },
+    )
+    response = _read_lsp(proc)
+    assert response is not None, "server returned no initialize response"
+    _send(proc, {"jsonrpc": "2.0", "method": "initialized", "params": {}})
+    return response
+
+
+class TestE2ECapabilityNegotiation:
+    """Regression coverage for per-feature static/dynamic capability negotiation.
+
+    Why these go through stdio + pygls (not just `on_initialize()` directly):
+
+    Pure-Python tests of `on_initialize` (test_server.py:782, :815) construct
+    `lsp.InitializeParams` and inspect the returned attrs object — they skip
+    pygls' wire-format JSON deserialization on the way in and lsprotocol's
+    converter on the way out. The bug fixed in PR #86 went undetected for
+    months precisely because the unit-test layer never observed the JSON the
+    client actually sees. Mirrors the rationale for `test_e2e_jdtls.py`:
+    "Unit tests with mocked subprocesses cannot catch JSON-shape regressions
+    because the mocks never parse the bytes."
+
+    Each test below verifies what a real LSP client would see on the wire.
+    """
+
+    def test_initialize_with_empty_caps_advertises_all_jdtls_features_statically(
+        self, server: subprocess.Popen[bytes]
+    ) -> None:
+        """Claude Code-style empty `capabilities` → server must list every jdtls provider statically.
+
+        Claude Code 2.1.x ignores `client/registerCapability` and routes solely
+        from the InitializeResult. If any jdtls feature is omitted here, that
+        feature is unreachable on Claude Code (the original bug — `LSP
+        documentSymbol` returned "No LSP server available for file type: .java"
+        even though the server was running and responsive).
+        """
+        response = _initialize_with_caps(server, capabilities={})
+        caps = response["result"]["capabilities"]
+        missing = sorted(k for k in _JDTLS_PROVIDER_KEYS if caps.get(k) is None)
+        assert not missing, (
+            f"Static InitializeResult is missing jdtls providers {missing}; "
+            "they will be unreachable on clients that don't honor "
+            "client/registerCapability (e.g., Claude Code 2.1.x)."
+        )
+
+    def test_initialize_with_full_dynamic_support_omits_jdtls_features_statically(
+        self, server: subprocess.Popen[bytes]
+    ) -> None:
+        """VS Code-style full `dynamicRegistration` claims → those providers must NOT be in static caps.
+
+        Preserves the PR #44 invariant: when the client supports dynamic
+        registration, defer jdtls features until jdtls actually warms up so
+        the IDE keeps showing its own diagnostic tooltips during the gap.
+        """
+        capabilities = {
+            "textDocument": {
+                "completion": {"dynamicRegistration": True},
+                "hover": {"dynamicRegistration": True},
+                "definition": {"dynamicRegistration": True},
+                "references": {"dynamicRegistration": True},
+                "documentSymbol": {"dynamicRegistration": True},
+                "callHierarchy": {"dynamicRegistration": True},
+                "signatureHelp": {"dynamicRegistration": True},
+                "implementation": {"dynamicRegistration": True},
+                "typeDefinition": {"dynamicRegistration": True},
+                "declaration": {"dynamicRegistration": True},
+                "documentHighlight": {"dynamicRegistration": True},
+                "rename": {"dynamicRegistration": True},
+                "typeHierarchy": {"dynamicRegistration": True},
+            },
+            "workspace": {"symbol": {"dynamicRegistration": True}},
+        }
+        response = _initialize_with_caps(server, capabilities=capabilities)
+        caps = response["result"]["capabilities"]
+        leaked = sorted(k for k in _JDTLS_PROVIDER_KEYS if caps.get(k) is not None)
+        assert not leaked, (
+            f"jdtls providers {leaked} appear in static caps even though the client claimed "
+            "dynamicRegistration for them — this would suppress IDE diagnostic tooltips during "
+            "jdtls warm-up (PR #44 invariant)."
+        )
+        # Always-static caps remain regardless of negotiation outcome.
+        assert caps.get("textDocumentSync") is not None
+        assert caps.get("codeActionProvider") is not None
+
+    def test_per_feature_negotiation_partial_dynamic_support(self, server: subprocess.Popen[bytes]) -> None:
+        """Mixed dynamic claims → server splits per feature, not all-or-nothing.
+
+        Guards against regressions that collapse the negotiation to a single
+        "if any feature claims dynamic, treat all as dynamic" (or the inverse).
+        Hover and definition claim dynamic; everything else does not. The
+        server must omit hover/definition from static caps and keep the rest.
+        """
+        capabilities = {
+            "textDocument": {
+                "hover": {"dynamicRegistration": True},
+                "definition": {"dynamicRegistration": True},
+            }
+        }
+        response = _initialize_with_caps(server, capabilities=capabilities)
+        caps = response["result"]["capabilities"]
+        # Dynamic-claimed: must be absent from static caps.
+        assert caps.get("hoverProvider") is None, (
+            "hoverProvider leaked into static caps despite the client claiming dynamicRegistration"
+        )
+        assert caps.get("definitionProvider") is None, (
+            "definitionProvider leaked into static caps despite the client claiming dynamicRegistration"
+        )
+        # Everything else should still be advertised statically.
+        unclaimed_keys = _JDTLS_PROVIDER_KEYS - {"hoverProvider", "definitionProvider"}
+        missing = sorted(k for k in unclaimed_keys if caps.get(k) is None)
+        assert not missing, (
+            f"Providers {missing} were dropped from static caps even though the client did NOT "
+            "claim dynamicRegistration for them — per-feature split is broken."
+        )
 
 
 class TestE2EDiagnostics:
