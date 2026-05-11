@@ -288,6 +288,52 @@ class TestNullCheckToMonadic:
         assert null_diags[0].data is not None
         assert null_diags[0].data.fix_type == "WRAP_IN_OPTION_MAP"
 
+    def test_snippet_uses_real_return_expression(self) -> None:
+        """Issue #74 review: snippet must build the lambda body from the real return expression,
+        not the degenerate `Option.of(x).map(v -> v).getOrElse(null)`."""
+        source = b"""
+        class T {
+            String f(User user) {
+                if (user != null) {
+                    return user.getName();
+                }
+                return "guest";
+            }
+        }
+        """
+        diags = parse_and_analyze(FunctionalChecker(), source)
+        diag = next(d for d in diags if d.code == "null-check-to-monadic")
+        assert diag.data is not None
+        snippet = diag.data.suggested_snippet
+        assert snippet is not None
+        # Lambda body should be the real method call, with `user` rewritten as `it`.
+        assert "Option.of(user).map(it -> it.getName())" in snippet
+        # Default should be the real fallback, not always-null.
+        assert '.getOrElse("guest")' in snippet
+        assert ".getOrElse(null)" not in snippet
+        # Must NOT contain the old degenerate identity-map shape.
+        assert ".map(v -> v)" not in snippet
+
+    def test_snippet_omits_default_when_else_returns_null(self) -> None:
+        """When the else-branch returns null, the snippet should leave the Option monadic
+        (no `.getOrElse(null)` — which would defeat the rule)."""
+        source = b"""
+        class T {
+            String f(User user) {
+                if (user != null) {
+                    return user.getName();
+                }
+                return null;
+            }
+        }
+        """
+        diags = parse_and_analyze(FunctionalChecker(), source)
+        diag = next(d for d in diags if d.code == "null-check-to-monadic")
+        assert diag.data is not None
+        snippet = diag.data.suggested_snippet
+        assert snippet is not None
+        assert ".getOrElse(null)" not in snippet
+
     def test_disabled_by_config(self) -> None:
         source = b"""
         class T {

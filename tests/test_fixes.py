@@ -6,7 +6,6 @@ from lsprotocol import types as lsp
 
 from java_functional_lsp.fixes import (
     ensure_import,
-    fix_field_injection,
     fix_frozen_mutation,
     fix_imperative_option_unwrap,
     fix_mutable_dto,
@@ -1184,9 +1183,45 @@ class TestFixImperativeOptionUnwrap:
         result = fix_imperative_option_unwrap("file:///T.java", source, diag_range, {})
         assert result is None
 
+    def test_no_else_branch_bails(self) -> None:
+        """Issue #74 review (blocker): without an else, rewriting to `opt.map(it -> it)` returns
+        Option<T> instead of the method's declared T — must NOT produce an edit.
+        """
+        source = (
+            "class T {\n"
+            "    String f(Option<String> opt) {\n"
+            "        if (opt.isDefined()) {\n"
+            "            return opt.get();\n"
+            "        }\n"
+            '        return "default";\n'
+            "    }\n"
+            "}\n"
+        )
+        diag_range = _range(2, 8, 4, 9)
+        result = fix_imperative_option_unwrap("file:///T.java", source, diag_range, {})
+        assert result is None, "fix must bail when there's no else branch (type-mismatch risk)"
+
 
 class TestFixMutableDto:
-    """Issue #74 #3: quick-fix that swaps @Data/@Setter for @Value."""
+    """Issue #74 #3: quick-fix that swaps @Data for @Value (only — @Setter is rejected)."""
+
+    def test_skips_setter_annotation(self) -> None:
+        """Issue #74 review: blanket @Setter -> @Value silently strips setters and makes class
+        final, breaking callers. The fix must only rewrite @Data."""
+        source = "@Setter\npublic class UserDto {\n    private String name;\n}\n"
+        diag_range = _range(0, 0, 0, 7)
+        result = fix_mutable_dto("file:///UserDto.java", source, diag_range, {})
+        assert result is None
+
+    def test_skips_when_configuration_properties_sibling(self) -> None:
+        """Issue #74 review: @ConfigurationProperties classes need @ConstructorBinding, not @Value.
+        The diagnostic message already says so — the fix must respect it."""
+        source = (
+            '@Data\n@ConfigurationProperties(prefix = "x")\npublic class AppConfig {\n    private String name;\n}\n'
+        )
+        diag_range = _range(0, 0, 0, 5)
+        result = fix_mutable_dto("file:///AppConfig.java", source, diag_range, {})
+        assert result is None
 
     def test_rewrites_data_to_value(self) -> None:
         source = "import lombok.Data;\n\n@Data\npublic class UserDto {\n    private String name;\n}\n"
@@ -1208,41 +1243,35 @@ class TestFixMutableDto:
         result = fix_mutable_dto("file:///UserDto.java", source, diag_range, {})
         assert result is None
 
-    def test_no_import_when_disabled(self) -> None:
+    def test_no_import_when_lombok_disabled(self) -> None:
+        """`autoImportLombok=False` should suppress the lombok.Value import edit."""
         source = "@Data\npublic class UserDto { private String name; }\n"
         diag_range = _range(0, 0, 0, 5)
-        result = fix_mutable_dto("file:///UserDto.java", source, diag_range, {"autoImportVavr": False})
+        result = fix_mutable_dto("file:///UserDto.java", source, diag_range, {"autoImportLombok": False})
         assert result is not None
         assert result.changes is not None
         edits = result.changes["file:///UserDto.java"]
         # Only the annotation rewrite, no import.
         assert all("import" not in e.new_text for e in edits)
 
-
-class TestFixFieldInjection:
-    """Issue #74 #3: quick-fix that removes @Autowired and ensures `final`."""
-
-    def test_removes_autowired_and_adds_final(self) -> None:
-        source = "class Foo {\n    @Autowired\n    private Bar bar;\n}\n"
-        # Diagnostic is on the @Autowired annotation name; spring_checker.py uses name_node points.
-        diag_range = _range(1, 5, 1, 14)  # the "Autowired" identifier
-        result = fix_field_injection("file:///Foo.java", source, diag_range, {})
+    def test_autovavr_disabled_does_not_affect_lombok_import(self) -> None:
+        """Issue #74 review: `autoImportVavr=False` must NOT block the Lombok import,
+        since the user might want Vavr off but still want Lombok auto-imported.
+        """
+        source = "@Data\npublic class UserDto { private String name; }\n"
+        diag_range = _range(0, 0, 0, 5)
+        result = fix_mutable_dto("file:///UserDto.java", source, diag_range, {"autoImportVavr": False})
         assert result is not None
         assert result.changes is not None
-        edits = result.changes["file:///Foo.java"]
-        # Should produce two edits: remove annotation line, insert `final`.
-        assert len(edits) >= 2
-        # Verify a `final ` insertion exists.
-        assert any(e.new_text == "final " for e in edits)
-        # Verify an annotation-removal edit exists (empty string replacement).
-        assert any(e.new_text == "" for e in edits)
+        edits = result.changes["file:///UserDto.java"]
+        # The Lombok import should still appear.
+        assert any("import lombok.Value" in e.new_text for e in edits)
 
-    def test_preserves_existing_final(self) -> None:
-        """If the field is already `final`, only remove the annotation."""
-        source = "class Foo {\n    @Autowired\n    private final Bar bar;\n}\n"
-        diag_range = _range(1, 5, 1, 14)
-        result = fix_field_injection("file:///Foo.java", source, diag_range, {})
-        assert result is not None
-        assert result.changes is not None
-        edits = result.changes["file:///Foo.java"]
-        assert not any(e.new_text == "final " for e in edits)
+
+class TestFieldInjectionNoQuickFix:
+    """field-injection has no registered quick-fix (synthesising a constructor is unsafe
+    without class-wide analysis). The diagnostic + suggested_snippet remain available for AI agents.
+    """
+
+    def test_field_injection_not_in_registry(self) -> None:
+        assert "field-injection" not in get_fix_registry_keys()

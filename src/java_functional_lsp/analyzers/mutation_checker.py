@@ -45,7 +45,6 @@ _DATA = {
         target_library="lombok.Value",
         rationale="Mutable DTOs allow uncontrolled state changes. Use @Value for immutable data classes.",
         recommended_api="@Value",
-        suggested_snippet="@Value\npublic class Foo { ... }",
     ),
     "imperative-option-unwrap": DiagnosticData(
         fix_type="USE_MAP_FLATMAP",
@@ -54,6 +53,23 @@ _DATA = {
         recommended_api="map / flatMap / fold / forEach (NOT ifPresent — Vavr Option uses forEach)",
     ),
 }
+
+
+def _build_mutable_dto_data(class_decl: Any) -> DiagnosticData:
+    """Build a DiagnosticData with a @Value snippet using the real class name."""
+    base = _DATA["mutable-dto"]
+    name_node = class_decl.child_by_field_name("name") if class_decl is not None else None
+    if name_node is None or not name_node.text:
+        return base
+    class_name = name_node.text.decode("utf-8")
+    snippet = f"@Value\npublic class {class_name} {{ /* fields become final */ }}"
+    return DiagnosticData(
+        fix_type=base.fix_type,
+        target_library=base.target_library,
+        rationale=base.rationale,
+        recommended_api=base.recommended_api,
+        suggested_snippet=snippet,
+    )
 
 
 def _build_imperative_option_unwrap_data(obj_name: bytes, consequence: Any, else_branch: Any) -> DiagnosticData:
@@ -151,7 +167,7 @@ class MutationChecker:
                                 severity=severity,
                                 code="mutable-dto",
                                 message=message,
-                                data=_DATA["mutable-dto"],
+                                data=_build_mutable_dto_data(grandparent),
                             )
                         )
 

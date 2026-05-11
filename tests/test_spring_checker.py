@@ -48,6 +48,43 @@ class TestSpringCheckerData:
         assert "private final UserRepository userRepo" in snippet
         assert "this.userRepo = userRepo" in snippet
 
+    def test_field_injection_snippet_uses_real_enclosing_class_name(self) -> None:
+        """Issue #74 review: the constructor in the snippet must use the actual enclosing class
+        name, not a hardcoded `Foo`."""
+        source = b"class AccountService { @Autowired private UserRepository userRepo; }"
+        diags = parse_and_analyze(SpringChecker(), source)
+        fi = next(d for d in diags if d.code == "field-injection")
+        assert fi.data is not None
+        snippet = fi.data.suggested_snippet
+        assert snippet is not None
+        assert "public AccountService(" in snippet
+        # And must NOT use the placeholder.
+        assert "public Foo(" not in snippet
+        assert "public MyClass(" not in snippet
+
+    def test_field_injection_multi_declarator_omits_snippet(self) -> None:
+        """Issue #74 review: a multi-declarator field is ambiguous; the snippet must be omitted
+        rather than fabricating a wrong-looking single-name constructor."""
+        source = b"class Service { @Autowired private Bar a, b; }"
+        diags = parse_and_analyze(SpringChecker(), source)
+        fi = next(d for d in diags if d.code == "field-injection")
+        assert fi.data is not None
+        assert fi.data.suggested_snippet is None
+
+    def test_component_annotation_snippet_uses_real_class_name(self) -> None:
+        """Issue #74 review: the @Configuration snippet must reference the real class name
+        rather than the placeholder `Foo`."""
+        source = b"@Service class PaymentGateway { }"
+        diags = parse_and_analyze(SpringChecker(), source)
+        comp = next(d for d in diags if d.code == "component-annotation")
+        assert comp.data is not None
+        snippet = comp.data.suggested_snippet
+        assert snippet is not None
+        assert "PaymentGateway" in snippet
+        assert "PaymentGatewayConfig" in snippet
+        # The bean factory method name should be lowerCamelCase of the class name.
+        assert "public PaymentGateway paymentGateway()" in snippet
+
 
 class TestComponentAnnotation:
     def test_detects_service(self) -> None:

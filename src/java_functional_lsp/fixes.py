@@ -1034,28 +1034,28 @@ def fix_imperative_option_unwrap(
         if lambda_body == ret_text:
             return None
 
-    # Alternative (else) must be a single return statement, or absent (then no getOrElse).
-    or_else: str | None = None
-    if alternative is not None:
-        alt_stmts = (
-            [c for c in alternative.named_children if c.type not in IGNORED_CHILDREN]
-            if alternative.type == "block"
-            else [alternative]
-        )
-        if len(alt_stmts) != 1 or alt_stmts[0].type != "return_statement":
-            return None
-        alt_ret = [c for c in alt_stmts[0].named_children if c.type not in IGNORED_CHILDREN]
-        if not alt_ret:
-            return None
-        alt_text = alt_ret[0].text.decode("utf-8") if alt_ret[0].text else "null"
-        if _is_eager(alt_ret[0]):
-            or_else = f".getOrElse({alt_text})"
-        else:
-            or_else = f".getOrElse(() -> {alt_text})"
+    # Alternative (else) must be a single return statement. Bail when absent — without an
+    # else-return, `return opt.map(it -> it);` returns Option<T> rather than T, breaking the
+    # method's return type.
+    if alternative is None:
+        return None
+    alt_stmts = (
+        [c for c in alternative.named_children if c.type not in IGNORED_CHILDREN]
+        if alternative.type == "block"
+        else [alternative]
+    )
+    if len(alt_stmts) != 1 or alt_stmts[0].type != "return_statement":
+        return None
+    alt_ret = [c for c in alt_stmts[0].named_children if c.type not in IGNORED_CHILDREN]
+    if not alt_ret:
+        return None
+    alt_text = alt_ret[0].text.decode("utf-8") if alt_ret[0].text else "null"
+    if _is_eager(alt_ret[0]):
+        or_else = f".getOrElse({alt_text})"
+    else:
+        or_else = f".getOrElse(() -> {alt_text})"
 
-    chain = f"{var}.map(it -> {lambda_body})"
-    if or_else is not None:
-        chain += or_else
+    chain = f"{var}.map(it -> {lambda_body}){or_else}"
 
     edits: list[lsp.TextEdit] = []
     edits.append(
@@ -1103,17 +1103,24 @@ def fix_mutable_dto(
     tree: Tree | None = None,
     lines: list[str] | None = None,
 ) -> lsp.WorkspaceEdit | None:
-    """Rewrite ``@Data`` / ``@Setter`` to ``@Value`` on the class declaration.
+    """Rewrite ``@Data`` to ``@Value`` on the class declaration.
 
-    Bails when the class also carries Lombok constructor annotations that conflict
-    with ``@Value`` (it implies a single all-args constructor and final fields).
+    Bails when:
+    - The annotation is ``@Setter`` (not ``@Data``). ``@Setter`` users typically pair it
+      with non-final fields and explicit setter usage; switching to ``@Value`` would make
+      the class final and strip the setters, silently breaking callers.
+    - The class carries ``@ConfigurationProperties`` (Spring Boot expects a settable bean
+      and recommends ``@ConstructorBinding`` instead — different rewrite path).
+    - The class carries Lombok constructor annotations that conflict with ``@Value`` (it
+      implies a single all-args constructor and final fields).
+    - The annotation isn't on a class_declaration parent.
     """
     if lines is None:
         lines = source.split("\n")
     if tree is None:
         tree = get_parser().parse(source.encode("utf-8"))
 
-    ann = _find_marker_annotation_at(tree, diag_range, {b"Data", b"Setter"})
+    ann = _find_marker_annotation_at(tree, diag_range, {b"Data"})
     if ann is None or has_error_or_missing(ann):
         return None
 
@@ -1121,11 +1128,20 @@ def fix_mutable_dto(
     if modifiers is None or modifiers.type != "modifiers":
         return None
 
-    # Reject if any conflicting Lombok annotation sits next to @Data/@Setter.
+    # Verify the annotation is actually on a class declaration (not e.g. a method or field).
+    if modifiers.parent is None or modifiers.parent.type != "class_declaration":
+        return None
+
+    # Reject if any conflicting Lombok annotation sits next to @Data, or if Spring's
+    # @ConfigurationProperties is present (use @ConstructorBinding there instead).
     for sib in modifiers.named_children:
-        if sib.type == "marker_annotation":
+        if sib.type in ("marker_annotation", "annotation"):
             name_node = sib.child_by_field_name("name")
-            if name_node is not None and name_node.text in _CONFLICTING_LOMBOK_ANNOTATIONS:
+            if name_node is None:
+                continue
+            if name_node.text in _CONFLICTING_LOMBOK_ANNOTATIONS:
+                return None
+            if name_node.text == b"ConfigurationProperties":
                 return None
 
     name_node = ann.child_by_field_name("name")
@@ -1143,125 +1159,12 @@ def fix_mutable_dto(
             new_text="Value",
         )
     )
-    if config.get("autoImportVavr", True):
-        # @Value lives in lombok.Value; keep the existing import-management helper but use a Lombok path.
+    # Lombok auto-import is gated on its own flag (defaults True) so users who disable
+    # Vavr imports still get the Lombok one and vice versa.
+    if config.get("autoImportLombok", True):
         import_edit = ensure_import(lines, "lombok.Value")
         if import_edit is not None:
             edits.append(import_edit)
-    return lsp.WorkspaceEdit(changes={uri: edits})
-
-
-# --- field-injection ---
-
-
-def _find_field_declaration_at(tree: Tree, diag_range: lsp.Range) -> Node | None:
-    """Find the field_declaration whose @Autowired annotation is at the diagnostic range."""
-    target = tree.root_node.descendant_for_point_range(
-        (diag_range.start.line, diag_range.start.character),
-        (diag_range.end.line, diag_range.end.character),
-    )
-    if target is None:
-        return None
-    return find_ancestor(target, "field_declaration")
-
-
-def _find_autowired_annotation(field_decl: Node) -> Node | None:
-    """Return the @Autowired marker_annotation inside a field_declaration, if present."""
-    modifiers = next((c for c in field_decl.children if c.type == "modifiers"), None)
-    if modifiers is None:
-        return None
-    for child in modifiers.named_children:
-        if child.type == "marker_annotation":
-            name_node = child.child_by_field_name("name")
-            if name_node is not None and name_node.text == b"Autowired":
-                return child
-    return None
-
-
-def fix_field_injection(
-    uri: str,
-    source: str,
-    diag_range: lsp.Range,
-    config: dict[str, Any],
-    *,
-    tree: Tree | None = None,
-    lines: list[str] | None = None,
-) -> lsp.WorkspaceEdit | None:
-    """Rewrite a single ``@Autowired`` field to ``private final``.
-
-    Removes the ``@Autowired`` annotation token (plus trailing whitespace) and ensures
-    the field declaration includes the ``final`` modifier. We do NOT synthesise a
-    constructor here — that requires class-wide analysis and risks clobbering existing
-    constructors. The diagnostic remains useful as a starting point; the agent (or user)
-    can follow the suggested_snippet to add the constructor.
-    """
-    if lines is None:
-        lines = source.split("\n")
-    if tree is None:
-        tree = get_parser().parse(source.encode("utf-8"))
-
-    field_decl = _find_field_declaration_at(tree, diag_range)
-    if field_decl is None or has_error_or_missing(field_decl):
-        return None
-
-    ann = _find_autowired_annotation(field_decl)
-    if ann is None:
-        return None
-
-    modifiers = ann.parent
-    if modifiers is None:
-        return None
-
-    edits: list[lsp.TextEdit] = []
-
-    # Remove the @Autowired annotation: extend the range to swallow trailing whitespace
-    # on the same line (or the newline if @Autowired sits on its own line).
-    ann_end_line = ann.end_point[0]
-    ann_end_col = ann.end_point[1]
-    if ann_end_line < len(lines):
-        line_after = lines[ann_end_line][ann_end_col:]
-        if line_after.strip() == "":
-            # Annotation sits alone on its line — remove the whole line including newline.
-            edits.append(
-                lsp.TextEdit(
-                    range=lsp.Range(
-                        start=lsp.Position(line=ann.start_point[0], character=0),
-                        end=lsp.Position(line=ann_end_line + 1, character=0),
-                    ),
-                    new_text="",
-                )
-            )
-        else:
-            # Annotation has code after it on the same line — remove annotation + one trailing space.
-            trailing = 1 if line_after.startswith(" ") else 0
-            edits.append(
-                lsp.TextEdit(
-                    range=lsp.Range(
-                        start=lsp.Position(line=ann.start_point[0], character=ann.start_point[1]),
-                        end=lsp.Position(line=ann_end_line, character=ann_end_col + trailing),
-                    ),
-                    new_text="",
-                )
-            )
-
-    # Ensure `final` is present on the field. Look at modifier keywords (unnamed children).
-    has_final = any(c.type == "final" for c in modifiers.children)
-    if not has_final:
-        # Insert `final ` right before the type. The type is a child of field_decl, not modifiers.
-        type_node = field_decl.child_by_field_name("type")
-        if type_node is not None:
-            edits.append(
-                lsp.TextEdit(
-                    range=lsp.Range(
-                        start=lsp.Position(line=type_node.start_point[0], character=type_node.start_point[1]),
-                        end=lsp.Position(line=type_node.start_point[0], character=type_node.start_point[1]),
-                    ),
-                    new_text="final ",
-                )
-            )
-
-    if not edits:
-        return None
     return lsp.WorkspaceEdit(changes={uri: edits})
 
 
@@ -1274,7 +1177,10 @@ _FIX_REGISTRY: dict[str, FixGenerator] = {
     "try-catch-to-monadic": fix_try_catch_to_monadic,
     "imperative-option-unwrap": fix_imperative_option_unwrap,
     "mutable-dto": fix_mutable_dto,
-    "field-injection": fix_field_injection,
+    # field-injection is intentionally NOT registered: producing a sound rewrite
+    # requires synthesising or extending a constructor (class-wide analysis that
+    # risks clobbering user code). The diagnostic + suggested_snippet remain
+    # available to AI agents, which can apply the change themselves.
 }
 
 

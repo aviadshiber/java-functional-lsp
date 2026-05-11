@@ -302,7 +302,9 @@ def _load_config(workspace_root: str | None) -> dict[str, Any]:
 
 def _to_lsp_diagnostic(diag: LintDiagnostic) -> lsp.Diagnostic:
     """Convert an internal diagnostic to an LSP diagnostic."""
-    data: dict[str, str] | None = None
+    # dict[str, Any] mirrors the LSP `Diagnostic.data` shape so future non-string fields
+    # (numbers, bools, nested objects) can be added without re-typing the function.
+    data: dict[str, Any] | None = None
     if diag.data is not None:
         data = {
             "fixType": diag.data.fix_type,
@@ -1148,8 +1150,7 @@ _FIX_TITLES: dict[str, str] = {
     "null-return": "Replace with Option.none()",
     "try-catch-to-monadic": "Convert try/catch to Try monadic flow",
     "imperative-option-unwrap": "Convert to Option.map().getOrElse()",
-    "mutable-dto": "Replace @Data/@Setter with @Value",
-    "field-injection": "Convert @Autowired field to final + constructor injection",
+    "mutable-dto": "Replace @Data with @Value",
 }
 
 # Guard against title/registry mismatch at import time

@@ -182,6 +182,19 @@ class TestMutationCheckerData:
         assert dto.data is not None
         assert dto.data.recommended_api == "@Value"
 
+    def test_mutable_dto_snippet_uses_real_class_name(self) -> None:
+        """Issue #74 review: snippet must reference the real class name, not the placeholder `Foo`
+        with `{ ... }` body that would never compile if pasted."""
+        source = b"@Data class UserDto { private String name; }"
+        diags = parse_and_analyze(MutationChecker(), source)
+        dto = next(d for d in diags if d.code == "mutable-dto")
+        assert dto.data is not None
+        snippet = dto.data.suggested_snippet
+        assert snippet is not None
+        assert "class UserDto" in snippet
+        # No `{ ... }` placeholder body (that's not valid Java).
+        assert "{ ... }" not in snippet
+
 
 class TestConstructorAssignment:
     def test_ignores_this_field_in_constructor(self) -> None:

@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from typing import Any
+import re
+from typing import Any, Literal
 
 from tree_sitter import Node, Tree
 
@@ -72,11 +73,46 @@ _DATA = {
 }
 
 
-def _build_null_check_to_monadic_data(var_name: bytes) -> DiagnosticData:
-    """Build a DiagnosticData carrying a concrete Option snippet using the real var name."""
+def _build_null_check_to_monadic_data(
+    var_name: bytes, consequence: Node | None, alternative: Node | None, if_node: Node | None = None
+) -> DiagnosticData:
+    """Build an Option snippet using the real var name + real return expressions.
+
+    Inspects the if-then return expression (the body of ``if (x != null) return X.something();``)
+    and rewrites references to ``var_name`` as ``it`` in a ``.map(it -> ...)`` lambda. The else
+    branch's return expression — either nested in the if as an alternative or following the if
+    as a fallthrough — becomes the ``.getOrElse(...)`` argument. Falls back to the base data
+    (no snippet) when the then-branch isn't a single return.
+    """
     base = _DATA["null-check-to-monadic"]
-    var = var_name.decode("utf-8") if var_name else "value"
-    snippet = f"Option.of({var}).map(v -> v).getOrElse(null);"
+    if not var_name:
+        return base
+    var = var_name.decode("utf-8")
+
+    then_expr = _single_return_expr_text(consequence)
+    if then_expr is None:
+        return base
+    # Rewrite references to the checked variable as `it` in the lambda body. Use a word-boundary
+    # regex so a short var name like `s` doesn't match `s.toString()` inside another identifier.
+    # Skip the map when the body is exactly the variable itself (identity case).
+    if then_expr == var:
+        chain_body = f"Option.of({var})"
+    else:
+        lambda_body = re.sub(rf"\b{re.escape(var)}\b", "it", then_expr)
+        chain_body = f"Option.of({var}).map(it -> {lambda_body})"
+
+    # Prefer the nested else-branch; otherwise look at the statement immediately following the if
+    # (a common fallthrough pattern: `if (x != null) return ...; return fallback;`).
+    else_expr = _single_return_expr_text(alternative)
+    if else_expr is None and if_node is not None:
+        else_expr = _next_statement_return_expr(if_node)
+
+    if else_expr is None or else_expr == "null":
+        # No else (or else returns null) — return Option<T> directly; don't fabricate a default.
+        snippet = f"return {chain_body};"
+    else:
+        snippet = f"return {chain_body}.getOrElse({else_expr});"
+
     return DiagnosticData(
         fix_type=base.fix_type,
         target_library=base.target_library,
@@ -84,6 +120,41 @@ def _build_null_check_to_monadic_data(var_name: bytes) -> DiagnosticData:
         recommended_api=base.recommended_api,
         suggested_snippet=snippet,
     )
+
+
+def _next_statement_return_expr(if_node: Node) -> str | None:
+    """If the statement immediately after ``if_node`` (in its enclosing block) is a single
+    `return <expr>;`, return that expression's text. Otherwise None."""
+    parent = if_node.parent
+    if parent is None or parent.type != "block":
+        return None
+    siblings = [c for c in parent.named_children if c.type not in ("line_comment", "block_comment")]
+    try:
+        idx = siblings.index(if_node)
+    except ValueError:
+        return None
+    if idx + 1 >= len(siblings):
+        return None
+    next_stmt = siblings[idx + 1]
+    return _single_return_expr_text(next_stmt)
+
+
+def _single_return_expr_text(block_or_stmt: Node | None) -> str | None:
+    """Return the text of a single ``return <expr>;`` statement in a block (or the statement
+    itself). Returns None for anything else (multiple statements, no return, bare return)."""
+    if block_or_stmt is None:
+        return None
+    if block_or_stmt.type == "block":
+        stmts = [c for c in block_or_stmt.named_children if c.type not in ("line_comment", "block_comment")]
+    else:
+        stmts = [block_or_stmt]
+    if len(stmts) != 1 or stmts[0].type != "return_statement":
+        return None
+    ret_children = [c for c in stmts[0].named_children if c.type not in ("line_comment", "block_comment")]
+    if not ret_children or not ret_children[0].text:
+        return None
+    decoded: str = ret_children[0].text.decode("utf-8")
+    return decoded
 
 
 def _build_frozen_mutation_data(method_name: bytes, var_name: bytes) -> DiagnosticData:
@@ -344,7 +415,12 @@ class FunctionalChecker:
                     severity=severity,
                     code="null-check-to-monadic",
                     message=_MESSAGES["null-check-to-monadic"],
-                    data=_build_null_check_to_monadic_data(checked_var),
+                    data=_build_null_check_to_monadic_data(
+                        checked_var,
+                        consequence,
+                        if_node.child_by_field_name("alternative"),
+                        if_node,
+                    ),
                 )
             )
 
@@ -398,7 +474,7 @@ class FunctionalChecker:
                 continue  # Need at least 2 statements to have a mix
 
             offender: Node | None = None
-            offender_kind: str | None = None  # "throw" or "io"
+            offender_kind: Literal["throw", "io"] | None = None
             has_pure_logic = False
 
             for stmt in statements:
@@ -438,12 +514,13 @@ class FunctionalChecker:
                 )
             )
 
-    def _classify_side_effect(self, stmt: Node) -> tuple[str | None, Node | None]:
+    def _classify_side_effect(self, stmt: Node) -> tuple[Literal["throw", "io"] | None, Node | None]:
         """Find the first side-effect node within a statement subtree.
 
         Returns (kind, node) where kind is "throw", "io", or None (if the statement
         contains no side-effects). The node is the offending throw_statement or
-        method_invocation — used to position the diagnostic.
+        method_invocation — used to position the diagnostic. The Literal annotation
+        catches typos in the discriminator at type-check time.
 
         Single TreeCursor traversal to detect both throws and IO calls in one pass.
         """
