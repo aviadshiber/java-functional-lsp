@@ -56,9 +56,7 @@ _DATA = {
 }
 
 
-def _build_imperative_option_unwrap_data(
-    obj_name: bytes, consequence: Any, else_branch: Any
-) -> DiagnosticData:
+def _build_imperative_option_unwrap_data(obj_name: bytes, consequence: Any, else_branch: Any) -> DiagnosticData:
     """Build a DiagnosticData carrying a concrete snippet for imperative Option unwrap.
 
     Uses the real variable name from the AST. Snippet shape depends on whether the
@@ -101,6 +99,7 @@ def _build_imperative_option_unwrap_data(
         recommended_api=base.recommended_api,
         suggested_snippet=snippet,
     )
+
 
 _LOOP_TYPES = {"enhanced_for_statement", "for_statement", "while_statement"}
 _METHOD_TYPES = {"method_declaration", "constructor_declaration", "lambda_expression"}

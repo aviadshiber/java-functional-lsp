@@ -1189,14 +1189,7 @@ class TestFixMutableDto:
     """Issue #74 #3: quick-fix that swaps @Data/@Setter for @Value."""
 
     def test_rewrites_data_to_value(self) -> None:
-        source = (
-            "import lombok.Data;\n"
-            "\n"
-            "@Data\n"
-            "public class UserDto {\n"
-            "    private String name;\n"
-            "}\n"
-        )
+        source = "import lombok.Data;\n\n@Data\npublic class UserDto {\n    private String name;\n}\n"
         diag_range = _range(2, 0, 2, 5)
         result = fix_mutable_dto("file:///UserDto.java", source, diag_range, {})
         assert result is not None
@@ -1210,22 +1203,13 @@ class TestFixMutableDto:
 
     def test_skips_when_conflicting_annotation_present(self) -> None:
         """@Value doesn't combine with @NoArgsConstructor — bail."""
-        source = (
-            "@Data\n"
-            "@NoArgsConstructor\n"
-            "public class UserDto {\n"
-            "    private String name;\n"
-            "}\n"
-        )
+        source = "@Data\n@NoArgsConstructor\npublic class UserDto {\n    private String name;\n}\n"
         diag_range = _range(0, 0, 0, 5)
         result = fix_mutable_dto("file:///UserDto.java", source, diag_range, {})
         assert result is None
 
     def test_no_import_when_disabled(self) -> None:
-        source = (
-            "@Data\n"
-            "public class UserDto { private String name; }\n"
-        )
+        source = "@Data\npublic class UserDto { private String name; }\n"
         diag_range = _range(0, 0, 0, 5)
         result = fix_mutable_dto("file:///UserDto.java", source, diag_range, {"autoImportVavr": False})
         assert result is not None
@@ -1239,12 +1223,7 @@ class TestFixFieldInjection:
     """Issue #74 #3: quick-fix that removes @Autowired and ensures `final`."""
 
     def test_removes_autowired_and_adds_final(self) -> None:
-        source = (
-            "class Foo {\n"
-            "    @Autowired\n"
-            "    private Bar bar;\n"
-            "}\n"
-        )
+        source = "class Foo {\n    @Autowired\n    private Bar bar;\n}\n"
         # Diagnostic is on the @Autowired annotation name; spring_checker.py uses name_node points.
         diag_range = _range(1, 5, 1, 14)  # the "Autowired" identifier
         result = fix_field_injection("file:///Foo.java", source, diag_range, {})
@@ -1260,12 +1239,7 @@ class TestFixFieldInjection:
 
     def test_preserves_existing_final(self) -> None:
         """If the field is already `final`, only remove the annotation."""
-        source = (
-            "class Foo {\n"
-            "    @Autowired\n"
-            "    private final Bar bar;\n"
-            "}\n"
-        )
+        source = "class Foo {\n    @Autowired\n    private final Bar bar;\n}\n"
         diag_range = _range(1, 5, 1, 14)
         result = fix_field_injection("file:///Foo.java", source, diag_range, {})
         assert result is not None

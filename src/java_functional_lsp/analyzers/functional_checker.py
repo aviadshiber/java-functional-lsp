@@ -107,6 +107,7 @@ def _build_frozen_mutation_data(method_name: bytes, var_name: bytes) -> Diagnost
         suggested_snippet=snippet,
     )
 
+
 # Factory methods that produce frozen (unmodifiable) collections
 _FROZEN_FACTORIES = {
     b"of",  # List.of(), Set.of(), Map.of()

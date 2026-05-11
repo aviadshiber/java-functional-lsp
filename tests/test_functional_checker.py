@@ -566,7 +566,7 @@ class TestImpureMethod:
         # The method declaration is on line 2 (0-indexed: line 2 = `String f(...) {`).
         # The println is on line 4. Range must land on the println line, not the method name.
         diag_line = impure[0].line
-        method_decl_line = source.split(b"\n").index(b'            String f(String input) {')
+        method_decl_line = source.split(b"\n").index(b"            String f(String input) {")
         assert diag_line != method_decl_line, (
             f"Diagnostic should point at the side-effect line, not the method declaration "
             f"(diag_line={diag_line}, method_decl_line={method_decl_line})"

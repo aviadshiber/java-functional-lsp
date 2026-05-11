@@ -1011,8 +1011,11 @@ def fix_imperative_option_unwrap(
     var = var_name.decode("utf-8")
 
     # Consequence must be a block with exactly: `return <var>.get();` (or similar shape).
-    cons_stmts = [c for c in consequence.named_children if c.type not in IGNORED_CHILDREN] \
-        if consequence.type == "block" else [consequence]
+    cons_stmts = (
+        [c for c in consequence.named_children if c.type not in IGNORED_CHILDREN]
+        if consequence.type == "block"
+        else [consequence]
+    )
     if len(cons_stmts) != 1 or cons_stmts[0].type != "return_statement":
         return None
     ret_children = [c for c in cons_stmts[0].named_children if c.type not in IGNORED_CHILDREN]
@@ -1034,8 +1037,11 @@ def fix_imperative_option_unwrap(
     # Alternative (else) must be a single return statement, or absent (then no getOrElse).
     or_else: str | None = None
     if alternative is not None:
-        alt_stmts = [c for c in alternative.named_children if c.type not in IGNORED_CHILDREN] \
-            if alternative.type == "block" else [alternative]
+        alt_stmts = (
+            [c for c in alternative.named_children if c.type not in IGNORED_CHILDREN]
+            if alternative.type == "block"
+            else [alternative]
+        )
         if len(alt_stmts) != 1 or alt_stmts[0].type != "return_statement":
             return None
         alt_ret = [c for c in alt_stmts[0].named_children if c.type not in IGNORED_CHILDREN]

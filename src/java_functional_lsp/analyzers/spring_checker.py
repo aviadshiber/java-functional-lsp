@@ -29,11 +29,7 @@ _DATA = {
         ),
         recommended_api="@Configuration + @Bean",
         suggested_snippet=(
-            "@Configuration\n"
-            "public class FooConfig {\n"
-            "    @Bean\n"
-            "    public Foo foo() { return new Foo(); }\n"
-            "}"
+            "@Configuration\npublic class FooConfig {\n    @Bean\n    public Foo foo() { return new Foo(); }\n}"
         ),
     ),
 }
@@ -67,6 +63,7 @@ def _build_field_injection_data(field_decl: Any) -> DiagnosticData:
         recommended_api=base.recommended_api,
         suggested_snippet=snippet,
     )
+
 
 _BAD_ANNOTATIONS = {b"Component", b"Service", b"Repository"}
 
