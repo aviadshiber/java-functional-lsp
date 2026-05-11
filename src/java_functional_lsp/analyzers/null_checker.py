@@ -18,6 +18,8 @@ _DATA = {
         fix_type="WRAP_IN_OPTION_NONE",
         target_library="io.vavr.control.Option",
         rationale="Passing null propagates unsafe references. Use Option.none() to represent absence explicitly.",
+        recommended_api="Option.none()",
+        suggested_snippet="Option.none()",
     ),
     "null-return": DiagnosticData(
         fix_type="WRAP_IN_OPTION",
@@ -25,11 +27,15 @@ _DATA = {
         rationale=(
             "Returning null forces callers to perform null checks. Use Option to encode absence in the type system."
         ),
+        recommended_api="Option.none() / Option.of(...)",
+        suggested_snippet="return Option.none();",
     ),
     "null-assignment": DiagnosticData(
         fix_type="USE_OPTION_TYPE",
         target_library="io.vavr.control.Option",
         rationale="Local null assignment hides absence. Use Option<T> to make optionality explicit.",
+        recommended_api="Option<T> = Option.none()",
+        suggested_snippet="Option<T> value = Option.none();",
     ),
     "null-field-assignment": DiagnosticData(
         fix_type="USE_OPTION_NONE",
@@ -37,6 +43,8 @@ _DATA = {
         rationale=(
             "Null field initializers propagate unsafe state. Use Option<T> with Option.none() for optional fields."
         ),
+        recommended_api="Option<T> field = Option.none()",
+        suggested_snippet="private final Option<T> field = Option.none();",
     ),
 }
 

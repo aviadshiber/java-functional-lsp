@@ -37,6 +37,17 @@ class TestSpringCheckerData:
         assert comp_diags[0].data is not None
         assert comp_diags[0].data.fix_type == "USE_CONFIGURATION_BEAN"
 
+    def test_field_injection_snippet_uses_real_field_name_and_type(self) -> None:
+        """Issue #74 #2: snippet shows the actual field's type + name from the AST."""
+        source = b"class Service { @Autowired private UserRepository userRepo; }"
+        diags = parse_and_analyze(SpringChecker(), source)
+        fi = next(d for d in diags if d.code == "field-injection")
+        assert fi.data is not None
+        snippet = fi.data.suggested_snippet
+        assert snippet is not None
+        assert "private final UserRepository userRepo" in snippet
+        assert "this.userRepo = userRepo" in snippet
+
 
 class TestComponentAnnotation:
     def test_detects_service(self) -> None:

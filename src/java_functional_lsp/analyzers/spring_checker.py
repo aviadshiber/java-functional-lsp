@@ -18,6 +18,7 @@ _DATA = {
         rationale=(
             "Field injection hides dependencies and prevents immutability. Use constructor injection with @Value."
         ),
+        recommended_api="constructor injection + @Value (or @RequiredArgsConstructor on final fields)",
     ),
     "component-annotation": DiagnosticData(
         fix_type="USE_CONFIGURATION_BEAN",
@@ -26,8 +27,46 @@ _DATA = {
             "Component scanning reduces explicit wiring control."
             " Use @Configuration + @Bean for explicit dependency graphs."
         ),
+        recommended_api="@Configuration + @Bean",
+        suggested_snippet=(
+            "@Configuration\n"
+            "public class FooConfig {\n"
+            "    @Bean\n"
+            "    public Foo foo() { return new Foo(); }\n"
+            "}"
+        ),
     ),
 }
+
+
+def _build_field_injection_data(field_decl: Any) -> DiagnosticData:
+    """Build a DiagnosticData with a concrete constructor-injection snippet.
+
+    Reads the field's type and name from the AST so the snippet shows the user
+    exactly which constructor parameter to add.
+    """
+    base = _DATA["field-injection"]
+    type_node = field_decl.child_by_field_name("type")
+    type_text = type_node.text.decode("utf-8") if type_node is not None and type_node.text else "Foo"
+    field_name = "foo"
+    for declarator in field_decl.children:
+        if declarator.type == "variable_declarator":
+            name_node = declarator.child_by_field_name("name")
+            if name_node is not None and name_node.text:
+                field_name = name_node.text.decode("utf-8")
+                break
+    snippet = (
+        f"private final {type_text} {field_name};\n"
+        f"// constructor:\n"
+        f"public Foo(final {type_text} {field_name}) {{ this.{field_name} = {field_name}; }}"
+    )
+    return DiagnosticData(
+        fix_type=base.fix_type,
+        target_library=base.target_library,
+        rationale=base.rationale,
+        recommended_api=base.recommended_api,
+        suggested_snippet=snippet,
+    )
 
 _BAD_ANNOTATIONS = {b"Component", b"Service", b"Repository"}
 
@@ -69,7 +108,7 @@ class SpringChecker:
                         severity=severity,
                         code="field-injection",
                         message=_MESSAGES["field-injection"],
-                        data=_DATA["field-injection"],
+                        data=_build_field_injection_data(node.parent.parent),
                     )
                 )
 

@@ -508,3 +508,66 @@ class TestImpureMethod:
         config = {"rules": {"impure-method": "off"}}
         diags = parse_and_analyze(FunctionalChecker(), source, config)
         assert not any(d.code == "impure-method" for d in diags)
+
+    def test_io_case_uses_try_data(self) -> None:
+        """Issue #74 #4: impure-method with IO side-effect carries Try-targeted data."""
+        source = b"""
+        class T {
+            String f(String input) {
+                String result = input.trim();
+                System.out.println(result);
+                return result;
+            }
+        }
+        """
+        diags = parse_and_analyze(FunctionalChecker(), source)
+        impure = [d for d in diags if d.code == "impure-method"]
+        assert len(impure) == 1
+        assert impure[0].data is not None
+        assert impure[0].data.target_library == "io.vavr.control.Try"
+        assert "Try.of" in (impure[0].data.recommended_api or "")
+        assert "IO/state" in impure[0].message
+
+    def test_throw_case_uses_either_data(self) -> None:
+        """Issue #74 #4: impure-method with throw side-effect carries Either-targeted data + distinct message."""
+        source = b"""
+        class T {
+            String process(String input) {
+                String result = input.trim();
+                if (result.isEmpty()) {
+                    throw new IllegalArgumentException("empty input");
+                }
+                return result;
+            }
+        }
+        """
+        diags = parse_and_analyze(FunctionalChecker(), source)
+        impure = [d for d in diags if d.code == "impure-method"]
+        assert len(impure) == 1
+        assert impure[0].data is not None
+        assert impure[0].data.target_library == "io.vavr.control.Either"
+        assert "Either.left" in (impure[0].data.recommended_api or "")
+        assert "exceptions" in impure[0].message
+
+    def test_points_at_offending_statement_not_method_decl(self) -> None:
+        """Issue #74 #5: diagnostic range covers the offending side-effect, not the method name."""
+        source = b"""
+        class T {
+            String f(String input) {
+                String result = input.trim();
+                System.out.println(result);
+                return result;
+            }
+        }
+        """
+        diags = parse_and_analyze(FunctionalChecker(), source)
+        impure = [d for d in diags if d.code == "impure-method"]
+        assert len(impure) == 1
+        # The method declaration is on line 2 (0-indexed: line 2 = `String f(...) {`).
+        # The println is on line 4. Range must land on the println line, not the method name.
+        diag_line = impure[0].line
+        method_decl_line = source.split(b"\n").index(b'            String f(String input) {')
+        assert diag_line != method_decl_line, (
+            f"Diagnostic should point at the side-effect line, not the method declaration "
+            f"(diag_line={diag_line}, method_decl_line={method_decl_line})"
+        )

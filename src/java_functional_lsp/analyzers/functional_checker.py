@@ -22,9 +22,13 @@ _MESSAGES = {
         "Use io.vavr.collection.List for safe persistent immutability."
     ),
     "null-check-to-monadic": ("Imperative null handling: Consider monadic flow with Option.of().map().getOrElse()."),
-    "impure-method": (
+    "impure-method-io": (
         "Hidden side-effect: Method mixes pure logic with IO/state mutations. "
         "Extract pure logic to a separate method; wrap side-effects in Try."
+    ),
+    "impure-method-throw": (
+        "Hidden side-effect: Method mixes pure logic with exceptions. "
+        "Extract pure logic; return Either.left(...) or Try.failure(...) instead of throwing."
     ),
 }
 
@@ -36,6 +40,7 @@ _DATA = {
             "Runtime mutation of List.of() causes UnsupportedOperationException. "
             "Use Vavr for safe, persistent immutability."
         ),
+        recommended_api=".append / .appendAll / .update / .remove (returns a new persistent collection)",
     ),
     "null-check-to-monadic": DiagnosticData(
         fix_type="WRAP_IN_OPTION_MAP",
@@ -44,16 +49,63 @@ _DATA = {
             "Imperative null checks create nested branching. "
             "Use Option.of().map() for composable, null-safe monadic flow."
         ),
+        recommended_api="Option.of(...).map(...).getOrElse(...)",
     ),
-    "impure-method": DiagnosticData(
+    "impure-method-io": DiagnosticData(
         fix_type="EXTRACT_PURE_LOGIC",
         target_library="io.vavr.control.Try",
         rationale=(
-            "Mixing pure logic with side-effects breaks referential transparency. "
+            "Mixing pure logic with IO/state mutations breaks referential transparency. "
             "Extract pure logic; wrap IO/state mutations in Try."
         ),
+        recommended_api="Try.of(() -> sideEffect()).onFailure(...)",
+    ),
+    "impure-method-throw": DiagnosticData(
+        fix_type="EXTRACT_PURE_LOGIC",
+        target_library="io.vavr.control.Either",
+        rationale=(
+            "Mixing pure logic with exceptions breaks referential transparency. "
+            "Extract pure logic; return Either.left(...) or Try.failure(...) instead of throwing."
+        ),
+        recommended_api="Either.left(...) / Try.of(() -> ...)",
     ),
 }
+
+
+def _build_null_check_to_monadic_data(var_name: bytes) -> DiagnosticData:
+    """Build a DiagnosticData carrying a concrete Option snippet using the real var name."""
+    base = _DATA["null-check-to-monadic"]
+    var = var_name.decode("utf-8") if var_name else "value"
+    snippet = f"Option.of({var}).map(v -> v).getOrElse(null);"
+    return DiagnosticData(
+        fix_type=base.fix_type,
+        target_library=base.target_library,
+        rationale=base.rationale,
+        recommended_api=base.recommended_api,
+        suggested_snippet=snippet,
+    )
+
+
+def _build_frozen_mutation_data(method_name: bytes, var_name: bytes) -> DiagnosticData:
+    """Build a DiagnosticData carrying a concrete Vavr-persistent snippet using real names."""
+    base = _DATA["frozen-mutation"]
+    var = var_name.decode("utf-8") if var_name else "items"
+    vavr_method_map = {
+        b"add": "append",
+        b"addAll": "appendAll",
+        b"remove": "remove",
+        b"set": "update",
+        b"sort": "sorted",
+    }
+    vavr_method = vavr_method_map.get(method_name, "append") if method_name else "append"
+    snippet = f"{var} = {var}.{vavr_method}(...);  // returns a new persistent collection"
+    return DiagnosticData(
+        fix_type=base.fix_type,
+        target_library=base.target_library,
+        rationale=base.rationale,
+        recommended_api=base.recommended_api,
+        suggested_snippet=snippet,
+    )
 
 # Factory methods that produce frozen (unmodifiable) collections
 _FROZEN_FACTORIES = {
@@ -211,7 +263,10 @@ class FunctionalChecker:
                             severity=severity,
                             code="frozen-mutation",
                             message=_MESSAGES["frozen-mutation"],
-                            data=_DATA["frozen-mutation"],
+                            data=_build_frozen_mutation_data(
+                                method_name.text or b"",
+                                obj_node.text or b"",
+                            ),
                         )
                     )
 
@@ -288,7 +343,7 @@ class FunctionalChecker:
                     severity=severity,
                     code="null-check-to-monadic",
                     message=_MESSAGES["null-check-to-monadic"],
-                    data=_DATA["null-check-to-monadic"],
+                    data=_build_null_check_to_monadic_data(checked_var),
                 )
             )
 
@@ -320,7 +375,13 @@ class FunctionalChecker:
         return False
 
     def _check_impure_method(self, tree: Tree, diagnostics: list[Diagnostic], config: dict[str, Any]) -> None:
-        """Detect methods mixing pure logic with side-effects."""
+        """Detect methods mixing pure logic with side-effects.
+
+        Points the diagnostic at the first offending statement (throw or IO call) rather
+        than the method declaration, so the user immediately sees what to extract.
+        The message + data payload differ based on whether the side-effect is a throw
+        or an IO call — agents need to suggest the right Vavr type (Either vs Try).
+        """
         default = Severity.WARNING if config.get("strictPurity", False) else Severity.HINT
         severity = severity_from_config(config, "impure-method", default=default)
         if severity is None:
@@ -331,41 +392,59 @@ class FunctionalChecker:
             if body is None:
                 continue
 
-            has_side_effect = False
-            has_pure_logic = False
-
             statements = [c for c in body.named_children if c.type not in ("line_comment", "block_comment")]
             if len(statements) < 2:  # noqa: PLR2004
                 continue  # Need at least 2 statements to have a mix
 
+            offender: Node | None = None
+            offender_kind: str | None = None  # "throw" or "io"
+            has_pure_logic = False
+
             for stmt in statements:
-                if self._is_side_effect_statement(stmt):
-                    has_side_effect = True
-                else:
+                kind, node = self._classify_side_effect(stmt)
+                if kind is None:
                     has_pure_logic = True
+                elif offender is None:
+                    offender = node
+                    offender_kind = kind
 
-            if has_side_effect and has_pure_logic:
-                name_node = method.child_by_field_name("name")
-                if name_node is None:
-                    continue
-                diagnostics.append(
-                    Diagnostic(
-                        line=name_node.start_point[0],
-                        col=name_node.start_point[1],
-                        end_line=name_node.end_point[0],
-                        end_col=name_node.end_point[1],
-                        severity=severity,
-                        code="impure-method",
-                        message=_MESSAGES["impure-method"],
-                        data=_DATA["impure-method"],
-                    )
+            if offender is None or not has_pure_logic:
+                continue
+
+            name_node = method.child_by_field_name("name")
+            # Range = the offending statement itself, not the method declaration.
+            range_node = offender if offender is not None else name_node
+            if range_node is None:
+                continue
+
+            if offender_kind == "throw":
+                message = _MESSAGES["impure-method-throw"]
+                data = _DATA["impure-method-throw"]
+            else:
+                message = _MESSAGES["impure-method-io"]
+                data = _DATA["impure-method-io"]
+
+            diagnostics.append(
+                Diagnostic(
+                    line=range_node.start_point[0],
+                    col=range_node.start_point[1],
+                    end_line=range_node.end_point[0],
+                    end_col=range_node.end_point[1],
+                    severity=severity,
+                    code="impure-method",
+                    message=message,
+                    data=data,
                 )
+            )
 
-    def _is_side_effect_statement(self, stmt: Node) -> bool:
-        """Check if a statement contains side-effect calls or throw statements.
+    def _classify_side_effect(self, stmt: Node) -> tuple[str | None, Node | None]:
+        """Find the first side-effect node within a statement subtree.
 
-        Single TreeCursor traversal to detect both method_invocation side-effects
-        and throw_statement nodes (avoids two separate find_nodes walks).
+        Returns (kind, node) where kind is "throw", "io", or None (if the statement
+        contains no side-effects). The node is the offending throw_statement or
+        method_invocation — used to position the diagnostic.
+
+        Single TreeCursor traversal to detect both throws and IO calls in one pass.
         """
         cursor = stmt.walk()
         visited_children = False
@@ -374,24 +453,13 @@ class FunctionalChecker:
                 current: Node | None = cursor.node
                 if current is not None:
                     if current.type == "throw_statement":
-                        return True
-                    if current.type == "method_invocation":
-                        if self._is_side_effect_invocation(current):
-                            return True
+                        return "throw", current
+                    if current.type == "method_invocation" and is_side_effect_invocation(current):
+                        return "io", current
                 if not cursor.goto_first_child():
                     visited_children = True
             elif cursor.goto_next_sibling():
                 visited_children = False
             elif not cursor.goto_parent():
                 break
-        return False
-
-    @staticmethod
-    def _is_side_effect_invocation(invocation: Node) -> bool:
-        """Check if a method_invocation node is a side-effect call.
-
-        Thin delegator kept for backward compatibility; the real logic lives in
-        the module-level ``is_side_effect_invocation`` so other modules (e.g.
-        ``fixes.py``) can reuse it without importing the class.
-        """
-        return is_side_effect_invocation(invocation)
+        return None, None

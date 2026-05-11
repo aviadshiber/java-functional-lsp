@@ -149,6 +149,39 @@ class TestMutationCheckerData:
         assert dto_diags[0].data.fix_type == "USE_VALUE_ANNOTATION"
         assert dto_diags[0].data.target_library == "lombok.Value"
 
+    def test_imperative_option_unwrap_has_snippet_with_real_var_name(self) -> None:
+        """Issue #74 #2: snippet uses the AST variable name, not a placeholder."""
+        source = b"""
+        class T {
+            String f(Option<String> myOpt) {
+                if (myOpt.isDefined()) {
+                    return myOpt.get();
+                } else {
+                    return "fallback";
+                }
+            }
+        }
+        """
+        diags = parse_and_analyze(MutationChecker(), source)
+        unwraps = [d for d in diags if d.code == "imperative-option-unwrap"]
+        assert len(unwraps) == 1
+        unwrap = unwraps[0]
+        assert unwrap.data is not None
+        assert unwrap.data.recommended_api is not None
+        assert "ifPresent" in unwrap.data.recommended_api  # warns about Vavr-vs-Optional confusion
+        snippet = unwrap.data.suggested_snippet
+        assert snippet is not None
+        assert "myOpt" in snippet  # real variable name from AST
+        assert '"fallback"' in snippet  # real default value from AST
+
+    def test_mutable_dto_has_recommended_api(self) -> None:
+        """Issue #74 #1: mutable-dto carries the @Value recommendation."""
+        source = b"@Data class Foo { private String name; }"
+        diags = parse_and_analyze(MutationChecker(), source)
+        dto = next(d for d in diags if d.code == "mutable-dto")
+        assert dto.data is not None
+        assert dto.data.recommended_api == "@Value"
+
 
 class TestConstructorAssignment:
     def test_ignores_this_field_in_constructor(self) -> None:

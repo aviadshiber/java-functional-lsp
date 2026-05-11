@@ -950,6 +950,315 @@ def fix_try_catch_to_monadic(
     return lsp.WorkspaceEdit(changes={uri: edits})
 
 
+# --- imperative-option-unwrap ---
+
+
+def _find_if_at(tree: Tree, diag_range: lsp.Range) -> Node | None:
+    """Find the if_statement at the diagnostic range (which spans the whole if)."""
+    target = tree.root_node.descendant_for_point_range(
+        (diag_range.start.line, diag_range.start.character),
+        (diag_range.end.line, diag_range.end.character),
+    )
+    if target is None:
+        return None
+    if target.type == "if_statement":
+        return target
+    return find_ancestor(target, "if_statement")
+
+
+def fix_imperative_option_unwrap(
+    uri: str,
+    source: str,
+    diag_range: lsp.Range,
+    config: dict[str, Any],
+    *,
+    tree: Tree | None = None,
+    lines: list[str] | None = None,
+) -> lsp.WorkspaceEdit | None:
+    """Rewrite ``if (opt.isDefined()) return opt.get(); else return X;`` to
+    ``return opt.map(it -> it).getOrElse(X);``.
+
+    Bails (returns None) when the shape is anything other than that exact return/else-return
+    pair — keeping the diagnostic visible but avoiding a broken edit.
+    """
+    if lines is None:
+        lines = source.split("\n")
+    if tree is None:
+        tree = get_parser().parse(source.encode("utf-8"))
+
+    if_node = _find_if_at(tree, diag_range)
+    if if_node is None or has_error_or_missing(if_node):
+        return None
+
+    condition = if_node.child_by_field_name("condition")
+    consequence = if_node.child_by_field_name("consequence")
+    alternative = if_node.child_by_field_name("alternative")
+    if condition is None or consequence is None:
+        return None
+
+    # Extract the variable name from the isDefined/isPresent invocation in the condition.
+    var_name: bytes | None = None
+    for inv in find_nodes(condition, "method_invocation"):
+        name_node = inv.child_by_field_name("name")
+        obj_node = inv.child_by_field_name("object")
+        if name_node is None or obj_node is None:
+            continue
+        if name_node.text in (b"isDefined", b"isPresent") and obj_node.text:
+            var_name = obj_node.text
+            break
+    if var_name is None:
+        return None
+    var = var_name.decode("utf-8")
+
+    # Consequence must be a block with exactly: `return <var>.get();` (or similar shape).
+    cons_stmts = [c for c in consequence.named_children if c.type not in IGNORED_CHILDREN] \
+        if consequence.type == "block" else [consequence]
+    if len(cons_stmts) != 1 or cons_stmts[0].type != "return_statement":
+        return None
+    ret_children = [c for c in cons_stmts[0].named_children if c.type not in IGNORED_CHILDREN]
+    if not ret_children:
+        return None
+    ret_expr = ret_children[0]
+    # Map the returned expression to a lambda body. If it's literally `var.get()`, the lambda
+    # is the identity `it -> it`; otherwise rewrite occurrences of `var` to `it`.
+    ret_text = ret_expr.text.decode("utf-8") if ret_expr.text else var
+    if ret_text == f"{var}.get()":
+        lambda_body = "it"
+    else:
+        pattern = re.compile(rf"\b{re.escape(var)}\.get\(\)")
+        lambda_body = pattern.sub("it", ret_text)
+        # If the rewrite did nothing (no .get() call to replace), bail — shape isn't safe.
+        if lambda_body == ret_text:
+            return None
+
+    # Alternative (else) must be a single return statement, or absent (then no getOrElse).
+    or_else: str | None = None
+    if alternative is not None:
+        alt_stmts = [c for c in alternative.named_children if c.type not in IGNORED_CHILDREN] \
+            if alternative.type == "block" else [alternative]
+        if len(alt_stmts) != 1 or alt_stmts[0].type != "return_statement":
+            return None
+        alt_ret = [c for c in alt_stmts[0].named_children if c.type not in IGNORED_CHILDREN]
+        if not alt_ret:
+            return None
+        alt_text = alt_ret[0].text.decode("utf-8") if alt_ret[0].text else "null"
+        if _is_eager(alt_ret[0]):
+            or_else = f".getOrElse({alt_text})"
+        else:
+            or_else = f".getOrElse(() -> {alt_text})"
+
+    chain = f"{var}.map(it -> {lambda_body})"
+    if or_else is not None:
+        chain += or_else
+
+    edits: list[lsp.TextEdit] = []
+    edits.append(
+        lsp.TextEdit(
+            range=lsp.Range(
+                start=lsp.Position(line=if_node.start_point[0], character=if_node.start_point[1]),
+                end=lsp.Position(line=if_node.end_point[0], character=if_node.end_point[1]),
+            ),
+            new_text=f"return {chain};",
+        )
+    )
+    return lsp.WorkspaceEdit(changes={uri: edits})
+
+
+# --- mutable-dto ---
+
+
+def _find_marker_annotation_at(tree: Tree, diag_range: lsp.Range, names: set[bytes]) -> Node | None:
+    """Find a marker_annotation node at the diagnostic range whose name is in ``names``."""
+    target = tree.root_node.descendant_for_point_range(
+        (diag_range.start.line, diag_range.start.character),
+        (diag_range.end.line, diag_range.end.character),
+    )
+    if target is None:
+        return None
+    cur: Node | None = target
+    while cur is not None:
+        if cur.type == "marker_annotation":
+            name_node = cur.child_by_field_name("name")
+            if name_node is not None and name_node.text in names:
+                return cur
+        cur = cur.parent
+    return None
+
+
+_CONFLICTING_LOMBOK_ANNOTATIONS = {b"NoArgsConstructor", b"AllArgsConstructor", b"RequiredArgsConstructor"}
+
+
+def fix_mutable_dto(
+    uri: str,
+    source: str,
+    diag_range: lsp.Range,
+    config: dict[str, Any],
+    *,
+    tree: Tree | None = None,
+    lines: list[str] | None = None,
+) -> lsp.WorkspaceEdit | None:
+    """Rewrite ``@Data`` / ``@Setter`` to ``@Value`` on the class declaration.
+
+    Bails when the class also carries Lombok constructor annotations that conflict
+    with ``@Value`` (it implies a single all-args constructor and final fields).
+    """
+    if lines is None:
+        lines = source.split("\n")
+    if tree is None:
+        tree = get_parser().parse(source.encode("utf-8"))
+
+    ann = _find_marker_annotation_at(tree, diag_range, {b"Data", b"Setter"})
+    if ann is None or has_error_or_missing(ann):
+        return None
+
+    modifiers = ann.parent
+    if modifiers is None or modifiers.type != "modifiers":
+        return None
+
+    # Reject if any conflicting Lombok annotation sits next to @Data/@Setter.
+    for sib in modifiers.named_children:
+        if sib.type == "marker_annotation":
+            name_node = sib.child_by_field_name("name")
+            if name_node is not None and name_node.text in _CONFLICTING_LOMBOK_ANNOTATIONS:
+                return None
+
+    name_node = ann.child_by_field_name("name")
+    if name_node is None:
+        return None
+
+    edits: list[lsp.TextEdit] = []
+    # Replace just the annotation name token (preserves `@`).
+    edits.append(
+        lsp.TextEdit(
+            range=lsp.Range(
+                start=lsp.Position(line=name_node.start_point[0], character=name_node.start_point[1]),
+                end=lsp.Position(line=name_node.end_point[0], character=name_node.end_point[1]),
+            ),
+            new_text="Value",
+        )
+    )
+    if config.get("autoImportVavr", True):
+        # @Value lives in lombok.Value; keep the existing import-management helper but use a Lombok path.
+        import_edit = ensure_import(lines, "lombok.Value")
+        if import_edit is not None:
+            edits.append(import_edit)
+    return lsp.WorkspaceEdit(changes={uri: edits})
+
+
+# --- field-injection ---
+
+
+def _find_field_declaration_at(tree: Tree, diag_range: lsp.Range) -> Node | None:
+    """Find the field_declaration whose @Autowired annotation is at the diagnostic range."""
+    target = tree.root_node.descendant_for_point_range(
+        (diag_range.start.line, diag_range.start.character),
+        (diag_range.end.line, diag_range.end.character),
+    )
+    if target is None:
+        return None
+    return find_ancestor(target, "field_declaration")
+
+
+def _find_autowired_annotation(field_decl: Node) -> Node | None:
+    """Return the @Autowired marker_annotation inside a field_declaration, if present."""
+    modifiers = next((c for c in field_decl.children if c.type == "modifiers"), None)
+    if modifiers is None:
+        return None
+    for child in modifiers.named_children:
+        if child.type == "marker_annotation":
+            name_node = child.child_by_field_name("name")
+            if name_node is not None and name_node.text == b"Autowired":
+                return child
+    return None
+
+
+def fix_field_injection(
+    uri: str,
+    source: str,
+    diag_range: lsp.Range,
+    config: dict[str, Any],
+    *,
+    tree: Tree | None = None,
+    lines: list[str] | None = None,
+) -> lsp.WorkspaceEdit | None:
+    """Rewrite a single ``@Autowired`` field to ``private final``.
+
+    Removes the ``@Autowired`` annotation token (plus trailing whitespace) and ensures
+    the field declaration includes the ``final`` modifier. We do NOT synthesise a
+    constructor here — that requires class-wide analysis and risks clobbering existing
+    constructors. The diagnostic remains useful as a starting point; the agent (or user)
+    can follow the suggested_snippet to add the constructor.
+    """
+    if lines is None:
+        lines = source.split("\n")
+    if tree is None:
+        tree = get_parser().parse(source.encode("utf-8"))
+
+    field_decl = _find_field_declaration_at(tree, diag_range)
+    if field_decl is None or has_error_or_missing(field_decl):
+        return None
+
+    ann = _find_autowired_annotation(field_decl)
+    if ann is None:
+        return None
+
+    modifiers = ann.parent
+    if modifiers is None:
+        return None
+
+    edits: list[lsp.TextEdit] = []
+
+    # Remove the @Autowired annotation: extend the range to swallow trailing whitespace
+    # on the same line (or the newline if @Autowired sits on its own line).
+    ann_end_line = ann.end_point[0]
+    ann_end_col = ann.end_point[1]
+    if ann_end_line < len(lines):
+        line_after = lines[ann_end_line][ann_end_col:]
+        if line_after.strip() == "":
+            # Annotation sits alone on its line — remove the whole line including newline.
+            edits.append(
+                lsp.TextEdit(
+                    range=lsp.Range(
+                        start=lsp.Position(line=ann.start_point[0], character=0),
+                        end=lsp.Position(line=ann_end_line + 1, character=0),
+                    ),
+                    new_text="",
+                )
+            )
+        else:
+            # Annotation has code after it on the same line — remove annotation + one trailing space.
+            trailing = 1 if line_after.startswith(" ") else 0
+            edits.append(
+                lsp.TextEdit(
+                    range=lsp.Range(
+                        start=lsp.Position(line=ann.start_point[0], character=ann.start_point[1]),
+                        end=lsp.Position(line=ann_end_line, character=ann_end_col + trailing),
+                    ),
+                    new_text="",
+                )
+            )
+
+    # Ensure `final` is present on the field. Look at modifier keywords (unnamed children).
+    has_final = any(c.type == "final" for c in modifiers.children)
+    if not has_final:
+        # Insert `final ` right before the type. The type is a child of field_decl, not modifiers.
+        type_node = field_decl.child_by_field_name("type")
+        if type_node is not None:
+            edits.append(
+                lsp.TextEdit(
+                    range=lsp.Range(
+                        start=lsp.Position(line=type_node.start_point[0], character=type_node.start_point[1]),
+                        end=lsp.Position(line=type_node.start_point[0], character=type_node.start_point[1]),
+                    ),
+                    new_text="final ",
+                )
+            )
+
+    if not edits:
+        return None
+    return lsp.WorkspaceEdit(changes={uri: edits})
+
+
 # --- Fix registry ---
 
 _FIX_REGISTRY: dict[str, FixGenerator] = {
@@ -957,6 +1266,9 @@ _FIX_REGISTRY: dict[str, FixGenerator] = {
     "null-check-to-monadic": fix_null_check_to_monadic,
     "null-return": fix_null_return,
     "try-catch-to-monadic": fix_try_catch_to_monadic,
+    "imperative-option-unwrap": fix_imperative_option_unwrap,
+    "mutable-dto": fix_mutable_dto,
+    "field-injection": fix_field_injection,
 }
 
 

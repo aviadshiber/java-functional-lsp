@@ -6,7 +6,10 @@ from lsprotocol import types as lsp
 
 from java_functional_lsp.fixes import (
     ensure_import,
+    fix_field_injection,
     fix_frozen_mutation,
+    fix_imperative_option_unwrap,
+    fix_mutable_dto,
     fix_null_check_to_monadic,
     fix_null_return,
     fix_try_catch_to_monadic,
@@ -1114,3 +1117,158 @@ class TestFixTryCatchToMonadic:
         assert _strip_trailing_semicolon('logger.warn("x", e);  ') == 'logger.warn("x", e)'
         # No trailing semicolon → no change
         assert _strip_trailing_semicolon('logger.warn("x", e)') == 'logger.warn("x", e)'
+
+
+class TestFixImperativeOptionUnwrap:
+    """Issue #74 #3: quick-fix for if(opt.isDefined()) return opt.get(); else ..."""
+
+    def test_rewrites_if_return_get_else_return(self) -> None:
+        source = (
+            "import io.vavr.control.Option;\n"
+            "\n"
+            "class T {\n"
+            "    String f(Option<String> opt) {\n"
+            "        if (opt.isDefined()) {\n"
+            "            return opt.get();\n"
+            "        } else {\n"
+            '            return "default";\n'
+            "        }\n"
+            "    }\n"
+            "}\n"
+        )
+        # The diagnostic spans the whole if-statement (mutation_checker emits start..end).
+        diag_range = _range(4, 8, 8, 9)
+        result = fix_imperative_option_unwrap("file:///T.java", source, diag_range, {})
+        assert result is not None
+        assert result.changes is not None
+        edits = result.changes["file:///T.java"]
+        assert len(edits) == 1
+        # The rewrite uses the real var name `opt`.
+        assert "opt.map(it -> it)" in edits[0].new_text
+        assert '.getOrElse("default")' in edits[0].new_text
+
+    def test_lazy_else_uses_supplier(self) -> None:
+        source = (
+            "class T {\n"
+            "    String f(Option<String> opt) {\n"
+            "        if (opt.isDefined()) {\n"
+            "            return opt.get();\n"
+            "        } else {\n"
+            "            return computeDefault();\n"
+            "        }\n"
+            "    }\n"
+            "}\n"
+        )
+        diag_range = _range(2, 8, 6, 9)
+        result = fix_imperative_option_unwrap("file:///T.java", source, diag_range, {})
+        assert result is not None
+        assert result.changes is not None
+        edits = result.changes["file:///T.java"]
+        assert ".getOrElse(() -> computeDefault())" in edits[0].new_text
+
+    def test_complex_consequence_bails(self) -> None:
+        """If the if-body has multiple statements, no fix should be produced."""
+        source = (
+            "class T {\n"
+            "    String f(Option<String> opt) {\n"
+            "        if (opt.isDefined()) {\n"
+            "            log(opt.get());\n"
+            "            return opt.get();\n"
+            "        } else {\n"
+            '            return "default";\n'
+            "        }\n"
+            "    }\n"
+            "}\n"
+        )
+        diag_range = _range(2, 8, 7, 9)
+        result = fix_imperative_option_unwrap("file:///T.java", source, diag_range, {})
+        assert result is None
+
+
+class TestFixMutableDto:
+    """Issue #74 #3: quick-fix that swaps @Data/@Setter for @Value."""
+
+    def test_rewrites_data_to_value(self) -> None:
+        source = (
+            "import lombok.Data;\n"
+            "\n"
+            "@Data\n"
+            "public class UserDto {\n"
+            "    private String name;\n"
+            "}\n"
+        )
+        diag_range = _range(2, 0, 2, 5)
+        result = fix_mutable_dto("file:///UserDto.java", source, diag_range, {})
+        assert result is not None
+        assert result.changes is not None
+        edits = result.changes["file:///UserDto.java"]
+        # One edit replaces "Data" with "Value"; another adds the lombok.Value import.
+        replacement_edits = [e for e in edits if e.new_text == "Value"]
+        assert len(replacement_edits) == 1
+        import_edits = [e for e in edits if "import lombok.Value" in e.new_text]
+        assert len(import_edits) == 1
+
+    def test_skips_when_conflicting_annotation_present(self) -> None:
+        """@Value doesn't combine with @NoArgsConstructor — bail."""
+        source = (
+            "@Data\n"
+            "@NoArgsConstructor\n"
+            "public class UserDto {\n"
+            "    private String name;\n"
+            "}\n"
+        )
+        diag_range = _range(0, 0, 0, 5)
+        result = fix_mutable_dto("file:///UserDto.java", source, diag_range, {})
+        assert result is None
+
+    def test_no_import_when_disabled(self) -> None:
+        source = (
+            "@Data\n"
+            "public class UserDto { private String name; }\n"
+        )
+        diag_range = _range(0, 0, 0, 5)
+        result = fix_mutable_dto("file:///UserDto.java", source, diag_range, {"autoImportVavr": False})
+        assert result is not None
+        assert result.changes is not None
+        edits = result.changes["file:///UserDto.java"]
+        # Only the annotation rewrite, no import.
+        assert all("import" not in e.new_text for e in edits)
+
+
+class TestFixFieldInjection:
+    """Issue #74 #3: quick-fix that removes @Autowired and ensures `final`."""
+
+    def test_removes_autowired_and_adds_final(self) -> None:
+        source = (
+            "class Foo {\n"
+            "    @Autowired\n"
+            "    private Bar bar;\n"
+            "}\n"
+        )
+        # Diagnostic is on the @Autowired annotation name; spring_checker.py uses name_node points.
+        diag_range = _range(1, 5, 1, 14)  # the "Autowired" identifier
+        result = fix_field_injection("file:///Foo.java", source, diag_range, {})
+        assert result is not None
+        assert result.changes is not None
+        edits = result.changes["file:///Foo.java"]
+        # Should produce two edits: remove annotation line, insert `final`.
+        assert len(edits) >= 2
+        # Verify a `final ` insertion exists.
+        assert any(e.new_text == "final " for e in edits)
+        # Verify an annotation-removal edit exists (empty string replacement).
+        assert any(e.new_text == "" for e in edits)
+
+    def test_preserves_existing_final(self) -> None:
+        """If the field is already `final`, only remove the annotation."""
+        source = (
+            "class Foo {\n"
+            "    @Autowired\n"
+            "    private final Bar bar;\n"
+            "}\n"
+        )
+        diag_range = _range(1, 5, 1, 14)
+        result = fix_field_injection("file:///Foo.java", source, diag_range, {})
+        assert result is not None
+        assert result.changes is not None
+        edits = result.changes["file:///Foo.java"]
+        assert not any(e.new_text == "final " for e in edits)
