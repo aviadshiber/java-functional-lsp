@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 from typing import Any
 
 from .base import (
@@ -53,27 +54,26 @@ _DATA = {
 
 
 def _build_throw_statement_data(throw_node: Any) -> DiagnosticData:
-    """Build a DiagnosticData with a concrete Either.left/Try.failure snippet.
+    """Build a DiagnosticData with a concrete ``Either.left(...)`` snippet.
 
-    Reads the throw expression text from the AST so the snippet preserves the
-    real exception construction (e.g. ``new IllegalArgumentException("x")``).
+    Reads the throw expression from the first non-comment named child. tree-sitter-java
+    doesn't expose a field name for `throw_statement`'s expression, so we filter
+    `named_children` to skip comments and take the first remaining node.
+
+    We commit to ``Either.left`` here (rather than offering both ``Either.left`` and
+    ``Try.failure`` in a comment) so the snippet is paste-able without manual cleanup;
+    the `recommended_api` mentions both alternatives.
     """
     base = _DATA["throw-statement"]
     expr_text = "error"
-    # throw_statement has a single expression child (the exception being thrown).
     for child in throw_node.named_children:
-        if child.type not in ("line_comment", "block_comment"):
-            if child.text:
-                expr_text = child.text.decode("utf-8")
-            break
-    snippet = f"return Either.left({expr_text});  // or: return Try.failure({expr_text});"
-    return DiagnosticData(
-        fix_type=base.fix_type,
-        target_library=base.target_library,
-        rationale=base.rationale,
-        recommended_api=base.recommended_api,
-        suggested_snippet=snippet,
-    )
+        if child.type in IGNORED_CHILDREN:
+            continue
+        if child.text:
+            expr_text = child.text.decode("utf-8")
+        break
+    snippet = f"return Either.left({expr_text});"
+    return dataclasses.replace(base, suggested_snippet=snippet)
 
 
 def _extract_return_expr(block_node: Any) -> str | None:
@@ -108,13 +108,7 @@ def _build_try_catch_to_monadic_data(try_node: Any) -> DiagnosticData:
         return base
 
     snippet = f"return Try.of(() -> {try_expr}).getOrElse({catch_expr});"
-    return DiagnosticData(
-        fix_type=base.fix_type,
-        target_library=base.target_library,
-        rationale=base.rationale,
-        recommended_api=base.recommended_api,
-        suggested_snippet=snippet,
-    )
+    return dataclasses.replace(base, suggested_snippet=snippet)
 
 
 def _is_in_bean_method(node: Any) -> bool:

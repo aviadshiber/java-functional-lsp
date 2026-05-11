@@ -27,6 +27,7 @@ from lsprotocol.converters import get_converter
 from pygls.lsp.server import LanguageServer
 from pygls.uris import from_fs_path, to_fs_path
 
+from .analyzers import KNOWN_RULES
 from .analyzers.base import Analyzer, Severity, get_parser, is_excluded, is_suppressed
 from .analyzers.base import Diagnostic as LintDiagnostic
 from .analyzers.exception_checker import ExceptionChecker
@@ -1153,9 +1154,19 @@ _FIX_TITLES: dict[str, str] = {
     "mutable-dto": "Replace @Data with @Value",
 }
 
-# Guard against title/registry mismatch at import time
+# Guard against title/registry mismatch at import time.
 assert set(_FIX_TITLES) == get_fix_registry_keys(), (
     f"_FIX_TITLES keys {set(_FIX_TITLES)} do not match fix registry keys {get_fix_registry_keys()}"
+)
+
+# Guard against a fix being registered against a rule code that no analyzer emits.
+# This catches typos like registering "fronzen-mutation" — without the check, the title
+# silently never appears in any client's code action menu because no diagnostic carries
+# that code.
+_UNKNOWN_FIXED_RULES = set(_FIX_TITLES) - KNOWN_RULES
+assert not _UNKNOWN_FIXED_RULES, (
+    f"_FIX_TITLES references rules that no analyzer emits: {sorted(_UNKNOWN_FIXED_RULES)}. "
+    f"Known rules: {sorted(KNOWN_RULES)}"
 )
 
 

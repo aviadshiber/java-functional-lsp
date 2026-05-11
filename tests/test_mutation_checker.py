@@ -132,6 +132,18 @@ class TestMutationCheckerData:
         assert mut_diags[0].data.fix_type == "USE_FINAL_TRANSFORMS"
         assert mut_diags[0].data.target_library == "io.vavr.collection.List"
 
+    def test_mutable_variable_recommended_api_omits_final(self) -> None:
+        """Issue #74 review: `recommended_api` is an API hint paired with `target_library`; the
+        `final` language modifier doesn't belong there. The rationale field mentions it instead."""
+        source = b"class T { void f() { int x = 1; x = 2; } }"
+        diags = parse_and_analyze(MutationChecker(), source)
+        mut = next(d for d in diags if d.code == "mutable-variable")
+        assert mut.data is not None
+        assert mut.data.recommended_api is not None
+        assert "final" not in mut.data.recommended_api
+        # But the rationale still mentions final.
+        assert "final" in mut.data.rationale
+
     def test_imperative_loop_has_data_field(self) -> None:
         source = b"class T { void f() { for (String s : list) { process(s); } } }"
         diags = parse_and_analyze(MutationChecker(), source)

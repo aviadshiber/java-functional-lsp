@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 from typing import Any
 
 from .base import Diagnostic, DiagnosticData, find_nodes, severity_from_config
@@ -63,13 +64,7 @@ def _build_null_assignment_data(declarator: Any, parent_decl: Any, is_field: boo
         snippet = f"private final Option<{type_text}> {var_name} = Option.none();"
     else:
         snippet = f"Option<{type_text}> {var_name} = Option.none();"
-    return DiagnosticData(
-        fix_type=base.fix_type,
-        target_library=base.target_library,
-        rationale=base.rationale,
-        recommended_api=base.recommended_api,
-        suggested_snippet=snippet,
-    )
+    return dataclasses.replace(base, suggested_snippet=snippet)
 
 
 class NullChecker:

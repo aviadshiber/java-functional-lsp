@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import re
 from typing import Any, Literal
 
@@ -52,8 +53,12 @@ _DATA = {
         ),
         recommended_api="Option.of(...).map(...).getOrElse(...)",
     ),
+    # impure-method has two variants (IO and throw) that share the rule code "impure-method"
+    # but carry distinct fix_type values so AI agents can filter on the variant without
+    # parsing target_library or message text. Splitting the rule code itself would break
+    # existing user severity-overrides like `rules: { "impure-method": "off" }`.
     "impure-method-io": DiagnosticData(
-        fix_type="EXTRACT_PURE_LOGIC",
+        fix_type="EXTRACT_PURE_LOGIC_IO",
         target_library="io.vavr.control.Try",
         rationale=(
             "Mixing pure logic with IO/state mutations breaks referential transparency. "
@@ -62,7 +67,7 @@ _DATA = {
         recommended_api="Try.of(() -> sideEffect()).onFailure(...)",
     ),
     "impure-method-throw": DiagnosticData(
-        fix_type="EXTRACT_PURE_LOGIC",
+        fix_type="EXTRACT_PURE_LOGIC_THROW",
         target_library="io.vavr.control.Either",
         rationale=(
             "Mixing pure logic with exceptions breaks referential transparency. "
@@ -113,13 +118,7 @@ def _build_null_check_to_monadic_data(
     else:
         snippet = f"return {chain_body}.getOrElse({else_expr});"
 
-    return DiagnosticData(
-        fix_type=base.fix_type,
-        target_library=base.target_library,
-        rationale=base.rationale,
-        recommended_api=base.recommended_api,
-        suggested_snippet=snippet,
-    )
+    return dataclasses.replace(base, suggested_snippet=snippet)
 
 
 def _next_statement_return_expr(if_node: Node) -> str | None:
@@ -157,26 +156,40 @@ def _single_return_expr_text(block_or_stmt: Node | None) -> str | None:
     return decoded
 
 
+# Module-scope so it's allocated once at import rather than per diagnostic.
+_VAVR_MUTATION_METHODS: dict[bytes, str] = {
+    b"add": "append",
+    b"addAll": "appendAll",
+    b"remove": "remove",
+    b"set": "update",
+    b"sort": "sorted",
+}
+
+# Identifier syntax: bare identifiers only (not `this.x`, `foo.bar()`, etc.) — used to gate
+# whether the assignment-style snippet `x = x.append(...)` is safe to suggest.
+_PLAIN_IDENTIFIER_RE = re.compile(r"^[A-Za-z_$][A-Za-z0-9_$]*$")
+
+
 def _build_frozen_mutation_data(method_name: bytes, var_name: bytes) -> DiagnosticData:
-    """Build a DiagnosticData carrying a concrete Vavr-persistent snippet using real names."""
+    """Build a Vavr-persistent snippet using the real var name and migration hint.
+
+    Returns the base data (no snippet) when ``var_name`` is anything other than a plain
+    identifier — chained LHS like ``foo.getList()`` or ``this.items`` would produce invalid
+    Java if used as the left-hand side of an assignment.
+    """
     base = _DATA["frozen-mutation"]
-    var = var_name.decode("utf-8") if var_name else "items"
-    vavr_method_map = {
-        b"add": "append",
-        b"addAll": "appendAll",
-        b"remove": "remove",
-        b"set": "update",
-        b"sort": "sorted",
-    }
-    vavr_method = vavr_method_map.get(method_name, "append") if method_name else "append"
-    snippet = f"{var} = {var}.{vavr_method}(...);  // returns a new persistent collection"
-    return DiagnosticData(
-        fix_type=base.fix_type,
-        target_library=base.target_library,
-        rationale=base.rationale,
-        recommended_api=base.recommended_api,
-        suggested_snippet=snippet,
+    decoded_var = var_name.decode("utf-8") if var_name else ""
+    if not _PLAIN_IDENTIFIER_RE.match(decoded_var):
+        return base
+    vavr_method = _VAVR_MUTATION_METHODS.get(method_name, "append") if method_name else "append"
+    # Spell out that the *variable's type* must move to Vavr — pasting the assignment alone
+    # won't compile when the variable is still a java.util.List.
+    snippet = (
+        f"// Migrate `{decoded_var}` to io.vavr.collection.List:\n"
+        f"io.vavr.collection.List<...> {decoded_var} = io.vavr.collection.List.ofAll(...);\n"
+        f"{decoded_var} = {decoded_var}.{vavr_method}(...);  // returns a new persistent collection"
     )
+    return dataclasses.replace(base, suggested_snippet=snippet)
 
 
 # Factory methods that produce frozen (unmodifiable) collections
@@ -523,6 +536,12 @@ class FunctionalChecker:
         catches typos in the discriminator at type-check time.
 
         Single TreeCursor traversal to detect both throws and IO calls in one pass.
+
+        Note: When a single statement contains *both* a throw and an IO call (rare —
+        e.g. ``log(x); throw new …;`` collapsed onto one line), the kind chosen reflects
+        AST traversal order rather than a semantic precedence. In practice the diagnostic
+        is still actionable because both side-effects need extracting; the choice only
+        affects which message variant fires.
         """
         cursor = stmt.walk()
         visited_children = False

@@ -24,6 +24,36 @@ def _range(start_line: int, start_char: int, end_line: int, end_char: int) -> ls
     )
 
 
+def _offset_at(lines: list[str], line: int, char: int) -> int:
+    """Absolute character offset of (line, char) in a `splitlines(keepends=True)` list."""
+    return sum(len(lines[i]) for i in range(min(line, len(lines)))) + char
+
+
+def _apply_edits(source: str, edits: list[lsp.TextEdit]) -> str:
+    """Apply a list of TextEdits to ``source`` and return the resulting string.
+
+    Mirrors the LSP-client semantics for non-overlapping edits: applied in reverse-document
+    order so earlier-line offsets aren't invalidated by later replacements. Lets tests assert
+    on the final source text rather than just inspecting individual TextEdit shapes, which
+    catches off-by-one range bugs that edit-level assertions miss.
+    """
+    lines = source.splitlines(keepends=True)
+    # Sort edits by start position descending so applying one doesn't shift the others.
+    sorted_edits = sorted(
+        edits,
+        key=lambda e: (e.range.start.line, e.range.start.character),
+        reverse=True,
+    )
+    for edit in sorted_edits:
+        start_off = _offset_at(lines, edit.range.start.line, edit.range.start.character)
+        end_off = _offset_at(lines, edit.range.end.line, edit.range.end.character)
+        joined = "".join(lines)
+        new_source = joined[:start_off] + edit.new_text + joined[end_off:]
+        # Re-split so subsequent edits' offset() computations operate on the current line-array.
+        lines = new_source.splitlines(keepends=True)
+    return "".join(lines)
+
+
 class TestFixRegistryConsistency:
     def test_fix_registry_keys_match_server_titles(self) -> None:
         """Every rule with a fix generator must have a title registered in server._FIX_TITLES."""
@@ -32,6 +62,25 @@ class TestFixRegistryConsistency:
         registry_keys = get_fix_registry_keys()
         title_keys = set(_FIX_TITLES.keys())
         assert registry_keys == title_keys, f"Mismatch: registry has {registry_keys}, titles has {title_keys}"
+
+    def test_fix_titles_only_reference_known_rules(self) -> None:
+        """Issue #74 review: every key in `_FIX_TITLES` must be a rule code some analyzer
+        actually emits. Catches typos like `fronzen-mutation` that would otherwise silently
+        never appear in client code-action menus."""
+        from java_functional_lsp.analyzers import KNOWN_RULES
+        from java_functional_lsp.server import _FIX_TITLES
+
+        unknown = set(_FIX_TITLES) - KNOWN_RULES
+        assert not unknown, f"_FIX_TITLES references unknown rules: {sorted(unknown)}"
+
+    def test_impure_method_is_in_known_rules(self) -> None:
+        """KNOWN_RULES should expose the wire-visible `impure-method` code, not the internal
+        `_DATA` keys (`impure-method-io`, `impure-method-throw`)."""
+        from java_functional_lsp.analyzers import KNOWN_RULES
+
+        assert "impure-method" in KNOWN_RULES
+        assert "impure-method-io" not in KNOWN_RULES
+        assert "impure-method-throw" not in KNOWN_RULES
 
     def test_ensure_import_rejects_invalid_path(self) -> None:
         """ensure_import should return None for paths that contain invalid characters."""
@@ -1201,6 +1250,35 @@ class TestFixImperativeOptionUnwrap:
         result = fix_imperative_option_unwrap("file:///T.java", source, diag_range, {})
         assert result is None, "fix must bail when there's no else branch (type-mismatch risk)"
 
+    def test_post_edit_source_is_valid_java(self) -> None:
+        """Issue #74 review (test quality): assert on the post-edit source, not just edits.
+
+        Catches range off-by-one bugs: an edit replacing the wrong span would still pass an
+        "edits exist" check but produce broken output.
+        """
+        source = (
+            "class T {\n"
+            "    String f(Option<String> opt) {\n"
+            "        if (opt.isDefined()) {\n"
+            "            return opt.get();\n"
+            "        } else {\n"
+            '            return "default";\n'
+            "        }\n"
+            "    }\n"
+            "}\n"
+        )
+        diag_range = _range(2, 8, 6, 9)
+        result = fix_imperative_option_unwrap("file:///T.java", source, diag_range, {})
+        assert result is not None
+        assert result.changes is not None
+        edited = _apply_edits(source, result.changes["file:///T.java"])
+        # The full if/else is gone, replaced by a single return chain.
+        assert "if (opt.isDefined())" not in edited
+        assert 'return opt.map(it -> it).getOrElse("default");' in edited
+        # And the surrounding method braces are still intact.
+        assert "class T {" in edited
+        assert "String f(Option<String> opt) {" in edited
+
 
 class TestFixMutableDto:
     """Issue #74 #3: quick-fix that swaps @Data for @Value (only — @Setter is rejected)."""
@@ -1266,6 +1344,23 @@ class TestFixMutableDto:
         edits = result.changes["file:///UserDto.java"]
         # The Lombok import should still appear.
         assert any("import lombok.Value" in e.new_text for e in edits)
+
+    def test_post_edit_source_replaces_data_token_only(self) -> None:
+        """Issue #74 review (test quality): assert the @Data token is replaced exactly,
+        without disturbing surrounding code."""
+        source = "import lombok.Data;\n\n@Data\npublic class UserDto {\n    private String name;\n}\n"
+        diag_range = _range(2, 0, 2, 5)
+        result = fix_mutable_dto("file:///UserDto.java", source, diag_range, {})
+        assert result is not None
+        assert result.changes is not None
+        edited = _apply_edits(source, result.changes["file:///UserDto.java"])
+        assert "@Value" in edited
+        assert "@Data" not in edited
+        # The class body and import below were not touched.
+        assert "public class UserDto {" in edited
+        assert "    private String name;" in edited
+        # And the lombok.Value import was added.
+        assert "import lombok.Value;" in edited
 
 
 class TestFieldInjectionNoQuickFix:

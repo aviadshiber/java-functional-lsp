@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 from typing import Any
 
 from .base import (
@@ -26,10 +27,12 @@ _DATA = {
         fix_type="USE_FINAL_TRANSFORMS",
         target_library="io.vavr.collection.List",
         rationale=(
-            "Reassigning variables creates temporal coupling."
-            " Use final + functional transforms for predictable data flow."
+            "Reassigning variables creates temporal coupling. "
+            "Declare the variable `final` and replace reassignment with functional transforms."
         ),
-        recommended_api="final + .map / .filter / .flatMap / .foldLeft",
+        # API hint only — the `final` modifier is a language feature, not an API; mentioning it
+        # in `rationale` is appropriate but it doesn't belong in `recommended_api`.
+        recommended_api=".map / .filter / .flatMap / .foldLeft",
     ),
     "imperative-loop": DiagnosticData(
         fix_type="USE_FUNCTIONAL_TRANSFORMS",
@@ -63,13 +66,7 @@ def _build_mutable_dto_data(class_decl: Any) -> DiagnosticData:
         return base
     class_name = name_node.text.decode("utf-8")
     snippet = f"@Value\npublic class {class_name} {{ /* fields become final */ }}"
-    return DiagnosticData(
-        fix_type=base.fix_type,
-        target_library=base.target_library,
-        rationale=base.rationale,
-        recommended_api=base.recommended_api,
-        suggested_snippet=snippet,
-    )
+    return dataclasses.replace(base, suggested_snippet=snippet)
 
 
 def _build_imperative_option_unwrap_data(obj_name: bytes, consequence: Any, else_branch: Any) -> DiagnosticData:
@@ -108,13 +105,7 @@ def _build_imperative_option_unwrap_data(obj_name: bytes, consequence: Any, else
     else:
         snippet = f"{var}.forEach(value -> {{ /* use value */ }});"
 
-    return DiagnosticData(
-        fix_type=base.fix_type,
-        target_library=base.target_library,
-        rationale=base.rationale,
-        recommended_api=base.recommended_api,
-        suggested_snippet=snippet,
-    )
+    return dataclasses.replace(base, suggested_snippet=snippet)
 
 
 _LOOP_TYPES = {"enhanced_for_statement", "for_statement", "while_statement"}

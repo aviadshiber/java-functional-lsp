@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 from typing import Any
 
 from .base import Diagnostic, DiagnosticData, find_ancestor, find_nodes, severity_from_config
@@ -73,13 +74,7 @@ def _build_field_injection_data(field_decl: Any) -> DiagnosticData:
         f"// constructor:\n"
         f"public {class_name}(final {type_text} {field_name}) {{ this.{field_name} = {field_name}; }}"
     )
-    return DiagnosticData(
-        fix_type=base.fix_type,
-        target_library=base.target_library,
-        rationale=base.rationale,
-        recommended_api=base.recommended_api,
-        suggested_snippet=snippet,
-    )
+    return dataclasses.replace(base, suggested_snippet=snippet)
 
 
 def _build_component_annotation_data(class_decl: Any) -> DiagnosticData:
@@ -97,13 +92,7 @@ def _build_component_annotation_data(class_decl: Any) -> DiagnosticData:
         f"    public {class_name} {bean_name}() {{ return new {class_name}(); }}\n"
         f"}}"
     )
-    return DiagnosticData(
-        fix_type=base.fix_type,
-        target_library=base.target_library,
-        rationale=base.rationale,
-        recommended_api=base.recommended_api,
-        suggested_snippet=snippet,
-    )
+    return dataclasses.replace(base, suggested_snippet=snippet)
 
 
 _BAD_ANNOTATIONS = {b"Component", b"Service", b"Repository"}

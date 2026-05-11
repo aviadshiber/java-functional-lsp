@@ -100,6 +100,20 @@ class TestExceptionCheckerData:
         assert 'new IllegalArgumentException("bad input")' in snippet
         assert "Either.left" in snippet
 
+    def test_throw_statement_snippet_is_single_alternative_no_comment(self) -> None:
+        """Issue #74 review: snippet must be a single paste-able statement — no `// or:` comment
+        offering Try.failure as an alternative, since agents pasting verbatim get the comment too."""
+        source = b'class T { void f() { throw new RuntimeException("boom"); } }'
+        diags = parse_and_analyze(ExceptionChecker(), source)
+        throw = next(d for d in diags if d.code == "throw-statement")
+        assert throw.data is not None
+        snippet = throw.data.suggested_snippet
+        assert snippet is not None
+        # Single statement, no comment alternative.
+        assert "//" not in snippet
+        assert "Try.failure" not in snippet
+        assert snippet == 'return Either.left(new RuntimeException("boom"));'
+
 
 class TestBeanSuppression:
     def test_ignores_throw_in_bean_method(self) -> None:
