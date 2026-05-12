@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 from typing import Any
 
 from .base import (
@@ -30,6 +31,7 @@ _DATA = {
             "Throwing exceptions breaks referential transparency."
             " Use Either.left(error) to represent failures as values."
         ),
+        recommended_api="Either.left(...) / Try.failure(...)",
     ),
     "catch-rethrow": DiagnosticData(
         fix_type="USE_TRY_TO_EITHER",
@@ -37,6 +39,7 @@ _DATA = {
         rationale=(
             "Catching and rethrowing adds noise. Use Try.of(() -> ...).toEither() to convert exceptions to values."
         ),
+        recommended_api="Try.of(() -> ...).toEither()",
     ),
     "try-catch-to-monadic": DiagnosticData(
         fix_type="WRAP_IN_TRY",
@@ -45,8 +48,67 @@ _DATA = {
             "try/catch mixes control flow with value handling."
             " Use Try.of(...) for composable, value-based failure handling."
         ),
+        recommended_api="Try.of(() -> ...).getOrElse(...) / .recover(Type.class, e -> ...).get()",
     ),
 }
+
+
+def _build_throw_statement_data(throw_node: Any) -> DiagnosticData:
+    """Build a DiagnosticData with a concrete ``Either.left(...)`` snippet.
+
+    Reads the throw expression from the first non-comment named child. tree-sitter-java
+    doesn't expose a field name for `throw_statement`'s expression, so we filter
+    `named_children` to skip comments and take the first remaining node.
+
+    We commit to ``Either.left`` here (rather than offering both ``Either.left`` and
+    ``Try.failure`` in a comment) so the snippet is paste-able without manual cleanup;
+    the `recommended_api` mentions both alternatives.
+    """
+    base = _DATA["throw-statement"]
+    expr_text = "error"
+    for child in throw_node.named_children:
+        if child.type in IGNORED_CHILDREN:
+            continue
+        if child.text:
+            expr_text = child.text.decode("utf-8")
+        break
+    snippet = f"return Either.left({expr_text});"
+    return dataclasses.replace(base, suggested_snippet=snippet)
+
+
+def _extract_return_expr(block_node: Any) -> str | None:
+    """Return the text of the (last) return-statement expression in a block, or None."""
+    if block_node is None:
+        return None
+    stmts = [c for c in block_node.named_children if c.type not in IGNORED_CHILDREN]
+    if not stmts or stmts[-1].type != "return_statement":
+        return None
+    ret_children = [c for c in stmts[-1].named_children if c.type not in IGNORED_CHILDREN]
+    if not ret_children or not ret_children[0].text:
+        return None
+    decoded: str = ret_children[0].text.decode("utf-8")
+    return decoded
+
+
+def _build_try_catch_to_monadic_data(try_node: Any) -> DiagnosticData:
+    """Build a DiagnosticData with a Try.of(...).getOrElse(...) snippet drawn from the AST.
+
+    Best-effort: when the try/catch shape isn't a clean single-return-each pair, the
+    base data is returned without a snippet rather than synthesising garbage.
+    """
+    base = _DATA["try-catch-to-monadic"]
+    body = try_node.child_by_field_name("body")
+    catches = [c for c in try_node.children if c.type == "catch_clause"]
+    if body is None or not catches:
+        return base
+
+    try_expr = _extract_return_expr(body)
+    catch_expr = _extract_return_expr(catches[0].child_by_field_name("body"))
+    if try_expr is None or catch_expr is None:
+        return base
+
+    snippet = f"return Try.of(() -> {try_expr}).getOrElse({catch_expr});"
+    return dataclasses.replace(base, suggested_snippet=snippet)
 
 
 def _is_in_bean_method(node: Any) -> bool:
@@ -164,7 +226,7 @@ class ExceptionChecker:
                         severity=severity,
                         code="throw-statement",
                         message=_MESSAGES["throw-statement"],
-                        data=_DATA["throw-statement"],
+                        data=_build_throw_statement_data(node),
                     )
                 )
 
@@ -211,7 +273,7 @@ class ExceptionChecker:
                         severity=severity,
                         code="try-catch-to-monadic",
                         message=_MESSAGES["try-catch-to-monadic"],
-                        data=_DATA["try-catch-to-monadic"],
+                        data=_build_try_catch_to_monadic_data(try_node),
                     )
                 )
 

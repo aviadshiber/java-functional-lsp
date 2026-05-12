@@ -114,6 +114,46 @@ class TestFrozenMutation:
         assert frozen_diags[0].data.fix_type == "REPLACE_WITH_VAVR_LIST"
         assert frozen_diags[0].data.target_library == "io.vavr.collection.List"
 
+    def test_snippet_spells_out_vavr_type_migration(self) -> None:
+        """Issue #74 review: the snippet must call out that the *variable's type* needs to be
+        migrated to io.vavr.collection.List — pasting the assignment alone won't compile if the
+        variable is still a java.util.List."""
+        source = b"""
+        class T {
+            void f() {
+                List<String> list = List.of("a");
+                list.add("b");
+            }
+        }
+        """
+        diags = parse_and_analyze(FunctionalChecker(), source)
+        diag = next(d for d in diags if d.code == "frozen-mutation")
+        assert diag.data is not None
+        snippet = diag.data.suggested_snippet
+        assert snippet is not None
+        assert "io.vavr.collection.List" in snippet
+        assert "list" in snippet
+        assert ".append(...)" in snippet
+
+    def test_snippet_uses_word_boundary_for_short_var_name(self) -> None:
+        """Issue #74 review: the `var = var.append(...)` snippet is safe to suggest only when
+        the receiver is a plain identifier — chained LHS would produce invalid Java. With a
+        plain identifier, the snippet should populate normally."""
+        source = b"""
+        class T {
+            void f() {
+                List<String> xs = List.of("a");
+                xs.add("b");
+            }
+        }
+        """
+        diags = parse_and_analyze(FunctionalChecker(), source)
+        diag = next(d for d in diags if d.code == "frozen-mutation")
+        assert diag.data is not None
+        snippet = diag.data.suggested_snippet
+        assert snippet is not None
+        assert "xs = xs.append(...)" in snippet
+
     def test_disabled_by_config(self) -> None:
         source = b"""
         class T {
@@ -288,6 +328,52 @@ class TestNullCheckToMonadic:
         assert null_diags[0].data is not None
         assert null_diags[0].data.fix_type == "WRAP_IN_OPTION_MAP"
 
+    def test_snippet_uses_real_return_expression(self) -> None:
+        """Issue #74 review: snippet must build the lambda body from the real return expression,
+        not the degenerate `Option.of(x).map(v -> v).getOrElse(null)`."""
+        source = b"""
+        class T {
+            String f(User user) {
+                if (user != null) {
+                    return user.getName();
+                }
+                return "guest";
+            }
+        }
+        """
+        diags = parse_and_analyze(FunctionalChecker(), source)
+        diag = next(d for d in diags if d.code == "null-check-to-monadic")
+        assert diag.data is not None
+        snippet = diag.data.suggested_snippet
+        assert snippet is not None
+        # Lambda body should be the real method call, with `user` rewritten as `it`.
+        assert "Option.of(user).map(it -> it.getName())" in snippet
+        # Default should be the real fallback, not always-null.
+        assert '.getOrElse("guest")' in snippet
+        assert ".getOrElse(null)" not in snippet
+        # Must NOT contain the old degenerate identity-map shape.
+        assert ".map(v -> v)" not in snippet
+
+    def test_snippet_omits_default_when_else_returns_null(self) -> None:
+        """When the else-branch returns null, the snippet should leave the Option monadic
+        (no `.getOrElse(null)` — which would defeat the rule)."""
+        source = b"""
+        class T {
+            String f(User user) {
+                if (user != null) {
+                    return user.getName();
+                }
+                return null;
+            }
+        }
+        """
+        diags = parse_and_analyze(FunctionalChecker(), source)
+        diag = next(d for d in diags if d.code == "null-check-to-monadic")
+        assert diag.data is not None
+        snippet = diag.data.suggested_snippet
+        assert snippet is not None
+        assert ".getOrElse(null)" not in snippet
+
     def test_disabled_by_config(self) -> None:
         source = b"""
         class T {
@@ -456,7 +542,9 @@ class TestImpureMethod:
         impure_diags = [d for d in diags if d.code == "impure-method"]
         assert len(impure_diags) == 1
         assert impure_diags[0].data is not None
-        assert impure_diags[0].data.fix_type == "EXTRACT_PURE_LOGIC"
+        # Issue #74 review: fix_type now distinguishes IO vs throw variants. The default test
+        # source uses an IO side-effect (`System.out.println`), so the variant suffix is `_IO`.
+        assert impure_diags[0].data.fix_type == "EXTRACT_PURE_LOGIC_IO"
 
     def test_strict_purity_uses_warning_severity(self) -> None:
         """strictPurity: true should elevate impure-method to WARNING."""
@@ -508,3 +596,71 @@ class TestImpureMethod:
         config = {"rules": {"impure-method": "off"}}
         diags = parse_and_analyze(FunctionalChecker(), source, config)
         assert not any(d.code == "impure-method" for d in diags)
+
+    def test_io_case_uses_try_data(self) -> None:
+        """Issue #74 #4: impure-method with IO side-effect carries Try-targeted data."""
+        source = b"""
+        class T {
+            String f(String input) {
+                String result = input.trim();
+                System.out.println(result);
+                return result;
+            }
+        }
+        """
+        diags = parse_and_analyze(FunctionalChecker(), source)
+        impure = [d for d in diags if d.code == "impure-method"]
+        assert len(impure) == 1
+        assert impure[0].data is not None
+        assert impure[0].data.target_library == "io.vavr.control.Try"
+        assert "Try.of" in (impure[0].data.recommended_api or "")
+        assert "IO/state" in impure[0].message
+        # Issue #74 review: fix_type discriminates the variant so agents can filter without
+        # parsing target_library or message text.
+        assert impure[0].data.fix_type == "EXTRACT_PURE_LOGIC_IO"
+
+    def test_throw_case_uses_either_data(self) -> None:
+        """Issue #74 #4: impure-method with throw side-effect carries Either-targeted data + distinct message."""
+        source = b"""
+        class T {
+            String process(String input) {
+                String result = input.trim();
+                if (result.isEmpty()) {
+                    throw new IllegalArgumentException("empty input");
+                }
+                return result;
+            }
+        }
+        """
+        diags = parse_and_analyze(FunctionalChecker(), source)
+        impure = [d for d in diags if d.code == "impure-method"]
+        assert len(impure) == 1
+        assert impure[0].data is not None
+        assert impure[0].data.target_library == "io.vavr.control.Either"
+        assert "Either.left" in (impure[0].data.recommended_api or "")
+        assert "exceptions" in impure[0].message
+        # Issue #74 review: fix_type discriminates the variant from the IO case.
+        assert impure[0].data.fix_type == "EXTRACT_PURE_LOGIC_THROW"
+
+    def test_points_at_offending_statement_not_method_decl(self) -> None:
+        """Issue #74 #5: diagnostic range covers the offending side-effect, not the method name."""
+        source = b"""
+        class T {
+            String f(String input) {
+                String result = input.trim();
+                System.out.println(result);
+                return result;
+            }
+        }
+        """
+        diags = parse_and_analyze(FunctionalChecker(), source)
+        impure = [d for d in diags if d.code == "impure-method"]
+        assert len(impure) == 1
+        # The method declaration is on line 2 (0-indexed: line 2 = `String f(...) {`).
+        # The println is on line 4. Range must land on the println line, not the method name.
+        diag_line = impure[0].line
+        method_decl_line = source.split(b"\n").index(b"            String f(String input) {")
+        assert diag_line != method_decl_line, (
+            f"Diagnostic should point at the side-effect line, not the method declaration "
+            f"(diag_line={diag_line}, method_decl_line={method_decl_line})"
+        )

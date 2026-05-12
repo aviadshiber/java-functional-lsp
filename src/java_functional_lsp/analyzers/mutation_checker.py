@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 from typing import Any
 
 from .base import (
@@ -26,9 +27,12 @@ _DATA = {
         fix_type="USE_FINAL_TRANSFORMS",
         target_library="io.vavr.collection.List",
         rationale=(
-            "Reassigning variables creates temporal coupling."
-            " Use final + functional transforms for predictable data flow."
+            "Reassigning variables creates temporal coupling. "
+            "Declare the variable `final` and replace reassignment with functional transforms."
         ),
+        # API hint only — the `final` modifier is a language feature, not an API; mentioning it
+        # in `rationale` is appropriate but it doesn't belong in `recommended_api`.
+        recommended_api=".map / .filter / .flatMap / .foldLeft",
     ),
     "imperative-loop": DiagnosticData(
         fix_type="USE_FUNCTIONAL_TRANSFORMS",
@@ -37,18 +41,72 @@ _DATA = {
             "Imperative loops hide intent."
             " Use .map(), .filter(), .flatMap(), or .foldLeft() for declarative transforms."
         ),
+        recommended_api=".map / .filter / .flatMap / .foldLeft",
     ),
     "mutable-dto": DiagnosticData(
         fix_type="USE_VALUE_ANNOTATION",
         target_library="lombok.Value",
         rationale="Mutable DTOs allow uncontrolled state changes. Use @Value for immutable data classes.",
+        recommended_api="@Value",
     ),
     "imperative-option-unwrap": DiagnosticData(
         fix_type="USE_MAP_FLATMAP",
         target_library="io.vavr.control.Option",
         rationale="Imperative isDefined/get is error-prone. Use map(), flatMap(), or fold() for safe monadic access.",
+        recommended_api="map / flatMap / fold / forEach (NOT ifPresent — Vavr Option uses forEach)",
     ),
 }
+
+
+def _build_mutable_dto_data(class_decl: Any) -> DiagnosticData:
+    """Build a DiagnosticData with a @Value snippet using the real class name."""
+    base = _DATA["mutable-dto"]
+    name_node = class_decl.child_by_field_name("name") if class_decl is not None else None
+    if name_node is None or not name_node.text:
+        return base
+    class_name = name_node.text.decode("utf-8")
+    snippet = f"@Value\npublic class {class_name} {{ /* fields become final */ }}"
+    return dataclasses.replace(base, suggested_snippet=snippet)
+
+
+def _build_imperative_option_unwrap_data(obj_name: bytes, consequence: Any, else_branch: Any) -> DiagnosticData:
+    """Build a DiagnosticData carrying a concrete snippet for imperative Option unwrap.
+
+    Uses the real variable name from the AST. Snippet shape depends on whether the
+    if-body is a return (use map+getOrElse) or a side-effect statement (use forEach).
+    """
+    base = _DATA["imperative-option-unwrap"]
+    var = obj_name.decode("utf-8") if obj_name else "opt"
+
+    # Detect whether the consequence is a `return opt.get();` shape — then map/getOrElse fits.
+    # Otherwise (statement-style consumer), forEach is the right hint.
+    ignored = ("line_comment", "block_comment")
+    is_return_shape = False
+    if consequence is not None:
+        if consequence.type == "block":
+            stmts = [c for c in consequence.named_children if c.type not in ignored]
+        else:
+            stmts = [consequence]
+        if len(stmts) == 1 and stmts[0].type == "return_statement":
+            is_return_shape = True
+
+    if is_return_shape:
+        default_text = "default"
+        if else_branch is not None:
+            if else_branch.type == "block":
+                else_stmts = [c for c in else_branch.named_children if c.type not in ignored]
+            else:
+                else_stmts = [else_branch]
+            if len(else_stmts) == 1 and else_stmts[0].type == "return_statement":
+                ret_children = [c for c in else_stmts[0].named_children if c.type not in ignored]
+                if ret_children and ret_children[0].text:
+                    default_text = ret_children[0].text.decode("utf-8")
+        snippet = f"return {var}.map(value -> value).getOrElse({default_text});"
+    else:
+        snippet = f"{var}.forEach(value -> {{ /* use value */ }});"
+
+    return dataclasses.replace(base, suggested_snippet=snippet)
+
 
 _LOOP_TYPES = {"enhanced_for_statement", "for_statement", "while_statement"}
 _METHOD_TYPES = {"method_declaration", "constructor_declaration", "lambda_expression"}
@@ -100,7 +158,7 @@ class MutationChecker:
                                 severity=severity,
                                 code="mutable-dto",
                                 message=message,
-                                data=_DATA["mutable-dto"],
+                                data=_build_mutable_dto_data(grandparent),
                             )
                         )
 
@@ -170,6 +228,7 @@ class MutationChecker:
                         found_get = True
                         break
                 if found_get:
+                    alternative = if_node.child_by_field_name("alternative")
                     diagnostics.append(
                         Diagnostic(
                             line=if_node.start_point[0],
@@ -179,7 +238,7 @@ class MutationChecker:
                             severity=severity,
                             code="imperative-option-unwrap",
                             message=_MESSAGES["imperative-option-unwrap"],
-                            data=_DATA["imperative-option-unwrap"],
+                            data=_build_imperative_option_unwrap_data(obj_name, consequence, alternative),
                         )
                     )
                 break  # Only check first invocation in condition

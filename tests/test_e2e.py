@@ -556,6 +556,39 @@ class TestE2EDiagnosticData:
         assert data["fixType"] == "WRAP_IN_OPTION"
         assert data["targetLibrary"] == "io.vavr.control.Option"
 
+    def test_diagnostics_include_recommended_api_and_suggested_snippet(
+        self, server: subprocess.Popen[bytes], tmp_path: Path
+    ) -> None:
+        """Issue #74: the new recommendedApi + suggestedSnippet fields must appear on the wire
+        as camelCase keys under Diagnostic.data so AI agents can read them directly."""
+        java_file = tmp_path / "OptUse.java"
+        java_file.write_text(
+            "class T {\n"
+            "    String f(io.vavr.control.Option<String> myOpt) {\n"
+            "        if (myOpt.isDefined()) {\n"
+            "            return myOpt.get();\n"
+            '        } else { return "fallback"; }\n'
+            "    }\n"
+            "}\n"
+        )
+        uri = java_file.as_uri()
+
+        _initialize(server, root_uri=tmp_path.as_uri())
+        _did_open(server, uri, java_file.read_text())
+
+        msg = _wait_diagnostics(server)
+        assert msg is not None
+        unwrap_diags = [d for d in msg["params"]["diagnostics"] if d["code"] == "imperative-option-unwrap"]
+        assert len(unwrap_diags) == 1
+        data = unwrap_diags[0].get("data")
+        assert data is not None, "Diagnostic.data must be present"
+        assert "recommendedApi" in data, "recommendedApi must surface on the LSP wire"
+        assert "suggestedSnippet" in data, "suggestedSnippet must surface on the LSP wire"
+        # The snippet uses the real variable name from the AST.
+        assert "myOpt" in data["suggestedSnippet"]
+        # The recommended_api warns about the Vavr-vs-Optional API confusion.
+        assert "ifPresent" in data["recommendedApi"]
+
 
 def _request_code_actions(
     proc: subprocess.Popen[bytes], uri: str, diag_range: dict, diagnostics: list[dict]
