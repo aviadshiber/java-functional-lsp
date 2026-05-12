@@ -305,6 +305,54 @@ class TestServerInternals:
         diag = LintDiag(line=0, col=0, end_line=0, end_col=5, severity=Severity.WARNING, code="x", message="m")
         assert _to_lsp_diagnostic(diag).data is None
 
+    def test_to_lsp_diagnostic_emits_recommended_api_and_snippet(self) -> None:
+        """Issue #74 #1, #2: new optional payload fields surface as camelCase on the wire."""
+        from java_functional_lsp.analyzers.base import Diagnostic as LintDiag
+        from java_functional_lsp.analyzers.base import DiagnosticData, Severity
+        from java_functional_lsp.server import _to_lsp_diagnostic
+
+        diag = LintDiag(
+            line=0,
+            col=0,
+            end_line=0,
+            end_col=5,
+            severity=Severity.WARNING,
+            code="test",
+            message="m",
+            data=DiagnosticData(
+                fix_type="FIX",
+                target_library="lib",
+                rationale="r",
+                recommended_api="forEach (NOT ifPresent)",
+                suggested_snippet="opt.forEach(consumer)",
+            ),
+        )
+        result = _to_lsp_diagnostic(diag)
+        assert result.data is not None
+        assert result.data["recommendedApi"] == "forEach (NOT ifPresent)"
+        assert result.data["suggestedSnippet"] == "opt.forEach(consumer)"
+
+    def test_to_lsp_diagnostic_omits_optional_fields_when_none(self) -> None:
+        """Backward-compat: existing rules without new fields don't emit the extra keys."""
+        from java_functional_lsp.analyzers.base import Diagnostic as LintDiag
+        from java_functional_lsp.analyzers.base import DiagnosticData, Severity
+        from java_functional_lsp.server import _to_lsp_diagnostic
+
+        diag = LintDiag(
+            line=0,
+            col=0,
+            end_line=0,
+            end_col=5,
+            severity=Severity.WARNING,
+            code="test",
+            message="m",
+            data=DiagnosticData(fix_type="FIX", target_library="lib", rationale="r"),
+        )
+        result = _to_lsp_diagnostic(diag)
+        assert result.data is not None
+        assert "recommendedApi" not in result.data
+        assert "suggestedSnippet" not in result.data
+
     def test_analyze_document_with_excludes(self) -> None:
         from java_functional_lsp.server import _analyze_document, server
 

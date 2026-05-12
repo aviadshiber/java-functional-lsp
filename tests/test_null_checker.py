@@ -65,6 +65,27 @@ class TestNullCheckerData:
         assert arg_diags[0].data.fix_type == "WRAP_IN_OPTION_NONE"
         assert arg_diags[0].data.target_library == "io.vavr.control.Option"
 
+    def test_null_assignment_snippet_uses_real_name_and_type(self) -> None:
+        """Issue #74 review: snippet must use the real variable name + type from the AST,
+        not the placeholder `Option<T> value`."""
+        source = b"class T { void f() { Map<String, Integer> cache = null; } }"
+        diags = parse_and_analyze(NullChecker(), source)
+        diag = next(d for d in diags if d.code == "null-assignment")
+        assert diag.data is not None
+        snippet = diag.data.suggested_snippet
+        assert snippet is not None
+        assert "Option<Map<String, Integer>> cache = Option.none();" == snippet
+
+    def test_null_field_assignment_snippet_uses_real_name_and_type(self) -> None:
+        """Issue #74 review: field-level snippet must use real name + type."""
+        source = b"class T { private String userName = null; }"
+        diags = parse_and_analyze(NullChecker(), source)
+        diag = next(d for d in diags if d.code == "null-field-assignment")
+        assert diag.data is not None
+        snippet = diag.data.suggested_snippet
+        assert snippet is not None
+        assert "private final Option<String> userName = Option.none();" == snippet
+
 
 class TestNullConfig:
     def test_disabled_rule_produces_no_diagnostics(self) -> None:

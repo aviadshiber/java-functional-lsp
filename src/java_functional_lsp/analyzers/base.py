@@ -26,6 +26,14 @@ class DiagnosticData:
     fix_type: str  # e.g. "REPLACE_WITH_VAVR_LIST", "WRAP_IN_OPTION"
     target_library: str  # e.g. "io.vavr.collection.List"
     rationale: str  # human+machine readable explanation
+    # Library-agnostic API hint that pairs with target_library. Examples:
+    # "forEach (NOT ifPresent — Vavr Option)", "@Value", "Try.of(...).getOrElse(...)".
+    # Lets agents pick the right method without re-reading docs.
+    recommended_api: str | None = None
+    # Concrete fix snippet built from the offending AST node — uses real variable
+    # names so an agent can paste it directly. None when the shape is too complex
+    # to synthesise safely.
+    suggested_snippet: str | None = None
 
 
 @dataclass(frozen=True)

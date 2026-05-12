@@ -132,6 +132,18 @@ class TestMutationCheckerData:
         assert mut_diags[0].data.fix_type == "USE_FINAL_TRANSFORMS"
         assert mut_diags[0].data.target_library == "io.vavr.collection.List"
 
+    def test_mutable_variable_recommended_api_omits_final(self) -> None:
+        """Issue #74 review: `recommended_api` is an API hint paired with `target_library`; the
+        `final` language modifier doesn't belong there. The rationale field mentions it instead."""
+        source = b"class T { void f() { int x = 1; x = 2; } }"
+        diags = parse_and_analyze(MutationChecker(), source)
+        mut = next(d for d in diags if d.code == "mutable-variable")
+        assert mut.data is not None
+        assert mut.data.recommended_api is not None
+        assert "final" not in mut.data.recommended_api
+        # But the rationale still mentions final.
+        assert "final" in mut.data.rationale
+
     def test_imperative_loop_has_data_field(self) -> None:
         source = b"class T { void f() { for (String s : list) { process(s); } } }"
         diags = parse_and_analyze(MutationChecker(), source)
@@ -148,6 +160,52 @@ class TestMutationCheckerData:
         assert dto_diags[0].data is not None
         assert dto_diags[0].data.fix_type == "USE_VALUE_ANNOTATION"
         assert dto_diags[0].data.target_library == "lombok.Value"
+
+    def test_imperative_option_unwrap_has_snippet_with_real_var_name(self) -> None:
+        """Issue #74 #2: snippet uses the AST variable name, not a placeholder."""
+        source = b"""
+        class T {
+            String f(Option<String> myOpt) {
+                if (myOpt.isDefined()) {
+                    return myOpt.get();
+                } else {
+                    return "fallback";
+                }
+            }
+        }
+        """
+        diags = parse_and_analyze(MutationChecker(), source)
+        unwraps = [d for d in diags if d.code == "imperative-option-unwrap"]
+        assert len(unwraps) == 1
+        unwrap = unwraps[0]
+        assert unwrap.data is not None
+        assert unwrap.data.recommended_api is not None
+        assert "ifPresent" in unwrap.data.recommended_api  # warns about Vavr-vs-Optional confusion
+        snippet = unwrap.data.suggested_snippet
+        assert snippet is not None
+        assert "myOpt" in snippet  # real variable name from AST
+        assert '"fallback"' in snippet  # real default value from AST
+
+    def test_mutable_dto_has_recommended_api(self) -> None:
+        """Issue #74 #1: mutable-dto carries the @Value recommendation."""
+        source = b"@Data class Foo { private String name; }"
+        diags = parse_and_analyze(MutationChecker(), source)
+        dto = next(d for d in diags if d.code == "mutable-dto")
+        assert dto.data is not None
+        assert dto.data.recommended_api == "@Value"
+
+    def test_mutable_dto_snippet_uses_real_class_name(self) -> None:
+        """Issue #74 review: snippet must reference the real class name, not the placeholder `Foo`
+        with `{ ... }` body that would never compile if pasted."""
+        source = b"@Data class UserDto { private String name; }"
+        diags = parse_and_analyze(MutationChecker(), source)
+        dto = next(d for d in diags if d.code == "mutable-dto")
+        assert dto.data is not None
+        snippet = dto.data.suggested_snippet
+        assert snippet is not None
+        assert "class UserDto" in snippet
+        # No `{ ... }` placeholder body (that's not valid Java).
+        assert "{ ... }" not in snippet
 
 
 class TestConstructorAssignment:

@@ -950,6 +950,224 @@ def fix_try_catch_to_monadic(
     return lsp.WorkspaceEdit(changes={uri: edits})
 
 
+# --- imperative-option-unwrap ---
+
+
+def _find_if_at(tree: Tree, diag_range: lsp.Range) -> Node | None:
+    """Find the if_statement at the diagnostic range (which spans the whole if)."""
+    target = tree.root_node.descendant_for_point_range(
+        (diag_range.start.line, diag_range.start.character),
+        (diag_range.end.line, diag_range.end.character),
+    )
+    if target is None:
+        return None
+    if target.type == "if_statement":
+        return target
+    return find_ancestor(target, "if_statement")
+
+
+def fix_imperative_option_unwrap(
+    uri: str,
+    source: str,
+    diag_range: lsp.Range,
+    config: dict[str, Any],
+    *,
+    tree: Tree | None = None,
+    lines: list[str] | None = None,
+) -> lsp.WorkspaceEdit | None:
+    """Rewrite ``if (opt.isDefined()) return opt.get(); else return X;`` to
+    ``return opt.map(it -> it).getOrElse(X);``.
+
+    Bails (returns None) when the shape is anything other than that exact return/else-return
+    pair — keeping the diagnostic visible but avoiding a broken edit.
+    """
+    if lines is None:
+        lines = source.split("\n")
+    if tree is None:
+        tree = get_parser().parse(source.encode("utf-8"))
+
+    if_node = _find_if_at(tree, diag_range)
+    if if_node is None or has_error_or_missing(if_node):
+        return None
+
+    condition = if_node.child_by_field_name("condition")
+    consequence = if_node.child_by_field_name("consequence")
+    alternative = if_node.child_by_field_name("alternative")
+    if condition is None or consequence is None:
+        return None
+
+    # Extract the variable name from the isDefined/isPresent invocation in the condition.
+    var_name: bytes | None = None
+    for inv in find_nodes(condition, "method_invocation"):
+        name_node = inv.child_by_field_name("name")
+        obj_node = inv.child_by_field_name("object")
+        if name_node is None or obj_node is None:
+            continue
+        if name_node.text in (b"isDefined", b"isPresent") and obj_node.text:
+            var_name = obj_node.text
+            break
+    if var_name is None:
+        return None
+    var = var_name.decode("utf-8")
+
+    # Consequence must be a block with exactly: `return <var>.get();` (or similar shape).
+    cons_stmts = (
+        [c for c in consequence.named_children if c.type not in IGNORED_CHILDREN]
+        if consequence.type == "block"
+        else [consequence]
+    )
+    if len(cons_stmts) != 1 or cons_stmts[0].type != "return_statement":
+        return None
+    ret_children = [c for c in cons_stmts[0].named_children if c.type not in IGNORED_CHILDREN]
+    if not ret_children:
+        return None
+    ret_expr = ret_children[0]
+    # Map the returned expression to a lambda body. If it's literally `var.get()`, the lambda
+    # is the identity `it -> it`; otherwise rewrite occurrences of `var` to `it`.
+    ret_text = ret_expr.text.decode("utf-8") if ret_expr.text else var
+    if ret_text == f"{var}.get()":
+        lambda_body = "it"
+    else:
+        pattern = re.compile(rf"\b{re.escape(var)}\.get\(\)")
+        lambda_body = pattern.sub("it", ret_text)
+        # If the rewrite did nothing (no .get() call to replace), bail — shape isn't safe.
+        if lambda_body == ret_text:
+            return None
+
+    # Alternative (else) must be a single return statement. Bail when absent — without an
+    # else-return, `return opt.map(it -> it);` returns Option<T> rather than T, breaking the
+    # method's return type.
+    if alternative is None:
+        return None
+    alt_stmts = (
+        [c for c in alternative.named_children if c.type not in IGNORED_CHILDREN]
+        if alternative.type == "block"
+        else [alternative]
+    )
+    if len(alt_stmts) != 1 or alt_stmts[0].type != "return_statement":
+        return None
+    alt_ret = [c for c in alt_stmts[0].named_children if c.type not in IGNORED_CHILDREN]
+    if not alt_ret:
+        return None
+    alt_text = alt_ret[0].text.decode("utf-8") if alt_ret[0].text else "null"
+    if _is_eager(alt_ret[0]):
+        or_else = f".getOrElse({alt_text})"
+    else:
+        or_else = f".getOrElse(() -> {alt_text})"
+
+    chain = f"{var}.map(it -> {lambda_body}){or_else}"
+
+    edits: list[lsp.TextEdit] = []
+    edits.append(
+        lsp.TextEdit(
+            range=lsp.Range(
+                start=lsp.Position(line=if_node.start_point[0], character=if_node.start_point[1]),
+                end=lsp.Position(line=if_node.end_point[0], character=if_node.end_point[1]),
+            ),
+            new_text=f"return {chain};",
+        )
+    )
+    return lsp.WorkspaceEdit(changes={uri: edits})
+
+
+# --- mutable-dto ---
+
+
+def _find_marker_annotation_at(tree: Tree, diag_range: lsp.Range, names: set[bytes]) -> Node | None:
+    """Find a marker_annotation node at the diagnostic range whose name is in ``names``."""
+    target = tree.root_node.descendant_for_point_range(
+        (diag_range.start.line, diag_range.start.character),
+        (diag_range.end.line, diag_range.end.character),
+    )
+    if target is None:
+        return None
+    cur: Node | None = target
+    while cur is not None:
+        if cur.type == "marker_annotation":
+            name_node = cur.child_by_field_name("name")
+            if name_node is not None and name_node.text in names:
+                return cur
+        cur = cur.parent
+    return None
+
+
+_CONFLICTING_LOMBOK_ANNOTATIONS = {b"NoArgsConstructor", b"AllArgsConstructor", b"RequiredArgsConstructor"}
+
+
+def fix_mutable_dto(
+    uri: str,
+    source: str,
+    diag_range: lsp.Range,
+    config: dict[str, Any],
+    *,
+    tree: Tree | None = None,
+    lines: list[str] | None = None,
+) -> lsp.WorkspaceEdit | None:
+    """Rewrite ``@Data`` to ``@Value`` on the class declaration.
+
+    Bails when:
+    - The annotation is ``@Setter`` (not ``@Data``). ``@Setter`` users typically pair it
+      with non-final fields and explicit setter usage; switching to ``@Value`` would make
+      the class final and strip the setters, silently breaking callers.
+    - The class carries ``@ConfigurationProperties`` (Spring Boot expects a settable bean
+      and recommends ``@ConstructorBinding`` instead — different rewrite path).
+    - The class carries Lombok constructor annotations that conflict with ``@Value`` (it
+      implies a single all-args constructor and final fields).
+    - The annotation isn't on a class_declaration parent.
+    """
+    if lines is None:
+        lines = source.split("\n")
+    if tree is None:
+        tree = get_parser().parse(source.encode("utf-8"))
+
+    ann = _find_marker_annotation_at(tree, diag_range, {b"Data"})
+    if ann is None or has_error_or_missing(ann):
+        return None
+
+    modifiers = ann.parent
+    if modifiers is None or modifiers.type != "modifiers":
+        return None
+
+    # Verify the annotation is actually on a class declaration (not e.g. a method or field).
+    if modifiers.parent is None or modifiers.parent.type != "class_declaration":
+        return None
+
+    # Reject if any conflicting Lombok annotation sits next to @Data, or if Spring's
+    # @ConfigurationProperties is present (use @ConstructorBinding there instead).
+    for sib in modifiers.named_children:
+        if sib.type in ("marker_annotation", "annotation"):
+            name_node = sib.child_by_field_name("name")
+            if name_node is None:
+                continue
+            if name_node.text in _CONFLICTING_LOMBOK_ANNOTATIONS:
+                return None
+            if name_node.text == b"ConfigurationProperties":
+                return None
+
+    name_node = ann.child_by_field_name("name")
+    if name_node is None:
+        return None
+
+    edits: list[lsp.TextEdit] = []
+    # Replace just the annotation name token (preserves `@`).
+    edits.append(
+        lsp.TextEdit(
+            range=lsp.Range(
+                start=lsp.Position(line=name_node.start_point[0], character=name_node.start_point[1]),
+                end=lsp.Position(line=name_node.end_point[0], character=name_node.end_point[1]),
+            ),
+            new_text="Value",
+        )
+    )
+    # Lombok auto-import is gated on its own flag (defaults True) so users who disable
+    # Vavr imports still get the Lombok one and vice versa.
+    if config.get("autoImportLombok", True):
+        import_edit = ensure_import(lines, "lombok.Value")
+        if import_edit is not None:
+            edits.append(import_edit)
+    return lsp.WorkspaceEdit(changes={uri: edits})
+
+
 # --- Fix registry ---
 
 _FIX_REGISTRY: dict[str, FixGenerator] = {
@@ -957,6 +1175,12 @@ _FIX_REGISTRY: dict[str, FixGenerator] = {
     "null-check-to-monadic": fix_null_check_to_monadic,
     "null-return": fix_null_return,
     "try-catch-to-monadic": fix_try_catch_to_monadic,
+    "imperative-option-unwrap": fix_imperative_option_unwrap,
+    "mutable-dto": fix_mutable_dto,
+    # field-injection is intentionally NOT registered: producing a sound rewrite
+    # requires synthesising or extending a constructor (class-wide analysis that
+    # risks clobbering user code). The diagnostic + suggested_snippet remain
+    # available to AI agents, which can apply the change themselves.
 }
 
 

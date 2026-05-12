@@ -88,6 +88,32 @@ class TestExceptionCheckerData:
         assert rethrow_diags[0].data.fix_type == "USE_TRY_TO_EITHER"
         assert rethrow_diags[0].data.target_library == "io.vavr.control.Try"
 
+    def test_throw_statement_has_snippet_with_real_expression(self) -> None:
+        """Issue #74 #2: throw-statement snippet preserves the actual exception expression."""
+        source = b'class T { void f() { throw new IllegalArgumentException("bad input"); } }'
+        diags = parse_and_analyze(ExceptionChecker(), source)
+        throw = next(d for d in diags if d.code == "throw-statement")
+        assert throw.data is not None
+        assert throw.data.recommended_api is not None
+        snippet = throw.data.suggested_snippet
+        assert snippet is not None
+        assert 'new IllegalArgumentException("bad input")' in snippet
+        assert "Either.left" in snippet
+
+    def test_throw_statement_snippet_is_single_alternative_no_comment(self) -> None:
+        """Issue #74 review: snippet must be a single paste-able statement — no `// or:` comment
+        offering Try.failure as an alternative, since agents pasting verbatim get the comment too."""
+        source = b'class T { void f() { throw new RuntimeException("boom"); } }'
+        diags = parse_and_analyze(ExceptionChecker(), source)
+        throw = next(d for d in diags if d.code == "throw-statement")
+        assert throw.data is not None
+        snippet = throw.data.suggested_snippet
+        assert snippet is not None
+        # Single statement, no comment alternative.
+        assert "//" not in snippet
+        assert "Try.failure" not in snippet
+        assert snippet == 'return Either.left(new RuntimeException("boom"));'
+
 
 class TestBeanSuppression:
     def test_ignores_throw_in_bean_method(self) -> None:
@@ -281,6 +307,10 @@ class TestTryCatchToMonadic:
         assert d.data is not None
         assert d.data.fix_type == "WRAP_IN_TRY"
         assert d.data.target_library == "io.vavr.control.Try"
+        # Issue #74 #2: AST-aware snippet using the real try-body and catch-fallback.
+        assert d.data.suggested_snippet is not None
+        assert "Try.of(() -> risky())" in d.data.suggested_snippet
+        assert '"x"' in d.data.suggested_snippet
 
     def test_disabled_by_config(self) -> None:
         source = b"""
