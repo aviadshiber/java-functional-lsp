@@ -7,6 +7,7 @@ import re
 from typing import Any
 
 from .base import (
+    IGNORED_CHILDREN,
     Diagnostic,
     DiagnosticData,
     find_nodes,
@@ -74,9 +75,8 @@ def _single_return_stmt(branch: Any) -> Any | None:
     """Return the lone return_statement of a branch (block or bare statement), else None."""
     if branch is None:
         return None
-    ignored = ("line_comment", "block_comment")
     if branch.type == "block":
-        stmts = [c for c in branch.named_children if c.type not in ignored]
+        stmts = [c for c in branch.named_children if c.type not in IGNORED_CHILDREN]
     else:
         stmts = [branch]
     if len(stmts) != 1 or stmts[0].type != "return_statement":
@@ -86,8 +86,7 @@ def _single_return_stmt(branch: Any) -> Any | None:
 
 def _return_expr_text(return_stmt: Any) -> str | None:
     """Return the expression text of a `return <expr>;` statement, else None."""
-    ignored = ("line_comment", "block_comment")
-    children = [c for c in return_stmt.named_children if c.type not in ignored]
+    children = [c for c in return_stmt.named_children if c.type not in IGNORED_CHILDREN]
     if not children or not children[0].text:
         return None
     text: str = children[0].text.decode("utf-8")

@@ -803,6 +803,17 @@ class TestOptionMapNullable:
         diags = parse_and_analyze(FunctionalChecker(), source)
         assert "option-map-nullable" not in [d.code for d in diags]
 
+    def test_no_warn_non_decimal_index_get(self) -> None:
+        """All four Java integer-literal radixes are index access, not nullable keys."""
+        for literal in (b"0x1F", b"010", b"0b101"):
+            source = (
+                b"class T { Option<String> f(List<String> xs0) {"
+                b" return Option.of(xs0).map(xs -> xs.get(" + literal + b")).filter(v -> !v.isEmpty()); } }"
+            )
+            diags = parse_and_analyze(FunctionalChecker(), source)
+            codes = [d.code for d in diags]
+            assert "option-map-nullable" not in codes, f"false positive on index literal {literal!r}"
+
     def test_no_warn_get_or_else_follower(self) -> None:
         source = b"""
         class T {

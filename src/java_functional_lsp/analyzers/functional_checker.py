@@ -125,8 +125,14 @@ _NULL_SENSITIVE_FOLLOWERS = {b"filter", b"map", b"flatMap", b"forEach", b"peek",
 _MAX_OPTION_CHAIN_DEPTH = 10
 
 # Integer-literal argument types: x.get(0) on a java.util.List throws rather than
-# returning null, so index access is not a Some(null) hazard.
-_INTEGER_LITERAL_TYPES = ("decimal_integer_literal", "hex_integer_literal")
+# returning null, so index access is not a Some(null) hazard. All four Java integer
+# literal forms — tree-sitter emits a distinct node type per radix.
+_INTEGER_LITERAL_TYPES = (
+    "decimal_integer_literal",
+    "hex_integer_literal",
+    "octal_integer_literal",
+    "binary_integer_literal",
+)
 
 
 def _single_lambda_arg(invocation: Node) -> Node | None:
