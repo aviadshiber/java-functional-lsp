@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+import re
 from typing import Any
 
 from .base import (
@@ -69,6 +70,30 @@ def _build_mutable_dto_data(class_decl: Any) -> DiagnosticData:
     return dataclasses.replace(base, suggested_snippet=snippet)
 
 
+def _single_return_stmt(branch: Any) -> Any | None:
+    """Return the lone return_statement of a branch (block or bare statement), else None."""
+    if branch is None:
+        return None
+    ignored = ("line_comment", "block_comment")
+    if branch.type == "block":
+        stmts = [c for c in branch.named_children if c.type not in ignored]
+    else:
+        stmts = [branch]
+    if len(stmts) != 1 or stmts[0].type != "return_statement":
+        return None
+    return stmts[0]
+
+
+def _return_expr_text(return_stmt: Any) -> str | None:
+    """Return the expression text of a `return <expr>;` statement, else None."""
+    ignored = ("line_comment", "block_comment")
+    children = [c for c in return_stmt.named_children if c.type not in ignored]
+    if not children or not children[0].text:
+        return None
+    text: str = children[0].text.decode("utf-8")
+    return text
+
+
 def _build_imperative_option_unwrap_data(obj_name: bytes, consequence: Any, else_branch: Any) -> DiagnosticData:
     """Build a DiagnosticData carrying a concrete snippet for imperative Option unwrap.
 
@@ -78,33 +103,32 @@ def _build_imperative_option_unwrap_data(obj_name: bytes, consequence: Any, else
     base = _DATA["imperative-option-unwrap"]
     var = obj_name.decode("utf-8") if obj_name else "opt"
 
-    # Detect whether the consequence is a `return opt.get();` shape — then map/getOrElse fits.
-    # Otherwise (statement-style consumer), forEach is the right hint.
-    ignored = ("line_comment", "block_comment")
-    is_return_shape = False
-    if consequence is not None:
-        if consequence.type == "block":
-            stmts = [c for c in consequence.named_children if c.type not in ignored]
-        else:
-            stmts = [consequence]
-        if len(stmts) == 1 and stmts[0].type == "return_statement":
-            is_return_shape = True
+    # `return opt.get();` shape — map/getOrElse fits. Otherwise (statement-style
+    # consumer), forEach is the right hint.
+    then_return = _single_return_stmt(consequence)
+    if then_return is None:
+        return dataclasses.replace(base, suggested_snippet=f"{var}.forEach(value -> {{ /* use value */ }});")
 
-    if is_return_shape:
-        default_text = "default"
-        if else_branch is not None:
-            if else_branch.type == "block":
-                else_stmts = [c for c in else_branch.named_children if c.type not in ignored]
-            else:
-                else_stmts = [else_branch]
-            if len(else_stmts) == 1 and else_stmts[0].type == "return_statement":
-                ret_children = [c for c in else_stmts[0].named_children if c.type not in ignored]
-                if ret_children and ret_children[0].text:
-                    default_text = ret_children[0].text.decode("utf-8")
-        snippet = f"return {var}.map(value -> value).getOrElse({default_text});"
-    else:
-        snippet = f"{var}.forEach(value -> {{ /* use value */ }});"
+    default_text = "default"
+    else_return = _single_return_stmt(else_branch)
+    if else_return is not None:
+        default_text = _return_expr_text(else_return) or default_text
 
+    # Derive the lambda body from the real then-branch expression (issue #74 #2):
+    # `return opt.get().toUpperCase();` becomes `.map(value -> value.toUpperCase())`.
+    # Mirrors the rewrite in fixes.fix_imperative_option_unwrap — duplicated rather
+    # than imported because analyzers must not depend on fixes (fixes already imports
+    # from analyzers; the reverse edge would create a cycle).
+    lambda_body = "value"
+    ret_text = _return_expr_text(then_return)
+    if ret_text is not None and ret_text != f"{var}.get()":
+        rewritten = re.sub(rf"\b{re.escape(var)}\.get\(\)", "value", ret_text)
+        # Keep the identity placeholder when no `var.get()` was found to rewrite —
+        # the shape isn't one we can synthesise safely.
+        if rewritten != ret_text:
+            lambda_body = rewritten
+
+    snippet = f"return {var}.map(value -> {lambda_body}).getOrElse({default_text});"
     return dataclasses.replace(base, suggested_snippet=snippet)
 
 

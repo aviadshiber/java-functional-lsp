@@ -8,7 +8,7 @@
 A Java Language Server that provides three things in one:
 
 1. **Full Java language support** — completions, hover, go-to-definition, compile errors, missing imports — by proxying [Eclipse jdtls](https://github.com/eclipse-jdtls/eclipse.jdt.ls) under the hood
-2. **16 functional programming rules** — catches anti-patterns and suggests Vavr/Lombok/Spring alternatives, all before compilation
+2. **17 functional programming rules** — catches anti-patterns and suggests Vavr/Lombok/Spring alternatives, all before compilation
 3. **Code actions (quick fixes)** — automated refactoring via LSP `textDocument/codeAction`, with machine-readable diagnostic metadata for AI agents
 
 Designed for teams using **Vavr**, **Lombok**, and **Spring** with a functional-first approach.
@@ -24,7 +24,7 @@ When [jdtls](https://github.com/eclipse-jdtls/eclipse.jdt.ls) is installed, the 
 - Type mismatches
 - Completions, hover, go-to-definition, find references
 
-Install jdtls separately: `brew install jdtls` (requires JDK 21+). The server auto-detects a Java 21+ installation even when the IDE's project SDK is older (e.g., Java 8) by probing `JDTLS_JAVA_HOME`, `JAVA_HOME`, `/usr/libexec/java_home -v 21+` (macOS), and `java` on PATH. Without jdtls, the server runs in standalone mode — the 16 custom rules still work, but you won't get compile errors or completions.
+Install jdtls separately: `brew install jdtls` (requires JDK 21+). The server auto-detects a Java 21+ installation even when the IDE's project SDK is older (e.g., Java 8) by probing `JDTLS_JAVA_HOME`, `JAVA_HOME`, `/usr/libexec/java_home -v 21+` (macOS), and `java` on PATH. Without jdtls, the server runs in standalone mode — the 17 custom rules still work, but you won't get compile errors or completions.
 
 ### Functional programming rules
 
@@ -38,14 +38,15 @@ Install jdtls separately: `brew install jdtls` (requires JDK 21+). The server au
 | `catch-rethrow` | catch block that wraps + rethrows | `Try.of().toEither()` | — |
 | `mutable-variable` | Local variable reassignment | Final variables + functional transforms | — |
 | `imperative-loop` | `for`/`while` loops | `.map()`/`.filter()`/`.flatMap()`/`.foldLeft()` | — |
-| `mutable-dto` | `@Data` or `@Setter` on class | `@Value` (immutable) | — |
-| `imperative-option-unwrap` | `if (opt.isDefined()) { opt.get() }` | `map()`/`flatMap()`/`fold()` | — |
+| `mutable-dto` | `@Data` or `@Setter` on class | `@Value` (immutable) | ✅ |
+| `imperative-option-unwrap` | `if (opt.isDefined()) { opt.get() }` | `map()`/`flatMap()`/`fold()` | ✅ |
 | `field-injection` | `@Autowired` on field | Constructor injection | — |
 | `component-annotation` | `@Component`/`@Service`/`@Repository` | `@Configuration` + `@Bean` | — |
 | `frozen-mutation` | Mutation on `List.of()`/`Collections.unmodifiable*` | `io.vavr.collection.List` | ✅ |
 | `null-check-to-monadic` | `if (x != null) { return x.foo(); }` | `Option.of(x).map(...)` | ✅ |
 | `try-catch-to-monadic` | `try { return x(); } catch (E e) { return d; }` | `Try.of(() -> x()).getOrElse(d)` | ✅ |
-| `impure-method` | Method mixing pure logic with side-effects | Extract pure logic; wrap IO in `Try` | — |
+| `impure-method` | Method mixing pure logic with side-effects | Extract pure logic; wrap IO in `Try` / return `Either.left` instead of throwing | — |
+| `option-map-nullable` | `Option.map(x -> x.get(k))` followed by chained call (`Some(null)` risk) | `.flatMap(x -> Option.of(...))` | — |
 
 ## Install
 
@@ -129,7 +130,30 @@ Add `lspServers` to `~/.claude/settings.json` (the plugin handles this automatic
 claude plugin add https://github.com/aviadshiber/java-functional-lsp.git
 ```
 
-This registers the LSP server, adds auto-install hooks, a PostToolUse hook that reminds Claude to fix violations on every `.java` file edit, and the `/lint-java` command.
+This registers the LSP server, adds auto-install hooks, a PostToolUse hook that lints every `.java` file after Edit/Write and feeds the violations back to Claude as context (plus a reminder hook on Read), and the `/lint-java` command.
+
+**Manual hook setup (without the plugin)** — add the lint hook to `~/.claude/settings.json`, pointing at a checkout of this repo:
+
+```json
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Edit|MultiEdit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 /path/to/java-functional-lsp/hooks/post_tool_lint.py",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+The hook is failure-safe: it only fires on `.java` files, lints just the edited file (well under 2s), stays silent when the file is clean, and always exits 0 so a linter problem can never break the editing session.
 
 Or manually add to your Claude Code config:
 
@@ -313,8 +337,10 @@ The server provides LSP code actions (`textDocument/codeAction`) that automatica
 | `null-check-to-monadic` | Convert to Option monadic flow | Rewrites `if (x != null) { return x.foo(); }` → `Option.of(x).map(...)`, supports chained fallbacks via `.orElse()`, adds import |
 | `null-return` | Replace with Option.none() | Rewrites `return null` → `return Option.none()`, adds import |
 | `try-catch-to-monadic` | Convert try/catch to Try monadic flow | Rewrites `try { return expr; } catch (E e) { return default; }` → `Try.of(() -> expr).getOrElse(default)`. Supports 3 patterns: simple default (eager/lazy `.getOrElse`), logging + default (`.onFailure().getOrElse`), and exception-dependent recovery (`.recover(E.class, ...).get()`). Skips try-with-resources, finally, multi-catch, and union types. Adds import. |
+| `imperative-option-unwrap` | Convert to Option.map().getOrElse() | Rewrites `if (opt.isDefined()) return opt.get(); else return X;` → `return opt.map(it -> ...).getOrElse(X);` (lazy `getOrElse(() -> ...)` for non-eager defaults). Bails on missing else or complex bodies. |
+| `mutable-dto` | Replace @Data with @Value | Replaces the `@Data` annotation with `@Value` and adds `import lombok.Value`. Skips `@Setter`, `@ConfigurationProperties`, and conflicting Lombok constructor annotations. |
 
-Quick fixes automatically add the required Vavr import if it's not already present. Disable auto-import with `"autoImportVavr": false` in config.
+Quick fixes automatically add the required Vavr import if it's not already present. Disable auto-import with `"autoImportVavr": false` in config (`"autoImportLombok": false` for the Lombok import added by the `mutable-dto` fix).
 
 ## Agent mode (AI integration)
 
@@ -327,12 +353,14 @@ Every diagnostic includes a machine-readable `data` payload designed for AI agen
   "data": {
     "fixType": "REPLACE_WITH_VAVR_LIST",
     "targetLibrary": "io.vavr.collection.List",
-    "rationale": "Runtime mutation of List.of() causes UnsupportedOperationException. Use Vavr for safe, persistent immutability."
+    "rationale": "Runtime mutation of List.of() causes UnsupportedOperationException. Use Vavr for safe, persistent immutability.",
+    "recommendedApi": ".append / .appendAll / .update / .remove (returns a new persistent collection)",
+    "suggestedSnippet": "list = list.append(\"c\");  // returns a new persistent collection"
   }
 }
 ```
 
-This lets agents confidently apply fixes without guessing libraries or patterns — the `fixType` tells them *what* to do, `targetLibrary` tells them *which dependency*, and `rationale` tells them *why*.
+This lets agents confidently apply fixes without guessing libraries or patterns — the `fixType` tells them *what* to do, `targetLibrary` tells them *which dependency*, and `rationale` tells them *why*. `recommendedApi` names the exact method on the target library (e.g. Vavr `Option` uses `forEach`, **not** `ifPresent`) and `suggestedSnippet` is a paste-able fix built from the real AST variable names.
 
 **Agent mode configuration** in `.java-functional-lsp.json`:
 
@@ -346,6 +374,7 @@ This lets agents confidently apply fixes without guessing libraries or patterns 
 | Key | Default | Effect |
 |-----|---------|--------|
 | `autoImportVavr` | `true` | Quick fixes auto-add Vavr/Option imports |
+| `autoImportLombok` | `true` | The `mutable-dto` quick fix auto-adds `import lombok.Value` |
 | `strictPurity` | `false` | When `true`, `impure-method` uses WARNING severity instead of HINT |
 
 > **Note:** The machine-readable `data` payload is always included in diagnostics when available — no configuration needed.

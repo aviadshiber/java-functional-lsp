@@ -186,6 +186,50 @@ class TestMutationCheckerData:
         assert "myOpt" in snippet  # real variable name from AST
         assert '"fallback"' in snippet  # real default value from AST
 
+    def test_imperative_option_unwrap_snippet_uses_real_mapped_expression(self) -> None:
+        """Issue #74 #2: the then-branch expression appears in the lambda body, not a
+        `value -> value` placeholder — `myOpt.get().toUpperCase()` becomes
+        `.map(value -> value.toUpperCase())`."""
+        source = b"""
+        class T {
+            String f(Option<String> myOpt) {
+                if (myOpt.isDefined()) {
+                    return myOpt.get().toUpperCase();
+                } else {
+                    return "x";
+                }
+            }
+        }
+        """
+        diags = parse_and_analyze(MutationChecker(), source)
+        unwrap = next(d for d in diags if d.code == "imperative-option-unwrap")
+        assert unwrap.data is not None
+        snippet = unwrap.data.suggested_snippet
+        assert snippet is not None
+        assert "value -> value.toUpperCase()" in snippet
+        assert "value -> value)" not in snippet
+
+    def test_imperative_option_unwrap_snippet_keeps_placeholder_when_get_absent(self) -> None:
+        """When the then-branch return doesn't contain `var.get()`, the rewrite can't be
+        synthesised safely — keep the identity placeholder rather than guessing."""
+        source = b"""
+        class T {
+            String f(Option<String> myOpt) {
+                if (myOpt.isDefined()) {
+                    return "found";
+                } else {
+                    return "missing";
+                }
+            }
+        }
+        """
+        diags = parse_and_analyze(MutationChecker(), source)
+        unwraps = [d for d in diags if d.code == "imperative-option-unwrap"]
+        if unwraps:  # rule may legitimately not fire when the body never touches the Option
+            assert unwraps[0].data is not None
+            snippet = unwraps[0].data.suggested_snippet
+            assert snippet is None or "value -> value)" in snippet
+
     def test_mutable_dto_has_recommended_api(self) -> None:
         """Issue #74 #1: mutable-dto carries the @Value recommendation."""
         source = b"@Data class Foo { private String name; }"
