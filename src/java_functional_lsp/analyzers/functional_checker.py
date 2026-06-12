@@ -16,7 +16,9 @@ from .base import (
     extract_null_check_var,
     find_nodes,
     find_nodes_multi,
+    rewrite_var_references,
     severity_from_config,
+    single_return_expr_text,
 )
 
 _MESSAGES = {
@@ -216,21 +218,21 @@ def _build_null_check_to_monadic_data(
         return base
     var = var_name.decode("utf-8")
 
-    then_expr = _single_return_expr_text(consequence)
+    then_expr = single_return_expr_text(consequence)
     if then_expr is None:
         return base
-    # Rewrite references to the checked variable as `it` in the lambda body. Use a word-boundary
-    # regex so a short var name like `s` doesn't match `s.toString()` inside another identifier.
-    # Skip the map when the body is exactly the variable itself (identity case).
+    # Rewrite references to the checked variable as `it` in the lambda body ($-aware
+    # identifier boundaries, so a short var name like `s` doesn't match inside `$s` or
+    # `safe`). Skip the map when the body is exactly the variable itself (identity case).
     if then_expr == var:
         chain_body = f"Option.of({var})"
     else:
-        lambda_body = re.sub(rf"\b{re.escape(var)}\b", "it", then_expr)
+        lambda_body = rewrite_var_references(then_expr, var, "it")
         chain_body = f"Option.of({var}).map(it -> {lambda_body})"
 
     # Prefer the nested else-branch; otherwise look at the statement immediately following the if
     # (a common fallthrough pattern: `if (x != null) return ...; return fallback;`).
-    else_expr = _single_return_expr_text(alternative)
+    else_expr = single_return_expr_text(alternative)
     if else_expr is None and if_node is not None:
         else_expr = _next_statement_return_expr(if_node)
 
@@ -257,25 +259,7 @@ def _next_statement_return_expr(if_node: Node) -> str | None:
     if idx + 1 >= len(siblings):
         return None
     next_stmt = siblings[idx + 1]
-    return _single_return_expr_text(next_stmt)
-
-
-def _single_return_expr_text(block_or_stmt: Node | None) -> str | None:
-    """Return the text of a single ``return <expr>;`` statement in a block (or the statement
-    itself). Returns None for anything else (multiple statements, no return, bare return)."""
-    if block_or_stmt is None:
-        return None
-    if block_or_stmt.type == "block":
-        stmts = [c for c in block_or_stmt.named_children if c.type not in ("line_comment", "block_comment")]
-    else:
-        stmts = [block_or_stmt]
-    if len(stmts) != 1 or stmts[0].type != "return_statement":
-        return None
-    ret_children = [c for c in stmts[0].named_children if c.type not in ("line_comment", "block_comment")]
-    if not ret_children or not ret_children[0].text:
-        return None
-    decoded: str = ret_children[0].text.decode("utf-8")
-    return decoded
+    return single_return_expr_text(next_stmt)
 
 
 # Module-scope so it's allocated once at import rather than per diagnostic.
@@ -592,7 +576,7 @@ class FunctionalChecker:
 
         Unlike java.util.Optional, Vavr's Option.map() wraps a null mapper result as
         Some(null); a following .filter()/.map()/etc. then NPEs on the value (issue #69).
-        Detection requires all three gates:
+        Detection requires all three gates (ordered cheapest-first, measured):
           1. the .map(...) has a value-consuming follower chained after it,
           2. the receiver chain is rooted in a literal Option.of()/Option.ofOptional(),
           3. the map argument is a single-expression lambda matching a known
@@ -618,6 +602,8 @@ class FunctionalChecker:
                 continue
 
             # Gate 2: receiver chain rooted in Option.of(...) / Option.ofOptional(...).
+            # Measured cheaper than the lambda-shape gate (~3x on fluent-heavy code):
+            # most chains terminate the walk after one step at a bare identifier.
             if not _chain_rooted_in_option(invocation.child_by_field_name("object")):
                 continue
 

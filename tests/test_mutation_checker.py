@@ -209,6 +209,27 @@ class TestMutationCheckerData:
         assert "value -> value.toUpperCase()" in snippet
         assert "value -> value)" not in snippet
 
+    def test_imperative_option_unwrap_snippet_handles_dollar_identifier(self) -> None:
+        """Regression: regex \\b never matches before $-prefixed Java identifiers, which
+        silently dropped the real transformation from the snippet."""
+        source = b"""
+        class T {
+            String f(Option<String> $opt) {
+                if ($opt.isDefined()) {
+                    return $opt.get().trim();
+                } else {
+                    return "x";
+                }
+            }
+        }
+        """
+        diags = parse_and_analyze(MutationChecker(), source)
+        unwrap = next(d for d in diags if d.code == "imperative-option-unwrap")
+        assert unwrap.data is not None
+        snippet = unwrap.data.suggested_snippet
+        assert snippet is not None
+        assert "value -> value.trim()" in snippet
+
     def test_imperative_option_unwrap_snippet_keeps_placeholder_when_get_absent(self) -> None:
         """When the then-branch return doesn't contain `var.get()`, the rewrite can't be
         synthesised safely — keep the identity placeholder rather than guessing."""

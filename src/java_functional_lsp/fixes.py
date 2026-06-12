@@ -21,6 +21,9 @@ from .analyzers.base import (
     get_parser,
     has_error_or_missing,
     references_var,
+    return_expr_node,
+    rewrite_var_get_call,
+    single_return_stmt,
 )
 from .analyzers.functional_checker import is_side_effect_invocation
 
@@ -1011,46 +1014,37 @@ def fix_imperative_option_unwrap(
     var = var_name.decode("utf-8")
 
     # Consequence must be a block with exactly: `return <var>.get();` (or similar shape).
-    cons_stmts = (
-        [c for c in consequence.named_children if c.type not in IGNORED_CHILDREN]
-        if consequence.type == "block"
-        else [consequence]
-    )
-    if len(cons_stmts) != 1 or cons_stmts[0].type != "return_statement":
+    cons_return = single_return_stmt(consequence)
+    if cons_return is None:
         return None
-    ret_children = [c for c in cons_stmts[0].named_children if c.type not in IGNORED_CHILDREN]
-    if not ret_children:
+    ret_expr = return_expr_node(cons_return)
+    if ret_expr is None:
         return None
-    ret_expr = ret_children[0]
     # Map the returned expression to a lambda body. If it's literally `var.get()`, the lambda
-    # is the identity `it -> it`; otherwise rewrite occurrences of `var` to `it`.
+    # is the identity `it -> it`; otherwise rewrite occurrences of `var.get()` to `it`.
     ret_text = ret_expr.text.decode("utf-8") if ret_expr.text else var
     if ret_text == f"{var}.get()":
         lambda_body = "it"
     else:
-        pattern = re.compile(rf"\b{re.escape(var)}\.get\(\)")
-        lambda_body = pattern.sub("it", ret_text)
+        rewritten = rewrite_var_get_call(ret_text, var, "it")
         # If the rewrite did nothing (no .get() call to replace), bail — shape isn't safe.
-        if lambda_body == ret_text:
+        if rewritten is None:
             return None
+        lambda_body = rewritten
 
     # Alternative (else) must be a single return statement. Bail when absent — without an
     # else-return, `return opt.map(it -> it);` returns Option<T> rather than T, breaking the
     # method's return type.
     if alternative is None:
         return None
-    alt_stmts = (
-        [c for c in alternative.named_children if c.type not in IGNORED_CHILDREN]
-        if alternative.type == "block"
-        else [alternative]
-    )
-    if len(alt_stmts) != 1 or alt_stmts[0].type != "return_statement":
+    alt_return = single_return_stmt(alternative)
+    if alt_return is None:
         return None
-    alt_ret = [c for c in alt_stmts[0].named_children if c.type not in IGNORED_CHILDREN]
-    if not alt_ret:
+    alt_expr = return_expr_node(alt_return)
+    if alt_expr is None:
         return None
-    alt_text = alt_ret[0].text.decode("utf-8") if alt_ret[0].text else "null"
-    if _is_eager(alt_ret[0]):
+    alt_text = alt_expr.text.decode("utf-8") if alt_expr.text else "null"
+    if _is_eager(alt_expr):
         or_else = f".getOrElse({alt_text})"
     else:
         or_else = f".getOrElse(() -> {alt_text})"

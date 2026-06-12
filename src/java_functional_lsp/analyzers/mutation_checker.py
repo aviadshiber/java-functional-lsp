@@ -3,18 +3,20 @@
 from __future__ import annotations
 
 import dataclasses
-import re
 from typing import Any
 
 from .base import (
-    IGNORED_CHILDREN,
     Diagnostic,
     DiagnosticData,
     find_nodes,
     find_nodes_multi,
     has_ancestor,
     has_sibling_annotation,
+    return_expr_text,
+    rewrite_var_get_call,
     severity_from_config,
+    single_return_expr_text,
+    single_return_stmt,
 )
 
 _MESSAGES = {
@@ -71,28 +73,6 @@ def _build_mutable_dto_data(class_decl: Any) -> DiagnosticData:
     return dataclasses.replace(base, suggested_snippet=snippet)
 
 
-def _single_return_stmt(branch: Any) -> Any | None:
-    """Return the lone return_statement of a branch (block or bare statement), else None."""
-    if branch is None:
-        return None
-    if branch.type == "block":
-        stmts = [c for c in branch.named_children if c.type not in IGNORED_CHILDREN]
-    else:
-        stmts = [branch]
-    if len(stmts) != 1 or stmts[0].type != "return_statement":
-        return None
-    return stmts[0]
-
-
-def _return_expr_text(return_stmt: Any) -> str | None:
-    """Return the expression text of a `return <expr>;` statement, else None."""
-    children = [c for c in return_stmt.named_children if c.type not in IGNORED_CHILDREN]
-    if not children or not children[0].text:
-        return None
-    text: str = children[0].text.decode("utf-8")
-    return text
-
-
 def _build_imperative_option_unwrap_data(obj_name: bytes, consequence: Any, else_branch: Any) -> DiagnosticData:
     """Build a DiagnosticData carrying a concrete snippet for imperative Option unwrap.
 
@@ -104,28 +84,21 @@ def _build_imperative_option_unwrap_data(obj_name: bytes, consequence: Any, else
 
     # `return opt.get();` shape — map/getOrElse fits. Otherwise (statement-style
     # consumer), forEach is the right hint.
-    then_return = _single_return_stmt(consequence)
+    then_return = single_return_stmt(consequence)
     if then_return is None:
         return dataclasses.replace(base, suggested_snippet=f"{var}.forEach(value -> {{ /* use value */ }});")
 
-    default_text = "default"
-    else_return = _single_return_stmt(else_branch)
-    if else_return is not None:
-        default_text = _return_expr_text(else_return) or default_text
+    default_text = single_return_expr_text(else_branch) or "default"
 
     # Derive the lambda body from the real then-branch expression (issue #74 #2):
-    # `return opt.get().toUpperCase();` becomes `.map(value -> value.toUpperCase())`.
-    # Mirrors the rewrite in fixes.fix_imperative_option_unwrap — duplicated rather
-    # than imported because analyzers must not depend on fixes (fixes already imports
-    # from analyzers; the reverse edge would create a cycle).
+    # `return opt.get().toUpperCase();` becomes `.map(value -> value.toUpperCase())` —
+    # the same rewrite fixes.fix_imperative_option_unwrap applies, via the shared
+    # base helper. Keep the identity placeholder when no `var.get()` was found to
+    # rewrite — the shape isn't one we can synthesise safely.
     lambda_body = "value"
-    ret_text = _return_expr_text(then_return)
+    ret_text = return_expr_text(then_return)
     if ret_text is not None and ret_text != f"{var}.get()":
-        rewritten = re.sub(rf"\b{re.escape(var)}\.get\(\)", "value", ret_text)
-        # Keep the identity placeholder when no `var.get()` was found to rewrite —
-        # the shape isn't one we can synthesise safely.
-        if rewritten != ret_text:
-            lambda_body = rewritten
+        lambda_body = rewrite_var_get_call(ret_text, var, "value") or lambda_body
 
     snippet = f"return {var}.map(value -> {lambda_body}).getOrElse({default_text});"
     return dataclasses.replace(base, suggested_snippet=snippet)

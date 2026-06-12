@@ -9,6 +9,11 @@ from java_functional_lsp.analyzers.base import (
     has_ancestor,
     has_sibling_annotation,
     is_excluded,
+    return_expr_text,
+    rewrite_var_get_call,
+    rewrite_var_references,
+    single_return_expr_text,
+    single_return_stmt,
 )
 
 
@@ -155,3 +160,61 @@ class TestHasSiblingAnnotation:
             name = node.child_by_field_name("name")
             if name and name.text == b"Setter" and node.parent:
                 assert not has_sibling_annotation(node.parent, b"ConfigurationProperties")
+
+
+class TestReturnExtractionHelpers:
+    """Shared single-return extraction helpers (consolidated from analyzers/fixes)."""
+
+    def _if_branches(self, body: str):
+        tree = _parse(f"class T {{ String f(Option<String> opt) {{ {body} }} }}")
+        if_node = next(find_nodes(tree.root_node, "if_statement"))
+        return if_node.child_by_field_name("consequence"), if_node.child_by_field_name("alternative")
+
+    def test_single_return_stmt_block(self):
+        cons, _ = self._if_branches('if (opt.isDefined()) { return opt.get(); } else { return "x"; }')
+        stmt = single_return_stmt(cons)
+        assert stmt is not None
+        assert stmt.type == "return_statement"
+
+    def test_single_return_stmt_rejects_multi_statement_block(self):
+        cons, _ = self._if_branches('if (opt.isDefined()) { log(); return opt.get(); } else { return "x"; }')
+        assert single_return_stmt(cons) is None
+
+    def test_single_return_stmt_none_branch(self):
+        assert single_return_stmt(None) is None
+
+    def test_return_expr_text_bare_return_is_none(self):
+        cons, _ = self._if_branches('if (opt.isDefined()) { return; } else { return "x"; }')
+        stmt = single_return_stmt(cons)
+        assert stmt is not None
+        assert return_expr_text(stmt) is None
+
+    def test_single_return_expr_text_extracts_expression(self):
+        cons, alt = self._if_branches('if (opt.isDefined()) { return opt.get().trim(); } else { return "x"; }')
+        assert single_return_expr_text(cons) == "opt.get().trim()"
+        assert single_return_expr_text(alt) == '"x"'
+
+
+class TestIdentifierRewriteHelpers:
+    def test_rewrite_var_get_call_basic(self):
+        assert rewrite_var_get_call("myOpt.get().trim()", "myOpt", "value") == "value.trim()"
+
+    def test_rewrite_var_get_call_no_match_returns_none(self):
+        assert rewrite_var_get_call('"constant"', "myOpt", "value") is None
+
+    def test_rewrite_var_get_call_tolerates_whitespace(self):
+        """`opt .get ()` is valid Java; the rewrite must not silently miss it."""
+        assert rewrite_var_get_call("myOpt .get() .trim()", "myOpt", "value") == "value .trim()"
+
+    def test_rewrite_var_get_call_dollar_identifier(self):
+        """Regression: regex \\b never matches before $-prefixed Java identifiers."""
+        assert rewrite_var_get_call("$opt.get().trim()", "$opt", "value") == "value.trim()"
+
+    def test_rewrite_var_get_call_does_not_match_inside_longer_identifier(self):
+        assert rewrite_var_get_call("myOpt2.get()", "myOpt", "value") is None
+        assert rewrite_var_get_call("$myOpt.get()", "myOpt", "value") is None
+
+    def test_rewrite_var_references_dollar_adjacent(self):
+        # `s` must not be rewritten inside the distinct identifier `$s` or `s$x`.
+        assert rewrite_var_references("$s.concat(s)", "s", "it") == "$s.concat(it)"
+        assert rewrite_var_references("s$x + s", "s", "it") == "s$x + it"
