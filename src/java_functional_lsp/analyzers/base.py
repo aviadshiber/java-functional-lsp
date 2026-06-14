@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import fnmatch
+import re
 from collections.abc import Generator
 from dataclasses import dataclass
 from enum import IntEnum
@@ -177,6 +178,73 @@ def references_var(node: Node, var_name: bytes) -> bool:
         elif not cursor.goto_parent():
             break
     return False
+
+
+def single_return_stmt(branch: Node | None) -> Node | None:
+    """Return the lone ``return_statement`` of a branch, or None.
+
+    Accepts a block (filters comments, requires exactly one statement) or a bare
+    statement. Shared by analyzers and fix generators that rewrite
+    ``if (...) return X;`` shapes.
+    """
+    if branch is None:
+        return None
+    if branch.type == "block":
+        stmts = [c for c in branch.named_children if c.type not in IGNORED_CHILDREN]
+    else:
+        stmts = [branch]
+    if len(stmts) != 1 or stmts[0].type != "return_statement":
+        return None
+    return stmts[0]
+
+
+def return_expr_node(return_stmt: Node) -> Node | None:
+    """Return the expression node of a ``return <expr>;`` statement, or None for a bare return."""
+    children = [c for c in return_stmt.named_children if c.type not in IGNORED_CHILDREN]
+    if not children:
+        return None
+    return children[0]
+
+
+def return_expr_text(return_stmt: Node) -> str | None:
+    """Return the expression text of a ``return <expr>;`` statement, or None for a bare return."""
+    expr = return_expr_node(return_stmt)
+    if expr is None or expr.text is None:
+        return None
+    decoded: str = expr.text.decode("utf-8")
+    return decoded
+
+
+def single_return_expr_text(branch: Node | None) -> str | None:
+    """Text of the expression in a branch that is exactly ``return <expr>;``, else None."""
+    stmt = single_return_stmt(branch)
+    if stmt is None:
+        return None
+    return return_expr_text(stmt)
+
+
+# Java identifiers may contain `$`, which regex `\b` treats as a non-word character:
+# `\b\$opt` never matches, and `\bopt` falsely matches inside `$opt`. These lookarounds
+# treat `$` as part of the identifier alphabet so both failure modes are excluded.
+_IDENT_BOUNDARY_START = r"(?<![\w$])"
+_IDENT_BOUNDARY_END = r"(?![\w$])"
+
+
+def rewrite_var_get_call(text: str, var_name: str, replacement: str) -> str | None:
+    """Rewrite ``var_name.get()`` calls in ``text`` to ``replacement``.
+
+    Tolerates whitespace around the ``.`` and parens (``opt .get ()`` is valid Java).
+    Returns None when nothing was rewritten — callers treat that as "this shape
+    can't be synthesised safely" and fall back to a placeholder or bail out.
+    """
+    pattern = re.compile(rf"{_IDENT_BOUNDARY_START}{re.escape(var_name)}\s*\.\s*get\s*\(\s*\)")
+    rewritten = pattern.sub(replacement, text)
+    return rewritten if rewritten != text else None
+
+
+def rewrite_var_references(text: str, var_name: str, replacement: str) -> str:
+    """Rewrite standalone references to ``var_name`` in ``text`` to ``replacement``."""
+    return re.sub(rf"{_IDENT_BOUNDARY_START}{re.escape(var_name)}{_IDENT_BOUNDARY_END}", replacement, text)
 
 
 def has_error_or_missing(node: Node) -> bool:

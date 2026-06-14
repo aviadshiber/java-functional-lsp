@@ -73,7 +73,7 @@ Project-level rules are configured via `.java-functional-lsp.json` in your proje
 
 ## Coexistence with IntelliJ's Java Support
 
-The server automatically detects JetBrains IDEs and disables the jdtls proxy — IntelliJ provides its own Java language features (completions, hover, go-to-definition, compile errors). Only the 16 custom functional programming rules run, and they appear alongside IntelliJ's built-in inspections.
+The server automatically detects JetBrains IDEs and disables the jdtls proxy — IntelliJ provides its own Java language features (completions, hover, go-to-definition, compile errors). Only the 17 custom functional programming rules run, and they appear alongside IntelliJ's built-in inspections.
 
 ## Troubleshooting
 

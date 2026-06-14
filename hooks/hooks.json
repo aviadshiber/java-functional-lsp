@@ -15,11 +15,21 @@
     ],
     "PostToolUse": [
       {
-        "matcher": "Read|Edit|Write",
+        "matcher": "Read",
         "hooks": [
           {
             "type": "command",
             "command": "python3 ${CLAUDE_PLUGIN_ROOT}/hooks/java_linter_reminder.py"
+          }
+        ]
+      },
+      {
+        "matcher": "Edit|MultiEdit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 ${CLAUDE_PLUGIN_ROOT}/hooks/post_tool_lint.py",
+            "timeout": 10
           }
         ]
       }

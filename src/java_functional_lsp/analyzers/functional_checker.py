@@ -9,13 +9,16 @@ from typing import Any, Literal
 from tree_sitter import Node, Tree
 
 from .base import (
+    IGNORED_CHILDREN,
     Diagnostic,
     DiagnosticData,
     Severity,
     extract_null_check_var,
     find_nodes,
     find_nodes_multi,
+    rewrite_var_references,
     severity_from_config,
+    single_return_expr_text,
 )
 
 _MESSAGES = {
@@ -31,6 +34,11 @@ _MESSAGES = {
     "impure-method-throw": (
         "Hidden side-effect: Method mixes pure logic with exceptions. "
         "Extract pure logic; return Either.left(...) or Try.failure(...) instead of throwing."
+    ),
+    "option-map-nullable": (
+        "Possible Some(null): Vavr Option.map() does not collapse null to None "
+        "(unlike java.util.Optional). The mapper may return null (e.g. Map.get), "
+        "so the chained call can NPE. Use .flatMap(x -> Option.of(...)) instead."
     ),
 }
 
@@ -75,7 +83,123 @@ _DATA = {
         ),
         recommended_api="Either.left(...) / Try.of(() -> ...)",
     ),
+    "option-map-nullable": DiagnosticData(
+        fix_type="USE_FLATMAP_OPTION_OF",
+        target_library="io.vavr.control.Option",
+        rationale=(
+            "Vavr Option.map(f) wraps a null result as Some(null) rather than None. "
+            "Wrap the nullable expression with Option.of inside flatMap so absence "
+            "propagates as None."
+        ),
+        recommended_api=".flatMap(x -> Option.of(...))",
+    ),
 }
+
+
+def _build_option_map_nullable_data(lambda_node: Node) -> DiagnosticData:
+    """Build a flatMap snippet using the real lambda parameter and body text.
+
+    Produces e.g. ``.flatMap(m -> Option.of(m.get("author")))`` from the offending
+    ``.map(m -> m.get("author"))``. The parameter text is reused verbatim, so
+    ``m``, ``(m)``, and typed ``(Map m)`` forms all yield valid Java.
+    """
+    base = _DATA["option-map-nullable"]
+    params = lambda_node.child_by_field_name("parameters")
+    body = lambda_node.child_by_field_name("body")
+    if params is None or body is None or params.text is None or body.text is None:
+        return base
+    param_text = params.text.decode("utf-8")
+    body_text = body.text.decode("utf-8")
+    snippet = f".flatMap({param_text} -> Option.of({body_text}))"
+    return dataclasses.replace(base, suggested_snippet=snippet)
+
+
+# Option factory roots that start a Vavr Option chain. Deliberately excludes
+# "Optional" (java.util) — its map() collapses null to empty, so no Some(null) hazard.
+_OPTION_FACTORY_NAMES = {b"of", b"ofOptional"}
+
+# Chained methods whose callback/predicate receives the mapped value and will NPE
+# (or misbehave) on Some(null). Conservative: terminal extractors like getOrElse
+# and getOrNull never dereference the value, so they are excluded.
+_NULL_SENSITIVE_FOLLOWERS = {b"filter", b"map", b"flatMap", b"forEach", b"peek", b"exists", b"forAll"}
+
+# Bound on receiver-chain walking, mirroring _MAX_CHAIN_DEPTH in fixes.py.
+_MAX_OPTION_CHAIN_DEPTH = 10
+
+# Integer-literal argument types: x.get(0) on a java.util.List throws rather than
+# returning null, so index access is not a Some(null) hazard. All four Java integer
+# literal forms — tree-sitter emits a distinct node type per radix.
+_INTEGER_LITERAL_TYPES = (
+    "decimal_integer_literal",
+    "hex_integer_literal",
+    "octal_integer_literal",
+    "binary_integer_literal",
+)
+
+
+def _single_lambda_arg(invocation: Node) -> Node | None:
+    """Return the lone lambda_expression argument of a method_invocation, or None.
+
+    Method references like ``.map(Map::get)`` are deliberately skipped: there is no
+    parameter name to build a snippet from, and they are rare in this position.
+    """
+    args = invocation.child_by_field_name("arguments")
+    if args is None:
+        return None
+    named = [c for c in args.named_children if c.type not in IGNORED_CHILDREN]
+    if len(named) != 1 or named[0].type != "lambda_expression":
+        return None
+    return named[0]
+
+
+def _is_nullable_lambda_body(lambda_node: Node) -> bool:
+    """Conservative nullability heuristic for a .map() lambda body.
+
+    Matches exactly ``recv.get(arg, ...)`` with at least one non-integer argument —
+    the Map.get(key) / JsonNode.get(name) shape from issue #69. Zero-arg ``.get()``
+    (Vavr Option.get / Supplier.get) and integer-index ``List.get(0)`` are excluded.
+    Broader heuristics (getters without @NonNull, methods lacking @Nonnull) are
+    future work; this shape covers the real-world NPE incidents with no false
+    positives on non-nullable lambdas.
+    """
+    body = lambda_node.child_by_field_name("body")
+    if body is None or body.type != "method_invocation":
+        return False
+    name = body.child_by_field_name("name")
+    obj = body.child_by_field_name("object")
+    if name is None or name.text != b"get" or obj is None:
+        return False
+    args = body.child_by_field_name("arguments")
+    if args is None:
+        return False
+    named = [c for c in args.named_children if c.type not in IGNORED_CHILDREN]
+    if not named:
+        return False
+    return not all(a.type in _INTEGER_LITERAL_TYPES for a in named)
+
+
+def _chain_rooted_in_option(node: Node | None) -> bool:
+    """Walk a receiver chain looking for Option.of(...) / Option.ofOptional(...) at the root.
+
+    Bare-variable receivers return False: tree-sitter has no type info, so a variable
+    typed Option<T> cannot be distinguished from java.util.Optional — staying quiet
+    keeps the rule free of false positives.
+    """
+    depth = 0
+    while node is not None and depth < _MAX_OPTION_CHAIN_DEPTH:
+        if node.type != "method_invocation":
+            return False
+        obj = node.child_by_field_name("object")
+        name = node.child_by_field_name("name")
+        if obj is not None and name is not None and name.text in _OPTION_FACTORY_NAMES:
+            # `Option.of(...)` (identifier) or `io.vavr.control.Option.of(...)` (field_access)
+            if obj.type == "identifier" and obj.text == b"Option":
+                return True
+            if obj.type == "field_access" and obj.text is not None and obj.text.endswith(b".Option"):
+                return True
+        node = obj
+        depth += 1
+    return False
 
 
 def _build_null_check_to_monadic_data(
@@ -94,21 +218,21 @@ def _build_null_check_to_monadic_data(
         return base
     var = var_name.decode("utf-8")
 
-    then_expr = _single_return_expr_text(consequence)
+    then_expr = single_return_expr_text(consequence)
     if then_expr is None:
         return base
-    # Rewrite references to the checked variable as `it` in the lambda body. Use a word-boundary
-    # regex so a short var name like `s` doesn't match `s.toString()` inside another identifier.
-    # Skip the map when the body is exactly the variable itself (identity case).
+    # Rewrite references to the checked variable as `it` in the lambda body ($-aware
+    # identifier boundaries, so a short var name like `s` doesn't match inside `$s` or
+    # `safe`). Skip the map when the body is exactly the variable itself (identity case).
     if then_expr == var:
         chain_body = f"Option.of({var})"
     else:
-        lambda_body = re.sub(rf"\b{re.escape(var)}\b", "it", then_expr)
+        lambda_body = rewrite_var_references(then_expr, var, "it")
         chain_body = f"Option.of({var}).map(it -> {lambda_body})"
 
     # Prefer the nested else-branch; otherwise look at the statement immediately following the if
     # (a common fallthrough pattern: `if (x != null) return ...; return fallback;`).
-    else_expr = _single_return_expr_text(alternative)
+    else_expr = single_return_expr_text(alternative)
     if else_expr is None and if_node is not None:
         else_expr = _next_statement_return_expr(if_node)
 
@@ -135,25 +259,7 @@ def _next_statement_return_expr(if_node: Node) -> str | None:
     if idx + 1 >= len(siblings):
         return None
     next_stmt = siblings[idx + 1]
-    return _single_return_expr_text(next_stmt)
-
-
-def _single_return_expr_text(block_or_stmt: Node | None) -> str | None:
-    """Return the text of a single ``return <expr>;`` statement in a block (or the statement
-    itself). Returns None for anything else (multiple statements, no return, bare return)."""
-    if block_or_stmt is None:
-        return None
-    if block_or_stmt.type == "block":
-        stmts = [c for c in block_or_stmt.named_children if c.type not in ("line_comment", "block_comment")]
-    else:
-        stmts = [block_or_stmt]
-    if len(stmts) != 1 or stmts[0].type != "return_statement":
-        return None
-    ret_children = [c for c in stmts[0].named_children if c.type not in ("line_comment", "block_comment")]
-    if not ret_children or not ret_children[0].text:
-        return None
-    decoded: str = ret_children[0].text.decode("utf-8")
-    return decoded
+    return single_return_expr_text(next_stmt)
 
 
 # Module-scope so it's allocated once at import rather than per diagnostic.
@@ -306,6 +412,7 @@ class FunctionalChecker:
 
         self._check_frozen_mutation(tree, diagnostics, config)
         self._check_null_check_to_monadic(tree, diagnostics, config)
+        self._check_option_map_nullable(tree, diagnostics, config)
         self._check_impure_method(tree, diagnostics, config)
 
         return diagnostics
@@ -463,6 +570,62 @@ class FunctionalChecker:
             elif not cursor.goto_parent():
                 break
         return False
+
+    def _check_option_map_nullable(self, tree: Tree, diagnostics: list[Diagnostic], config: dict[str, Any]) -> None:
+        """Detect Vavr Option chains where .map() can produce Some(null) before a chained call.
+
+        Unlike java.util.Optional, Vavr's Option.map() wraps a null mapper result as
+        Some(null); a following .filter()/.map()/etc. then NPEs on the value (issue #69).
+        Detection requires all three gates (ordered cheapest-first, measured):
+          1. the .map(...) has a value-consuming follower chained after it,
+          2. the receiver chain is rooted in a literal Option.of()/Option.ofOptional(),
+          3. the map argument is a single-expression lambda matching a known
+             possibly-null shape (``x.get(key)`` — Map.get / JsonNode.get).
+        """
+        severity = severity_from_config(config, "option-map-nullable")
+        if severity is None:
+            return
+
+        for invocation in find_nodes(tree.root_node, "method_invocation"):
+            name_node = invocation.child_by_field_name("name")
+            if name_node is None or name_node.text != b"map":
+                continue
+
+            # Gate 1: something chained after .map(...) consumes the mapped value.
+            parent = invocation.parent
+            if parent is None or parent.type != "method_invocation":
+                continue
+            if parent.child_by_field_name("object") != invocation:
+                continue
+            follower = parent.child_by_field_name("name")
+            if follower is None or follower.text not in _NULL_SENSITIVE_FOLLOWERS:
+                continue
+
+            # Gate 2: receiver chain rooted in Option.of(...) / Option.ofOptional(...).
+            # Measured cheaper than the lambda-shape gate (~3x on fluent-heavy code):
+            # most chains terminate the walk after one step at a bare identifier.
+            if not _chain_rooted_in_option(invocation.child_by_field_name("object")):
+                continue
+
+            # Gate 3: the lambda body is a possibly-null expression.
+            lambda_node = _single_lambda_arg(invocation)
+            if lambda_node is None or not _is_nullable_lambda_body(lambda_node):
+                continue
+
+            # Range = from the `map` identifier to the end of .map(...), not the whole
+            # chain — keeps the squiggle on the offending call, not Option.of(...).
+            diagnostics.append(
+                Diagnostic(
+                    line=name_node.start_point[0],
+                    col=name_node.start_point[1],
+                    end_line=invocation.end_point[0],
+                    end_col=invocation.end_point[1],
+                    severity=severity,
+                    code="option-map-nullable",
+                    message=_MESSAGES["option-map-nullable"],
+                    data=_build_option_map_nullable_data(lambda_node),
+                )
+            )
 
     def _check_impure_method(self, tree: Tree, diagnostics: list[Diagnostic], config: dict[str, Any]) -> None:
         """Detect methods mixing pure logic with side-effects.

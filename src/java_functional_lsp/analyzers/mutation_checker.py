@@ -12,7 +12,11 @@ from .base import (
     find_nodes_multi,
     has_ancestor,
     has_sibling_annotation,
+    return_expr_text,
+    rewrite_var_get_call,
     severity_from_config,
+    single_return_expr_text,
+    single_return_stmt,
 )
 
 _MESSAGES = {
@@ -78,33 +82,25 @@ def _build_imperative_option_unwrap_data(obj_name: bytes, consequence: Any, else
     base = _DATA["imperative-option-unwrap"]
     var = obj_name.decode("utf-8") if obj_name else "opt"
 
-    # Detect whether the consequence is a `return opt.get();` shape — then map/getOrElse fits.
-    # Otherwise (statement-style consumer), forEach is the right hint.
-    ignored = ("line_comment", "block_comment")
-    is_return_shape = False
-    if consequence is not None:
-        if consequence.type == "block":
-            stmts = [c for c in consequence.named_children if c.type not in ignored]
-        else:
-            stmts = [consequence]
-        if len(stmts) == 1 and stmts[0].type == "return_statement":
-            is_return_shape = True
+    # `return opt.get();` shape — map/getOrElse fits. Otherwise (statement-style
+    # consumer), forEach is the right hint.
+    then_return = single_return_stmt(consequence)
+    if then_return is None:
+        return dataclasses.replace(base, suggested_snippet=f"{var}.forEach(value -> {{ /* use value */ }});")
 
-    if is_return_shape:
-        default_text = "default"
-        if else_branch is not None:
-            if else_branch.type == "block":
-                else_stmts = [c for c in else_branch.named_children if c.type not in ignored]
-            else:
-                else_stmts = [else_branch]
-            if len(else_stmts) == 1 and else_stmts[0].type == "return_statement":
-                ret_children = [c for c in else_stmts[0].named_children if c.type not in ignored]
-                if ret_children and ret_children[0].text:
-                    default_text = ret_children[0].text.decode("utf-8")
-        snippet = f"return {var}.map(value -> value).getOrElse({default_text});"
-    else:
-        snippet = f"{var}.forEach(value -> {{ /* use value */ }});"
+    default_text = single_return_expr_text(else_branch) or "default"
 
+    # Derive the lambda body from the real then-branch expression (issue #74 #2):
+    # `return opt.get().toUpperCase();` becomes `.map(value -> value.toUpperCase())` —
+    # the same rewrite fixes.fix_imperative_option_unwrap applies, via the shared
+    # base helper. Keep the identity placeholder when no `var.get()` was found to
+    # rewrite — the shape isn't one we can synthesise safely.
+    lambda_body = "value"
+    ret_text = return_expr_text(then_return)
+    if ret_text is not None and ret_text != f"{var}.get()":
+        lambda_body = rewrite_var_get_call(ret_text, var, "value") or lambda_body
+
+    snippet = f"return {var}.map(value -> {lambda_body}).getOrElse({default_text});"
     return dataclasses.replace(base, suggested_snippet=snippet)
 
 
