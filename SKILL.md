@@ -1,13 +1,13 @@
 ---
 name: java-functional-lsp
-description: Java LSP with full language support (completions, hover, go-to-def, compile errors) plus 16 functional programming rules with automated quick fixes. Auto-invoke when setting up Java language support or discussing Java linting configuration.
+description: Java LSP with full language support (completions, hover, go-to-def, compile errors) plus 17 functional programming rules with automated quick fixes. Auto-invoke when setting up Java language support or discussing Java linting configuration.
 allowed-tools: Bash
 disable-model-invocation: true
 ---
 
 # Java Functional LSP
 
-A Java LSP server that wraps jdtls and adds 16 functional programming rules with code actions (quick fixes). Gives you **full Java language support** (completions, hover, go-to-def, compile errors) **plus** custom diagnostics with machine-readable metadata for AI agents — all before compilation.
+A Java LSP server that wraps jdtls and adds 17 functional programming rules with code actions (quick fixes). Gives you **full Java language support** (completions, hover, go-to-def, compile errors) **plus** custom diagnostics with machine-readable metadata for AI agents — all before compilation.
 
 ## Prerequisites
 
@@ -22,7 +22,7 @@ brew install jdtls
 
 Without jdtls, the server runs in standalone mode — custom rules still work, but no completions/hover/compile errors.
 
-## Rules (16 checks)
+## Rules (17 checks)
 
 | Rule | Detects | Suggests | Quick Fix |
 |------|---------|----------|-----------|
@@ -34,14 +34,15 @@ Without jdtls, the server runs in standalone mode — custom rules still work, b
 | `catch-rethrow` | catch wraps + rethrows | `Try.of().toEither()` | — |
 | `mutable-variable` | Variable reassignment | Final + functional transforms | — |
 | `imperative-loop` | `for`/`while` loops | `.map()`/`.filter()`/`.flatMap()` | — |
-| `mutable-dto` | `@Data` or `@Setter` | `@Value` (immutable) | — |
-| `imperative-option-unwrap` | `if (opt.isDefined()) { opt.get() }` | `map()`/`flatMap()`/`fold()` | — |
+| `mutable-dto` | `@Data` or `@Setter` | `@Value` (immutable) | ✅ |
+| `imperative-option-unwrap` | `if (opt.isDefined()) { opt.get() }` | `map()`/`flatMap()`/`fold()` | ✅ |
 | `field-injection` | `@Autowired` on field | Constructor injection | — |
 | `component-annotation` | `@Component`/`@Service`/`@Repository` | `@Configuration` + `@Bean` | — |
 | `frozen-mutation` | Mutation on `List.of()`/`Collections.unmodifiable*` | `io.vavr.collection.List` | ✅ |
 | `null-check-to-monadic` | `if (x != null) { return x.foo(); }` | `Option.of(x).map(...)` | ✅ |
 | `try-catch-to-monadic` | `try { return x(); } catch (E e) { return d; }` | `Try.of(() -> x()).getOrElse(d)` | ✅ |
-| `impure-method` | Method mixing pure logic with side-effects | Extract pure logic; wrap IO in `Try` | — |
+| `impure-method` | Method mixing pure logic with side-effects | Extract pure logic; wrap IO in `Try` / return `Either.left` instead of throwing | — |
+| `option-map-nullable` | `Option.map(x -> x.get(k))` followed by chained call (`Some(null)` risk) | `.flatMap(x -> Option.of(...))` | — |
 
 ## Code Actions (Quick Fixes)
 
@@ -51,6 +52,8 @@ Rules marked ✅ provide automated `textDocument/codeAction` fixes:
 - **null-check-to-monadic** → "Convert to Option monadic flow" — rewrites `if (x != null)` to `Option.of(x).map(...)`, supports chained fallbacks via `.orElse()`, adds import
 - **null-return** → "Replace with Option.none()" — replaces `null` with `Option.none()`, adds import
 - **try-catch-to-monadic** → "Convert try/catch to Try monadic flow" — rewrites `try { return expr; } catch (E e) { return default; }` to `Try.of(() -> expr).getOrElse(default)`. Supports 3 patterns: simple default, logging + default (`.onFailure().getOrElse`), and exception-dependent recovery (`.recover(E.class, ...).get()`). Skips try-with-resources, finally, multi-catch, union types. Adds import.
+- **imperative-option-unwrap** → "Convert to Option.map().getOrElse()" — rewrites `if (opt.isDefined()) return opt.get(); else return X;` to `return opt.map(it -> ...).getOrElse(X);` (lazy supplier for non-eager defaults). Bails on missing else or complex bodies.
+- **mutable-dto** → "Replace @Data with @Value" — swaps the annotation and adds `import lombok.Value` (disable with `"autoImportLombok": false`). Skips `@Setter`, `@ConfigurationProperties`, and conflicting Lombok constructor annotations.
 
 ## Agent-Ready Diagnostics
 
@@ -60,11 +63,13 @@ Every diagnostic includes a machine-readable `data` payload:
 {
   "fixType": "REPLACE_WITH_VAVR_LIST",
   "targetLibrary": "io.vavr.collection.List",
-  "rationale": "Runtime mutation of List.of() causes UnsupportedOperationException."
+  "rationale": "Runtime mutation of List.of() causes UnsupportedOperationException.",
+  "recommendedApi": ".append / .appendAll / .update / .remove (returns a new persistent collection)",
+  "suggestedSnippet": "list = list.append(\"c\");  // returns a new persistent collection"
 }
 ```
 
-This lets AI agents apply fixes with confidence — `fixType` says what to do, `targetLibrary` says which dependency, `rationale` says why.
+This lets AI agents apply fixes with confidence — `fixType` says what to do, `targetLibrary` says which dependency, `rationale` says why, `recommendedApi` names the exact method (e.g. Vavr `Option` uses `forEach`, not `ifPresent`), and `suggestedSnippet` is a paste-able fix built from real AST variable names.
 
 ## Configuration
 
@@ -93,7 +98,10 @@ Create `.java-functional-lsp.json` in your project root:
 
 ## Automatic Enforcement
 
-The plugin includes a PostToolUse hook that fires on every Read/Edit/Write of `.java` files. If diagnostics appear, Claude is prompted to fix them immediately without explanation.
+The plugin includes two PostToolUse hooks:
+
+- **Edit/MultiEdit/Write** → `hooks/post_tool_lint.py` lints the edited `.java` file (single-file, <2s) and injects any violations into Claude's context so they get fixed immediately. Silent on clean files; internal errors are swallowed (always exits 0) so the editing session is never broken.
+- **Read** → `hooks/java_linter_reminder.py` reminds Claude to act on LSP diagnostics shown for the file.
 
 ## On-Demand Linting
 

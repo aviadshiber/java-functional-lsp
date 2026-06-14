@@ -664,3 +664,175 @@ class TestImpureMethod:
             f"Diagnostic should point at the side-effect line, not the method declaration "
             f"(diag_line={diag_line}, method_decl_line={method_decl_line})"
         )
+
+
+class TestOptionMapNullable:
+    """Issue #69: Option.map() producing Some(null) before a chained value-consuming call."""
+
+    def test_detects_map_get_followed_by_filter(self) -> None:
+        source = b"""
+        class T {
+            Option<String> author(Map<String, String> metadata) {
+                return Option.of(metadata)
+                    .map(m -> m.get("author"))
+                    .filter(s -> !s.trim().isEmpty());
+            }
+        }
+        """
+        diags = parse_and_analyze(FunctionalChecker(), source)
+        codes = [d.code for d in diags]
+        assert "option-map-nullable" in codes
+
+    def test_detects_map_get_followed_by_map(self) -> None:
+        source = b"""
+        class T {
+            Option<String> f(Map<String, String> m0) {
+                return Option.of(m0).map(m -> m.get("k")).map(s -> s.trim());
+            }
+        }
+        """
+        diags = parse_and_analyze(FunctionalChecker(), source)
+        assert "option-map-nullable" in [d.code for d in diags]
+
+    def test_detects_qualified_option_root(self) -> None:
+        source = b"""
+        class T {
+            void f(Map<String, String> m0) {
+                io.vavr.control.Option.of(m0).map(m -> m.get("k")).forEach(s -> use(s));
+            }
+        }
+        """
+        diags = parse_and_analyze(FunctionalChecker(), source)
+        assert "option-map-nullable" in [d.code for d in diags]
+
+    def test_data_payload_has_flatmap_snippet_with_real_names(self) -> None:
+        source = b"""
+        class T {
+            Option<String> f(Map<String, String> metadata) {
+                return Option.of(metadata)
+                    .map(m -> m.get("author"))
+                    .filter(s -> !s.isEmpty());
+            }
+        }
+        """
+        diags = parse_and_analyze(FunctionalChecker(), source)
+        diag = next(d for d in diags if d.code == "option-map-nullable")
+        assert diag.data is not None
+        assert diag.data.fix_type == "USE_FLATMAP_OPTION_OF"
+        assert diag.data.target_library == "io.vavr.control.Option"
+        assert diag.data.suggested_snippet == '.flatMap(m -> Option.of(m.get("author")))'
+
+    def test_range_starts_at_map_not_chain_root(self) -> None:
+        source = b"""
+        class T {
+            Option<String> f(Map<String, String> m0) {
+                return Option.of(m0).map(m -> m.get("k")).filter(s -> !s.isEmpty());
+            }
+        }
+        """
+        diags = parse_and_analyze(FunctionalChecker(), source)
+        diag = next(d for d in diags if d.code == "option-map-nullable")
+        line = source.split(b"\n")[diag.line]
+        assert line[diag.col :].startswith(b"map("), "range should start at the `map` token"
+
+    def test_no_warn_flatmap_version(self) -> None:
+        source = b"""
+        class T {
+            Option<String> f(Map<String, String> metadata) {
+                return Option.of(metadata)
+                    .flatMap(m -> Option.of(m.get("author")))
+                    .filter(s -> !s.isEmpty());
+            }
+        }
+        """
+        diags = parse_and_analyze(FunctionalChecker(), source)
+        assert "option-map-nullable" not in [d.code for d in diags]
+
+    def test_no_warn_non_nullable_lambda(self) -> None:
+        source = b"""
+        class T {
+            Option<String> f(String s0) {
+                return Option.of(s0).map(s -> s + "!").filter(s -> !s.isEmpty());
+            }
+        }
+        """
+        diags = parse_and_analyze(FunctionalChecker(), source)
+        assert "option-map-nullable" not in [d.code for d in diags]
+
+    def test_no_warn_java_util_optional(self) -> None:
+        source = b"""
+        class T {
+            Optional<String> f(Map<String, String> m0) {
+                return Optional.ofNullable(m0).map(m -> m.get("k")).filter(s -> !s.isEmpty());
+            }
+        }
+        """
+        diags = parse_and_analyze(FunctionalChecker(), source)
+        assert "option-map-nullable" not in [d.code for d in diags]
+
+    def test_no_warn_terminal_map(self) -> None:
+        source = b"""
+        class T {
+            Option<String> f(Map<String, String> m0) {
+                return Option.of(m0).map(m -> m.get("k"));
+            }
+        }
+        """
+        diags = parse_and_analyze(FunctionalChecker(), source)
+        assert "option-map-nullable" not in [d.code for d in diags]
+
+    def test_no_warn_zero_arg_get(self) -> None:
+        source = b"""
+        class T {
+            Option<String> f(Supplier<String> s0) {
+                return Option.of(s0).map(s -> s.get()).filter(v -> !v.isEmpty());
+            }
+        }
+        """
+        diags = parse_and_analyze(FunctionalChecker(), source)
+        assert "option-map-nullable" not in [d.code for d in diags]
+
+    def test_no_warn_list_index_get(self) -> None:
+        source = b"""
+        class T {
+            Option<String> f(List<String> xs0) {
+                return Option.of(xs0).map(xs -> xs.get(0)).filter(v -> !v.isEmpty());
+            }
+        }
+        """
+        diags = parse_and_analyze(FunctionalChecker(), source)
+        assert "option-map-nullable" not in [d.code for d in diags]
+
+    def test_no_warn_non_decimal_index_get(self) -> None:
+        """All four Java integer-literal radixes are index access, not nullable keys."""
+        for literal in (b"0x1F", b"010", b"0b101"):
+            source = (
+                b"class T { Option<String> f(List<String> xs0) {"
+                b" return Option.of(xs0).map(xs -> xs.get(" + literal + b")).filter(v -> !v.isEmpty()); } }"
+            )
+            diags = parse_and_analyze(FunctionalChecker(), source)
+            codes = [d.code for d in diags]
+            assert "option-map-nullable" not in codes, f"false positive on index literal {literal!r}"
+
+    def test_no_warn_get_or_else_follower(self) -> None:
+        source = b"""
+        class T {
+            String f(Map<String, String> m0) {
+                return Option.of(m0).map(m -> m.get("k")).getOrElse("x");
+            }
+        }
+        """
+        diags = parse_and_analyze(FunctionalChecker(), source)
+        assert "option-map-nullable" not in [d.code for d in diags]
+
+    def test_rule_off_in_config(self) -> None:
+        source = b"""
+        class T {
+            Option<String> f(Map<String, String> m0) {
+                return Option.of(m0).map(m -> m.get("k")).filter(s -> !s.isEmpty());
+            }
+        }
+        """
+        config = {"rules": {"option-map-nullable": "off"}}
+        diags = parse_and_analyze(FunctionalChecker(), source, config)
+        assert "option-map-nullable" not in [d.code for d in diags]
