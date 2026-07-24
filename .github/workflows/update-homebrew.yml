@@ -11,7 +11,7 @@ jobs:
     runs-on: ubuntu-latest
     if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Get release version
         id: version
         env:
@@ -43,7 +43,7 @@ jobs:
           echo "Generated formula:"
           cat java-functional-lsp.rb
       - name: Checkout tap repo
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           repository: aviadshiber/homebrew-tap
           token: ${{ secrets.TAP_GITHUB_TOKEN }}
