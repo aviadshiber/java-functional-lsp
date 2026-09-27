@@ -115,10 +115,7 @@ Add `lspServers` to `~/.claude/settings.json` (the plugin handles this automatic
   "lspServers": {
     "java-functional": {
       "command": "java-functional-lsp",
-      "extensionToLanguage": { ".java": "java" },
-      "startupTimeout": 120000,
-      "restartOnCrash": true,
-      "maxRestarts": 5
+      "extensionToLanguage": { ".java": "java" }
     }
   }
 }
@@ -162,16 +159,13 @@ Or manually add to your Claude Code config:
   "lspServers": {
     "java-functional": {
       "command": "java-functional-lsp",
-      "extensionToLanguage": { ".java": "java" },
-      "startupTimeout": 120000,
-      "restartOnCrash": true,
-      "maxRestarts": 5
+      "extensionToLanguage": { ".java": "java" }
     }
   }
 }
 ```
 
-(`startupTimeout: 120000` accommodates jdtls cold-start; `restartOnCrash` keeps the server alive across session.)
+(Leave out `startupTimeout`, `shutdownTimeout`, `restartOnCrash` and `maxRestarts`: Claude Code 2.1.202 and earlier reject them with "… is not yet implemented" and never start the server. Newer versions accept them and already restart a crashed server by default.)
 
 **Alternative: project-level `.lsp.json`** — instead of installing the plugin or editing global config, add a `.lsp.json` file at your project root:
 
@@ -179,10 +173,7 @@ Or manually add to your Claude Code config:
 {
   "java-functional": {
     "command": "java-functional-lsp",
-    "extensionToLanguage": { ".java": "java" },
-    "startupTimeout": 120000,
-    "restartOnCrash": true,
-    "maxRestarts": 5
+    "extensionToLanguage": { ".java": "java" }
   }
 }
 ```
