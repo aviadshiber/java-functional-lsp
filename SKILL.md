@@ -34,7 +34,7 @@ Without jdtls, the server runs in standalone mode — custom rules still work, b
 | `catch-rethrow` | catch wraps + rethrows | `Try.of().toEither()` | — |
 | `mutable-variable` | Variable reassignment | Final + functional transforms | — |
 | `imperative-loop` | `for`/`while` loops | `.map()`/`.filter()`/`.flatMap()` | — |
-| `mutable-dto` | `@Data` or `@Setter` | `@Value` (immutable) | ✅ |
+| `mutable-dto` | `@Data` or `@Setter` | `record` (source level 16+) or `@Value` (immutable) | ✅ |
 | `imperative-option-unwrap` | `if (opt.isDefined()) { opt.get() }` | `map()`/`flatMap()`/`fold()` | ✅ |
 | `field-injection` | `@Autowired` on field | Constructor injection | — |
 | `component-annotation` | `@Component`/`@Service`/`@Repository` | `@Configuration` + `@Bean` | — |
@@ -53,7 +53,7 @@ Rules marked ✅ provide automated `textDocument/codeAction` fixes:
 - **null-return** → "Replace with Option.none()" — replaces `null` with `Option.none()`, adds import
 - **try-catch-to-monadic** → "Convert try/catch to Try monadic flow" — rewrites `try { return expr; } catch (E e) { return default; }` to `Try.of(() -> expr).getOrElse(default)`. Supports 3 patterns: simple default, logging + default (`.onFailure().getOrElse`), and exception-dependent recovery (`.recover(E.class, ...).get()`). Skips try-with-resources, finally, multi-catch, union types. Adds import.
 - **imperative-option-unwrap** → "Convert to Option.map().getOrElse()" — rewrites `if (opt.isDefined()) return opt.get(); else return X;` to `return opt.map(it -> ...).getOrElse(X);` (lazy supplier for non-eager defaults). Bails on missing else or complex bodies.
-- **mutable-dto** → "Replace @Data with @Value" — swaps the annotation and adds `import lombok.Value` (disable with `"autoImportLombok": false`). Skips `@Setter`, `@ConfigurationProperties`, and conflicting Lombok constructor annotations.
+- **mutable-dto** → "Replace @Data with @Value" — swaps the annotation and adds `import lombok.Value` (disable with `"autoImportLombok": false`). Skips `@Setter`, `@ConfigurationProperties`, and conflicting Lombok constructor annotations. At source level 16+ the *diagnostic* recommends a `record` for a plain immutable DTO (with `@Value` as the fallback for `@With`/`@Builder`/`@Jacksonized`/facade/AOP cases); the automated fix still applies `@Value`, so convert to a `record` manually where appropriate.
 
 ## Agent-Ready Diagnostics
 
@@ -77,6 +77,7 @@ Create `.java-functional-lsp.json` in your project root:
 
 ```json
 {
+  "sourceLevel": 17,
   "excludes": ["**/generated/**", "**/vendor/**"],
   "rules": {
     "imperative-loop": "hint",
@@ -88,6 +89,7 @@ Create `.java-functional-lsp.json` in your project root:
 }
 ```
 
+- `sourceLevel` (alias `javaVersion`) — the project's Java source level, as an int (`17`) or string (`"17"`, legacy `"1.8"` → 8). Defaults to `8` if unset (existing configs unaffected). At `16+`, `mutable-dto` recommends a `record` over `@Value` for plain DTOs
 - `excludes` — glob patterns to skip files/directories entirely
 - `rules` — per-rule severity: `error`, `warning` (default), `info`, `hint`, `off`
 - `autoImportVavr` — quick fixes auto-add Vavr imports (default: `true`)
@@ -124,7 +126,7 @@ Declare `lspServers` in `~/.claude/settings.json` or in `plugin.json` — Claude
 
 For containers or CI, add a `.lsp.json` at the project root instead of installing the plugin:
 ```json
-{ "java-functional": { "command": "java-functional-lsp", "extensionToLanguage": { ".java": "java" }, "startupTimeout": 120000, "restartOnCrash": true, "maxRestarts": 5 } }
+{ "java-functional": { "command": "java-functional-lsp", "extensionToLanguage": { ".java": "java" } } }
 ```
 
 To nudge Claude to act on diagnostics, add to your project's `CLAUDE.md`:

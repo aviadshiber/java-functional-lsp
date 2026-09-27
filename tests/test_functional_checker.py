@@ -98,6 +98,22 @@ class TestFrozenMutation:
         frozen_diags = [d for d in diags if d.code == "frozen-mutation"]
         assert len(frozen_diags) == 0
 
+    def test_ignores_stream_to_list_mutation(self) -> None:
+        """Stream.toList() (Java 16+, JEP 431) returns an unmodifiable list too, but it isn't
+        one of the recognized frozen factories (List.of()/copyOf()/Collections.unmodifiable*) —
+        this guards that we don't misfire on it, and equally don't silently start relying on
+        name-based detection that would need its own dedicated rule/message."""
+        source = b"""
+        class T {
+            void f() {
+                List<String> list = stream.map(String::trim).toList();
+                list.add("b");
+            }
+        }
+        """
+        diags = parse_and_analyze(FunctionalChecker(), source)
+        assert not any(d.code == "frozen-mutation" for d in diags)
+
     def test_has_data_field(self) -> None:
         source = b"""
         class T {

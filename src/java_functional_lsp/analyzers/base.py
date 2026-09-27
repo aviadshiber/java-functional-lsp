@@ -288,6 +288,35 @@ def severity_from_config(config: dict[str, Any], rule_id: str, default: Severity
     }.get(level, default)
 
 
+def source_level_from_config(config: dict[str, Any], default: int = 8) -> int:
+    """Get the configured Java source level (feature level) as an int.
+
+    Accepts either the canonical ``sourceLevel`` key or ``javaVersion`` (checked
+    in that order — ``sourceLevel`` wins if both are present). Accepts ints or
+    strings; strings like "17" parse directly, and old-style "1.8" normalizes to
+    8 (the pre-Java-9 `1.x` versioning scheme). Defaults conservatively to 8
+    (pre-record/pattern-matching behavior) so unset config is unchanged.
+    """
+    raw = config.get("sourceLevel", config.get("javaVersion"))
+    if raw is None:
+        return default
+    if isinstance(raw, bool):
+        # bool is an int subclass; explicitly reject to avoid True/False -> 1/0.
+        return default
+    if isinstance(raw, int):
+        return raw
+    if isinstance(raw, str):
+        text = raw.strip()
+        # Old-style "1.x" versioning (e.g. "1.8") normalizes to the feature number.
+        if text.startswith("1."):
+            text = text.removeprefix("1.") or text
+        try:
+            return int(text)
+        except ValueError:
+            return default
+    return default
+
+
 def is_excluded(path_str: str, patterns: list[str]) -> bool:
     """Return True if path matches any exclude glob pattern.
 
