@@ -124,7 +124,7 @@ Declare `lspServers` in `~/.claude/settings.json` or in `plugin.json` — Claude
 
 For containers or CI, add a `.lsp.json` at the project root instead of installing the plugin:
 ```json
-{ "java-functional": { "command": "java-functional-lsp", "extensionToLanguage": { ".java": "java" }, "startupTimeout": 120000, "restartOnCrash": true, "maxRestarts": 5 } }
+{ "java-functional": { "command": "java-functional-lsp", "extensionToLanguage": { ".java": "java" } } }
 ```
 
 To nudge Claude to act on diagnostics, add to your project's `CLAUDE.md`:

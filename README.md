@@ -115,10 +115,7 @@ Add `lspServers` to `~/.claude/settings.json` (the plugin handles this automatic
   "lspServers": {
     "java-functional": {
       "command": "java-functional-lsp",
-      "extensionToLanguage": { ".java": "java" },
-      "startupTimeout": 120000,
-      "restartOnCrash": true,
-      "maxRestarts": 5
+      "extensionToLanguage": { ".java": "java" }
     }
   }
 }
@@ -162,16 +159,11 @@ Or manually add to your Claude Code config:
   "lspServers": {
     "java-functional": {
       "command": "java-functional-lsp",
-      "extensionToLanguage": { ".java": "java" },
-      "startupTimeout": 120000,
-      "restartOnCrash": true,
-      "maxRestarts": 5
+      "extensionToLanguage": { ".java": "java" }
     }
   }
 }
 ```
-
-(`startupTimeout: 120000` accommodates jdtls cold-start; `restartOnCrash` keeps the server alive across session.)
 
 **Alternative: project-level `.lsp.json`** — instead of installing the plugin or editing global config, add a `.lsp.json` file at your project root:
 
@@ -179,10 +171,7 @@ Or manually add to your Claude Code config:
 {
   "java-functional": {
     "command": "java-functional-lsp",
-    "extensionToLanguage": { ".java": "java" },
-    "startupTimeout": 120000,
-    "restartOnCrash": true,
-    "maxRestarts": 5
+    "extensionToLanguage": { ".java": "java" }
   }
 }
 ```
