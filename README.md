@@ -165,8 +165,6 @@ Or manually add to your Claude Code config:
 }
 ```
 
-(Leave out `startupTimeout`, `shutdownTimeout`, `restartOnCrash` and `maxRestarts`: Claude Code 2.1.202 and earlier reject them with "… is not yet implemented" and never start the server. Newer versions accept them and already restart a crashed server by default.)
-
 **Alternative: project-level `.lsp.json`** — instead of installing the plugin or editing global config, add a `.lsp.json` file at your project root:
 
 ```json
