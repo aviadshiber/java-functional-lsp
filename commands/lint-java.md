@@ -35,6 +35,6 @@ $ARGUMENTS - Java files, directories, or glob patterns to lint. If empty, lint a
    - `throw-statement` → convert to `Either.left()` or `Try.of()`
    - `mutable-variable` → make final, use functional transforms
    - `imperative-loop` → replace with `.map()`, `.filter()`, `.flatMap()`
-   - `mutable-dto` → change `@Data` to `@Value`
+   - `mutable-dto` → convert to a `record` (source level 16+) or change `@Data` to `@Value` (follow the diagnostic's recommendation, which is source-level aware)
    - `field-injection` → convert to constructor injection
    - `component-annotation` → move to `@Configuration` class with `@Bean`
