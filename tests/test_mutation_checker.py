@@ -72,6 +72,67 @@ class TestMutableDto:
         assert len(dto_diags) == 1
         assert "@Value" in dto_diags[0].message
 
+    def test_source_level_8_suggests_value(self) -> None:
+        """Unset/pre-16 sourceLevel keeps today's exact @Value behavior."""
+        source = b"@Data class Foo { private String name; }"
+        diags = parse_and_analyze(MutationChecker(), source, {"sourceLevel": 8})
+        dto_diags = [d for d in diags if d.code == "mutable-dto"]
+        assert len(dto_diags) == 1
+        assert "@Value" in dto_diags[0].message
+        assert "record" not in dto_diags[0].message
+        assert dto_diags[0].data.recommended_api == "@Value"
+
+    def test_unset_source_level_suggests_value(self) -> None:
+        source = b"@Data class Foo { private String name; }"
+        diags = parse_and_analyze(MutationChecker(), source)
+        dto_diags = [d for d in diags if d.code == "mutable-dto"]
+        assert len(dto_diags) == 1
+        assert "@Value" in dto_diags[0].message
+        assert "record" not in dto_diags[0].message
+
+    def test_source_level_17_suggests_record(self) -> None:
+        source = b"@Data class Foo { private String name; }"
+        diags = parse_and_analyze(MutationChecker(), source, {"sourceLevel": 17})
+        dto_diags = [d for d in diags if d.code == "mutable-dto"]
+        assert len(dto_diags) == 1
+        assert "record" in dto_diags[0].message
+        assert "@Value" in dto_diags[0].message  # still mentioned as the fallback
+        assert dto_diags[0].data.recommended_api == "record"
+        assert dto_diags[0].data.suggested_snippet is not None
+        assert "record Foo(" in dto_diags[0].data.suggested_snippet
+
+    def test_source_level_16_suggests_record(self) -> None:
+        """16 is the minimum — records became final/non-preview in JDK 16."""
+        source = b"@Data class Foo { private String name; }"
+        diags = parse_and_analyze(MutationChecker(), source, {"sourceLevel": 16})
+        dto_diags = [d for d in diags if d.code == "mutable-dto"]
+        assert "record" in dto_diags[0].message
+
+    def test_source_level_15_suggests_value(self) -> None:
+        """15 is below the record threshold — behavior unchanged from today."""
+        source = b"@Data class Foo { private String name; }"
+        diags = parse_and_analyze(MutationChecker(), source, {"sourceLevel": 15})
+        dto_diags = [d for d in diags if d.code == "mutable-dto"]
+        assert "record" not in dto_diags[0].message
+        assert "@Value" in dto_diags[0].message
+
+    def test_java_version_alias_also_triggers_record(self) -> None:
+        source = b"@Data class Foo { private String name; }"
+        diags = parse_and_analyze(MutationChecker(), source, {"javaVersion": "17"})
+        dto_diags = [d for d in diags if d.code == "mutable-dto"]
+        assert "record" in dto_diags[0].message
+
+    def test_config_properties_data_stays_value_shaped_at_source_17(self) -> None:
+        """@ConfigurationProperties always suggests @ConstructorBinding, never a record — the
+        `data` payload must match that message even when sourceLevel unlocks record elsewhere."""
+        source = b"@ConfigurationProperties @Setter class Props { String name; }"
+        diags = parse_and_analyze(MutationChecker(), source, {"sourceLevel": 17})
+        dto_diags = [d for d in diags if d.code == "mutable-dto"]
+        assert len(dto_diags) == 1
+        assert "@ConstructorBinding" in dto_diags[0].message
+        assert "record" not in dto_diags[0].message
+        assert dto_diags[0].data.recommended_api == "@Value"
+
 
 class TestImperativeOptionUnwrap:
     def test_detects_is_defined_get(self) -> None:

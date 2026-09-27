@@ -17,12 +17,23 @@ from .base import (
     severity_from_config,
     single_return_expr_text,
     single_return_stmt,
+    source_level_from_config,
 )
+
+# Java 16 is when both records (JEP 395) and instanceof pattern matching (JEP 394)
+# became final/non-preview — the point at which a plain immutable DTO is better
+# expressed as a `record` than a Lombok `@Value` class.
+_RECORD_MIN_SOURCE_LEVEL = 16
 
 _MESSAGES = {
     "mutable-variable": "Avoid reassigning variables. Use final + functional transforms (map, flatMap, fold).",
     "imperative-loop": "Replace imperative loop with .map(), .filter(), .flatMap(), or .foldLeft().",
     "mutable-dto": "Use @Value instead of @Data/@Setter for immutable DTOs.",
+    "mutable-dto-record": (
+        "Use a record instead of @Data/@Setter for plain immutable DTOs (source level 16+). "
+        "Fall back to @Value if the class needs @With/@Builder/@Jacksonized, is used as a facade, "
+        "or relies on AOP proxying (records are final and can't be proxied)."
+    ),
     "imperative-option-unwrap": "Avoid imperative unwrapping (isDefined/get). Use map(), flatMap(), or fold().",
 }
 
@@ -53,6 +64,17 @@ _DATA = {
         rationale="Mutable DTOs allow uncontrolled state changes. Use @Value for immutable data classes.",
         recommended_api="@Value",
     ),
+    "mutable-dto-record": DiagnosticData(
+        fix_type="USE_RECORD",
+        target_library="java.lang.Record",
+        rationale=(
+            "Mutable DTOs allow uncontrolled state changes. At source level 16+, a plain immutable "
+            "DTO is better expressed as a `record` (built-in, no Lombok dependency). Prefer @Value "
+            "instead when the class needs @With/@Builder/@Jacksonized, is used as a facade, or "
+            "relies on AOP proxying."
+        ),
+        recommended_api="record",
+    ),
     "imperative-option-unwrap": DiagnosticData(
         fix_type="USE_MAP_FLATMAP",
         target_library="io.vavr.control.Option",
@@ -62,14 +84,24 @@ _DATA = {
 }
 
 
-def _build_mutable_dto_data(class_decl: Any) -> DiagnosticData:
-    """Build a DiagnosticData with a @Value snippet using the real class name."""
-    base = _DATA["mutable-dto"]
+def _build_mutable_dto_data(class_decl: Any, source_level: int = 8) -> DiagnosticData:
+    """Build a DiagnosticData with a @Value (or, at source 16+, record) snippet.
+
+    Uses the real class name from the AST. At ``source_level >= 16`` (records +
+    instanceof pattern matching both final), a plain immutable DTO is better
+    expressed as a ``record``; below that, keep the historical ``@Value`` snippet
+    unchanged.
+    """
+    prefer_record = source_level >= _RECORD_MIN_SOURCE_LEVEL
+    base = _DATA["mutable-dto-record"] if prefer_record else _DATA["mutable-dto"]
     name_node = class_decl.child_by_field_name("name") if class_decl is not None else None
     if name_node is None or not name_node.text:
         return base
     class_name = name_node.text.decode("utf-8")
-    snippet = f"@Value\npublic class {class_name} {{ /* fields become final */ }}"
+    if prefer_record:
+        snippet = f"public record {class_name}(/* fields as record components */) {{ }}"
+    else:
+        snippet = f"@Value\npublic class {class_name} {{ /* fields become final */ }}"
     return dataclasses.replace(base, suggested_snippet=snippet)
 
 
@@ -127,6 +159,7 @@ class MutationChecker:
         severity = severity_from_config(config, "mutable-dto")
         if severity is None:
             return
+        source_level = source_level_from_config(config)
 
         for node in find_nodes(tree.root_node, "marker_annotation"):
             name_node = node.child_by_field_name("name")
@@ -139,12 +172,19 @@ class MutationChecker:
                     modifiers = node.parent
                     grandparent = modifiers.parent
                     if grandparent and grandparent.type == "class_declaration":
-                        if has_sibling_annotation(modifiers, b"ConfigurationProperties"):
+                        is_config_properties = has_sibling_annotation(modifiers, b"ConfigurationProperties")
+                        if is_config_properties:
                             message = (
                                 "Use @ConstructorBinding instead of @Data/@Setter for @ConfigurationProperties classes."
                             )
+                        elif source_level >= _RECORD_MIN_SOURCE_LEVEL:
+                            message = _MESSAGES["mutable-dto-record"]
                         else:
                             message = _MESSAGES["mutable-dto"]
+                        # @ConfigurationProperties classes need a settable bean (@ConstructorBinding),
+                        # never a record/@Value rewrite — force the pre-16 (@Value-shaped) data payload
+                        # so `data` doesn't contradict the message above.
+                        data_source_level = 8 if is_config_properties else source_level
                         diagnostics.append(
                             Diagnostic(
                                 line=name_node.start_point[0],
@@ -154,7 +194,7 @@ class MutationChecker:
                                 severity=severity,
                                 code="mutable-dto",
                                 message=message,
-                                data=_build_mutable_dto_data(grandparent),
+                                data=_build_mutable_dto_data(grandparent, data_source_level),
                             )
                         )
 

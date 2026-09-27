@@ -38,7 +38,7 @@ Install jdtls separately: `brew install jdtls` (requires JDK 21+). The server au
 | `catch-rethrow` | catch block that wraps + rethrows | `Try.of().toEither()` | — |
 | `mutable-variable` | Local variable reassignment | Final variables + functional transforms | — |
 | `imperative-loop` | `for`/`while` loops | `.map()`/`.filter()`/`.flatMap()`/`.foldLeft()` | — |
-| `mutable-dto` | `@Data` or `@Setter` on class | `@Value` (immutable) | ✅ |
+| `mutable-dto` | `@Data` or `@Setter` on class | `@Value` (immutable); `record` instead at `sourceLevel` 16+ | ✅ |
 | `imperative-option-unwrap` | `if (opt.isDefined()) { opt.get() }` | `map()`/`flatMap()`/`fold()` | ✅ |
 | `field-injection` | `@Autowired` on field | Constructor injection | — |
 | `component-annotation` | `@Component`/`@Service`/`@Repository` | `@Configuration` + `@Bean` | — |
@@ -219,6 +219,7 @@ Create `.java-functional-lsp.json` in your project root to customize rules:
 ```json
 {
   "excludes": ["**/generated/**", "**/vendor/**"],
+  "sourceLevel": 17,
   "rules": {
     "null-literal-arg": "warning",
     "throw-statement": "info",
@@ -231,11 +232,15 @@ Create `.java-functional-lsp.json` in your project root to customize rules:
 **Options:**
 - `excludes` — glob patterns for files/directories to skip entirely (supports `**` for multi-segment wildcards)
 - `rules` — per-rule severity: `error`, `warning` (default), `info`, `hint`, `off`
+- `sourceLevel` — the project's Java language/source level, as an int (e.g. `17`) or version string (`"17"`, legacy `"1.8"`). Also accepted as `javaVersion`. Defaults to `8` if unset, so existing configs are unaffected. Currently only changes the `mutable-dto` recommendation (see below); higher source levels unlock more rewrite targets over time (records, sealed types, pattern matching, text blocks).
 - `suppressJdtlsPatterns` — list of regex patterns to suppress jdtls diagnostics (see below)
 
 **Spring-aware behavior:**
 - `throw-statement`, `catch-rethrow`, and `try-catch-to-monadic` are automatically suppressed inside `@Bean` methods
 - `mutable-dto` suggests `@ConstructorBinding` instead of `@Value` when the class has `@ConfigurationProperties`
+
+**Source-level-aware behavior:**
+- `mutable-dto` recommends a `record` instead of `@Value` once `sourceLevel` is 16 or higher (records became final/non-preview in JDK 16) — a plain immutable DTO is simpler as a built-in `record` with no Lombok dependency. It still calls out `@Value` as the fallback when the class needs `@With`/`@Builder`/`@Jacksonized`, is used as a facade, or relies on AOP proxying (records are `final` and can't be proxied). Below `sourceLevel` 16 (including the default), the message and quick fix are unchanged — `@Value` only.
 
 **Inline suppression** with `@SuppressWarnings`:
 
@@ -327,7 +332,7 @@ The server provides LSP code actions (`textDocument/codeAction`) that automatica
 | `null-return` | Replace with Option.none() | Rewrites `return null` → `return Option.none()`, adds import |
 | `try-catch-to-monadic` | Convert try/catch to Try monadic flow | Rewrites `try { return expr; } catch (E e) { return default; }` → `Try.of(() -> expr).getOrElse(default)`. Supports 3 patterns: simple default (eager/lazy `.getOrElse`), logging + default (`.onFailure().getOrElse`), and exception-dependent recovery (`.recover(E.class, ...).get()`). Skips try-with-resources, finally, multi-catch, and union types. Adds import. |
 | `imperative-option-unwrap` | Convert to Option.map().getOrElse() | Rewrites `if (opt.isDefined()) return opt.get(); else return X;` → `return opt.map(it -> ...).getOrElse(X);` (lazy `getOrElse(() -> ...)` for non-eager defaults). Bails on missing else or complex bodies. |
-| `mutable-dto` | Replace @Data with @Value | Replaces the `@Data` annotation with `@Value` and adds `import lombok.Value`. Skips `@Setter`, `@ConfigurationProperties`, and conflicting Lombok constructor annotations. |
+| `mutable-dto` | Replace @Data with @Value | Replaces the `@Data` annotation with `@Value` and adds `import lombok.Value`. Skips `@Setter`, `@ConfigurationProperties`, and conflicting Lombok constructor annotations. This quick fix is currently `@Value`-only regardless of `sourceLevel` — the diagnostic message/snippet recommend a `record` at `sourceLevel` 16+, but applying that rewrite safely (enumerating fields into record components) isn't automated yet; use the suggested snippet as a manual starting point. |
 
 Quick fixes automatically add the required Vavr import if it's not already present. Disable auto-import with `"autoImportVavr": false` in config (`"autoImportLombok": false` for the Lombok import added by the `mutable-dto` fix).
 
@@ -365,6 +370,7 @@ This lets agents confidently apply fixes without guessing libraries or patterns 
 | `autoImportVavr` | `true` | Quick fixes auto-add Vavr/Option imports |
 | `autoImportLombok` | `true` | The `mutable-dto` quick fix auto-adds `import lombok.Value` |
 | `strictPurity` | `false` | When `true`, `impure-method` uses WARNING severity instead of HINT |
+| `sourceLevel` (alias `javaVersion`) | `8` | Java source level; `mutable-dto` recommends `record` over `@Value` at 16+ |
 
 > **Note:** The machine-readable `data` payload is always included in diagnostics when available — no configuration needed.
 
