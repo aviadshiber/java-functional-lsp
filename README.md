@@ -201,6 +201,7 @@ moving on. Fix any type errors or missing imports immediately.
 | "java-functional-lsp not found" | Run `brew install aviadshiber/tap/java-functional-lsp` |
 | Plugin not active | Run `claude plugin list` to verify, then `/reload-plugins` |
 | Diagnostics slow on first open | Normal — tree-sitter parses on first load, then incremental |
+| Java errors show up one tool call after the edit | Claude Code doesn't wait for LSP diagnostics after Edit/Write ([anthropics/claude-code#93321](https://github.com/anthropics/claude-code/issues/93321)); jdtls results arrive with the next tool result. See [Fresh jdtls diagnostics after edits](#fresh-jdtls-diagnostics-after-edits) |
 
 ### Other Editors
 
@@ -305,6 +306,27 @@ Custom settings fully replace the defaults (no merge). See the [jdtls Preference
 The jdtls Eclipse workspace index is cached in `~/.cache/jdtls-data/`. Warm starts (~10-20s) reuse this cache; cold starts (60-120s) rebuild from scratch. The cache is automatically invalidated when jdtls or Java is upgraded, but **not** when java-functional-lsp is upgraded — our Python code changes don't affect the Eclipse index.
 
 To force a clean rebuild: `rm -rf ~/.cache/jdtls-data/`
+
+### Fresh jdtls diagnostics after edits
+
+jdtls re-validates a file 0.4–2.4s after the last edit to *any* file, and its results carry no document version. So after an edit, java-functional-lsp holds back jdtls diagnostics for that file until jdtls publishes again, rather than re-sending the previous edit's results as if they were current ([#109](https://github.com/aviadshiber/java-functional-lsp/issues/109)):
+
+| Mode | Default for | After an edit |
+|------|-------------|---------------|
+| `custom-first` | Claude Code | Custom diagnostics publish at once, without jdtls errors; the full set follows when jdtls has re-validated |
+| `hold-all` | Other editors | Nothing is published for the file until jdtls has re-validated (no flickering squiggles) |
+| `off` | — | Previous behavior: custom diagnostics plus the last known jdtls diagnostics after 150ms |
+
+If jdtls doesn't publish in time (3s after the last edit, stretched when jdtls is slow, 10s at most), the last known jdtls diagnostics are used. Files whose module is still being imported, and files matched by `java.diagnostic.filter`, are never held. While you edit the same file in quick succession, its diagnostics update only once the burst settles.
+
+Environment variables:
+
+| Variable | Values | Effect |
+|----------|--------|--------|
+| `JAVA_FUNCTIONAL_LSP_DIAG_HOLD` | `custom-first`, `hold-all`, `off` | Overrides the mode above; `off` restores the previous behavior |
+| `JAVA_FUNCTIONAL_LSP_LOG_LEVEL` | `DEBUG`, `INFO` (default), `WARNING` | Log verbosity; `DEBUG` logs every publish decision (file name, trigger, counts — never code) |
+
+The log reports `jdtls freshness: released=… too_early=… timeout=… late_correction=…` every 100 decisions and when jdtls stops. Repeated `timeout` lines mean jdtls is slow or stuck on that module. A growing `late_correction` count means jdtls results were released too early.
 
 ### Suppressing jdtls diagnostics
 
