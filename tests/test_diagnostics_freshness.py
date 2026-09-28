@@ -352,13 +352,15 @@ class TestHoldWiring:
         await _until(lambda: live.call_count == 2)
         by_uri = {p.uri: p for p in _published(live)}
         assert _messages(by_uri[URI], "Java") == []
+        assert _messages(by_uri[OTHER_URI], "Java") == []
+        assert srv_mod._freshness.counts["too_early"] == 1
 
     async def test_timeout_publishes_cached(self, live: MagicMock) -> None:
         _short_deadlines()
         _jdtls_publishes([_java_diag("cached")])
         live.reset_mock()
         await _edit()
-        await asyncio.sleep(0.15)
+        await _past_debounce()
         assert live.call_count == 0
         await _until(lambda: live.call_count == 1, timeout=2.0)
         assert _messages(_published(live)[0], "Java") == ["cached"]
@@ -461,13 +463,25 @@ class TestHoldWiring:
         await _until(lambda: live.call_count == 1)
 
     async def test_close_while_pending_cancels_hold(self, live: MagicMock) -> None:
+        _short_deadlines()
         await _edit()
         await _past_debounce()
+        hold_task = srv_mod._pending[URI]
         await on_did_close(lsp.DidCloseTextDocumentParams(text_document=lsp.TextDocumentIdentifier(uri=URI)))
         live.reset_mock()
-        await _past_min_age()
+        await asyncio.sleep(0.4)  # past the (short) deadline: an uncancelled hold would have published
         assert live.call_count == 0
+        assert hold_task.cancelled()
         assert not srv_mod._freshness.is_pending(URI)
+
+    async def test_superseded_hold_task_does_not_publish(self, live: MagicMock) -> None:
+        srv_mod._freshness.note_forwarded_change()
+        srv_mod._freshness.mark_pending(URI)
+        stray = asyncio.create_task(srv_mod._hold_until_fresh(URI, URI))  # not the task in _pending
+        await _past_min_age()
+        _jdtls_publishes([])
+        await asyncio.gather(stray)
+        assert live.call_count == 0
 
     async def test_custom_first_publish_failure_does_not_strand_file(self, live: MagicMock) -> None:
         server._hold_mode = _HOLD_CUSTOM_FIRST

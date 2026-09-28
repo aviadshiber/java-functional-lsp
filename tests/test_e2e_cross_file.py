@@ -81,6 +81,8 @@ class _CallerWatch:
 
     async def wait_project_ready(self) -> bool:
         """Wait for a Caller publish without the non-project (code 16) marker."""
+        if self.history and self.project_ready():
+            return True  # published while the files were still being opened
         deadline = asyncio.get_running_loop().time() + _READY_TIMEOUT_SEC
         while asyncio.get_running_loop().time() < deadline:
             if await self.next_publish(deadline - asyncio.get_running_loop().time()) and self.project_ready():

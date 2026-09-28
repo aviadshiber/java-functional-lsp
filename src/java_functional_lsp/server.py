@@ -863,7 +863,7 @@ async def _hold_until_fresh(uri: str, key: str) -> None:
             except asyncio.TimeoutError:
                 pass
     finally:
-        if _hold_events.get(key) is event:
+        if _hold_events.get(key) is event and _is_current_task(uri):
             del _hold_events[key]
     if _is_current_task(uri):
         _analyze_and_publish(uri, trigger=trigger)
@@ -880,7 +880,8 @@ async def _deferred_validate(uri: str) -> None:
             _analyze_and_publish(uri, trigger="change")
     except Exception as e:
         # Never leave a file pending without a hold task: its jdtls publish would be swallowed.
-        _freshness.forget(key)
+        if _is_current_task(uri):
+            _freshness.forget(key)
         logger.error("Validation failed for %s: %s", Path(uri).name, e)
 
 
