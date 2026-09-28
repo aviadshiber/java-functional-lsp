@@ -14,6 +14,7 @@ import json
 import logging
 import os
 import re
+import stat
 import sys
 import time
 from collections import Counter, OrderedDict
@@ -47,7 +48,7 @@ from .capabilities import (
     StaticCapabilityBuilder,
 )
 from .fixes import get_fix, get_fix_registry_keys
-from .freshness_marker import write_marker
+from .freshness_marker import OPENING, content_digest, write_marker
 from .proxy import JdtlsProxy, _module_snapshot_path, _resolve_module_uri
 
 logger = logging.getLogger(__name__)
@@ -120,7 +121,14 @@ _HOLD_OFF = "off"
 _HOLD_ALL = "hold-all"
 _HOLD_CUSTOM_FIRST = "custom-first"
 _HOLD_MODES = (_HOLD_OFF, _HOLD_ALL, _HOLD_CUSTOM_FIRST)
-_CUSTOM_FIRST_CLIENTS = ("Claude Code",)
+_AGENT_HOST_CLIENTS = ("Claude Code",)
+
+
+def _is_agent_host(client_name: str) -> bool:
+    """Agent hosts write files before didChange and read diagnostics right after their hooks."""
+    return any(token in client_name for token in _AGENT_HOST_CLIENTS)
+
+
 _CUSTOM_SOURCE = "java-functional-lsp"
 
 
@@ -279,9 +287,10 @@ class JavaFunctionalLspServer(LanguageServer):
         self._user_suppress_patterns: list[re.Pattern[str]] = []
         self._skip_jdtls: bool = False
         self._hold_mode: str = _HOLD_OFF
-        # Agent host (Claude Code): writes files before didChange and reads diagnostics
-        # right after its PostToolUse hooks — see _forward_save_if_on_disk / write_marker.
+        # Agent host (Claude Code): see _forward_save_if_on_disk and _stamp_final_publish.
         self._agent_host: bool = False
+        # Opened files (normalized) opened or edited since their last freshness marker.
+        self._marker_dirty: set[str] = set()
         self._skip_jdtls_registration: bool = False
         self._init_generation: int = 0
         # Capability entries the negotiator decided to register dynamically
@@ -322,6 +331,7 @@ class JavaFunctionalLspServer(LanguageServer):
         if len(self._session_opened_uris) > _MAX_OPENED_URIS:
             evicted, _ = self._session_opened_uris.popitem(last=False)
             self._module_uris.pop(evicted, None)
+            self._marker_dirty.discard(evicted)
             _freshness.forget(evicted)
 
     def _on_jdtls_diagnostics(self, uri: str, diagnostics: list[Any]) -> None:
@@ -706,7 +716,8 @@ def on_initialize(params: lsp.InitializeParams) -> lsp.InitializeResult:
     _jdtls_capabilities_registered = False
     _release_all_holds()
     server._hold_mode = _resolve_hold_mode(client_name)
-    server._agent_host = any(token in client_name for token in _CUSTOM_FIRST_CLIENTS)
+    server._agent_host = _is_agent_host(client_name)
+    server._marker_dirty.clear()
     logger.info("jdtls diagnostics hold mode: %s", server._hold_mode)
 
     jdtls_override = os.environ.get("JAVA_FUNCTIONAL_LSP_JDTLS", "").strip().lower()
@@ -846,10 +857,31 @@ def _analyze_and_publish(uri: str, *, include_jdtls: bool = True, trigger: str =
             "publish %s trigger=%s java=%d custom=%d", Path(client_uri).name, trigger, java, len(diagnostics) - java
         )
     server.text_document_publish_diagnostics(lsp.PublishDiagnosticsParams(uri=client_uri, diagnostics=diagnostics))
-    if include_jdtls and server._agent_host:
-        fs_path = to_fs_path(client_uri)
-        if fs_path:
-            write_marker(fs_path)
+    if include_jdtls and server._agent_host and _is_final(trigger):
+        _stamp_final_publish(client_uri, doc.source)
+
+
+def _is_final(trigger: str) -> bool:
+    """Whether a publish carries jdtls results for the current content (nothing better is coming)."""
+    if trigger in ("jdtls", "timeout"):
+        return True
+    # With the hold on, a change/save publish only happens when the file isn't held, i.e.
+    # no fresher jdtls result will follow. With it off, it carries the previous edit's set.
+    return trigger in ("change", "save") and (server._hold_mode != _HOLD_OFF or not server._proxy.is_available)
+
+
+def _stamp_final_publish(client_uri: str, source: str) -> None:
+    """Tell the Claude Code hook that diagnostics for *source* are published (see freshness_marker)."""
+    key = _normalize_uri(client_uri)
+    fs_path = to_fs_path(client_uri)
+    if key not in server._marker_dirty or not fs_path:
+        return  # background republish of an unedited file: the hook only waits on edits
+    server._marker_dirty.discard(key)
+    write_marker(fs_path, content_digest(source.encode()))
+
+
+def _agent_did_save_enabled() -> bool:
+    return os.environ.get("JAVA_FUNCTIONAL_LSP_AGENT_DIDSAVE", "").strip().lower() != "off"
 
 
 def _forward_save_if_on_disk(uri: str) -> None:
@@ -857,18 +889,23 @@ def _forward_save_if_on_disk(uri: str) -> None:
 
     Agent hosts write the file themselves and may not send didSave; without it jdtls can
     re-validate dependent files against the old version of the edited one and never
-    correct them (#109: stale in ~2 of 5 runs, never with didSave).
+    correct them (#109: stale in ~2 of 5 runs, never with didSave). jdtls's handleSaved
+    only reloads the working copy from disk, which here equals the buffer.
     """
-    fs_path = to_fs_path(uri)
-    if not fs_path:
-        return
-    source = server.workspace.get_text_document(uri).source.encode()
     try:
-        if os.path.getsize(fs_path) != len(source) or Path(fs_path).read_bytes() != source:
+        fs_path = to_fs_path(uri)
+        if not fs_path:
             return
-    except OSError:
-        return
-    _forward_or_queue("textDocument/didSave", {"textDocument": {"uri": uri}})
+        source = server.workspace.get_text_document(uri).source.encode()
+        st = os.stat(fs_path)
+        if not stat.S_ISREG(st.st_mode) or st.st_size != len(source):
+            return
+        if Path(fs_path).read_bytes() != source:
+            logger.debug("didSave skipped for %s: disk content differs from the buffer", Path(fs_path).name)
+            return
+        _forward_or_queue("textDocument/didSave", {"textDocument": {"uri": uri}})
+    except Exception as e:
+        logger.debug("didSave check failed for %s: %s", Path(uri).name, type(e).__name__)
 
 
 def _resolve_hold_mode(client_name: str) -> str:
@@ -877,7 +914,7 @@ def _resolve_hold_mode(client_name: str) -> str:
         return override
     if override:
         logger.warning("Unknown JAVA_FUNCTIONAL_LSP_DIAG_HOLD value %r; expected %s", override, "/".join(_HOLD_MODES))
-    return _HOLD_CUSTOM_FIRST if any(token in client_name for token in _CUSTOM_FIRST_CLIENTS) else _HOLD_ALL
+    return _HOLD_CUSTOM_FIRST if _is_agent_host(client_name) else _HOLD_ALL
 
 
 def _matches_diagnostic_filter(uri: str) -> bool:
@@ -997,6 +1034,13 @@ async def on_did_open(params: lsp.DidOpenTextDocumentParams) -> None:
     # Must precede any await: same-loop jdtls diagnostic callbacks need to
     # observe this URI before they arrive to avoid the publish getting gated.
     server._record_opened(uri)
+    if server._agent_host and not server._skip_jdtls:
+        # A placeholder the file never hashes to: the hook waits for jdtls's first result
+        # instead of taking this open's (jdtls-less) publish as final.
+        fs_path = to_fs_path(uri)
+        if fs_path:
+            server._marker_dirty.add(_normalize_uri(uri))
+            write_marker(fs_path, OPENING)
 
     if server._skip_jdtls:
         # Skip all jdtls forwarding — custom diagnostics only.
@@ -1027,14 +1071,19 @@ async def on_did_open(params: lsp.DidOpenTextDocumentParams) -> None:
 async def on_did_change(params: lsp.DidChangeTextDocumentParams) -> None:
     """Forward to jdtls and schedule debounced re-analysis."""
     uri = params.text_document.uri
-    if _forward_or_queue("textDocument/didChange", _serialize_params(params)):
+    forwarded = _forward_or_queue("textDocument/didChange", _serialize_params(params))
+    if forwarded:
         _track_forwarded_edit(uri)
-        if server._agent_host:
-            _forward_save_if_on_disk(uri)
     # Cancel pending validation, schedule new one (150ms debounce for IDE typing)
     if uri in _pending:
         _pending[uri].cancel()
     _pending[uri] = asyncio.create_task(_deferred_validate(uri))
+    if server._agent_host:
+        key = _normalize_uri(uri)
+        if key in server._session_opened_uris:
+            server._marker_dirty.add(key)
+        if forwarded and _agent_did_save_enabled():
+            _forward_save_if_on_disk(uri)
 
 
 @server.feature(lsp.TEXT_DOCUMENT_DID_SAVE)

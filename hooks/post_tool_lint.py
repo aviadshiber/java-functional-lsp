@@ -19,6 +19,7 @@ import hashlib
 import json
 import os
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -28,43 +29,85 @@ from pathlib import Path
 TIMEOUT_SECONDS = 5  # hard cap; single-file analysis is typically <200ms
 MAX_DIAGNOSTICS = 25  # keep additionalContext bounded
 POLL_SECONDS = 0.05
+DEFAULT_WAIT_SECONDS = 3.0
+MAX_WAIT_SECONDS = 4.0
+EXIT_MARGIN_SECONDS = 0.5  # finish well before SIGALRM so the lint output is printed
+MARKER_MAX_BYTES = 128
 
 
 def _fresh_wait_seconds() -> float:
     try:
-        return max(0.0, min(float(os.environ.get("JAVA_FUNCTIONAL_LSP_HOOK_WAIT", "3")), 4.0))
+        wait = float(os.environ.get("JAVA_FUNCTIONAL_LSP_HOOK_WAIT", DEFAULT_WAIT_SECONDS))
     except ValueError:
-        return 3.0
+        return DEFAULT_WAIT_SECONDS
+    return max(0.0, min(wait, MAX_WAIT_SECONDS))
+
+
+def _user() -> str:
+    try:
+        return getpass.getuser()
+    except Exception:
+        return str(os.getuid()) if hasattr(os, "getuid") else "user"
 
 
 def _marker_path(file_path: str) -> Path:
     """Must match java_functional_lsp.freshness_marker.marker_path (a test checks)."""
     digest = hashlib.sha256(os.path.realpath(file_path).encode()).hexdigest()[:32]
-    return Path(tempfile.gettempdir()) / f"java-functional-lsp-{getpass.getuser()}" / "fresh" / digest
+    return Path(tempfile.gettempdir()) / f"java-functional-lsp-{_user()}" / "fresh" / digest
+
+
+def _owned(st: os.stat_result) -> bool:
+    return not hasattr(os, "getuid") or st.st_uid == os.getuid()
+
+
+def _read_marker(marker: Path) -> tuple[int, str] | None:
+    """(server pid, content digest), or None unless the marker and its dirs are private and ours."""
+    try:
+        for level in (marker.parent.parent, marker.parent):
+            st = os.lstat(level)
+            if not stat.S_ISDIR(st.st_mode) or not _owned(st) or st.st_mode & 0o077:
+                return None
+        fd = os.open(marker, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
+        try:
+            st = os.fstat(fd)
+            if not stat.S_ISREG(st.st_mode) or not _owned(st):
+                return None
+            pid, digest = os.read(fd, MARKER_MAX_BYTES).decode().split()
+        finally:
+            os.close(fd)
+        return int(pid), digest
+    except (OSError, ValueError):
+        return None
+
+
+def _server_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
 
 
 def _wait_for_fresh_diagnostics(path: Path, budget: float) -> None:
     """Wait until the language server has published final diagnostics for this edit.
 
     Claude Code attaches LSP diagnostics right after PostToolUse hooks finish, but jdtls
-    needs 0.4-2.4s to re-validate (#109). The server stamps a marker per file on each
-    final publish; waiting for a stamp newer than the edit puts fresh results in this
-    tool result. No marker means the server doesn't track this file — don't wait.
+    needs 0.4-2.4s to re-validate (#109). On each final publish the server records its pid
+    and a hash of the content it analyzed; waiting until that hash matches the file puts
+    fresh results in this tool result. No marker, or a dead server, means nobody will
+    publish — don't wait.
     """
     marker = _marker_path(str(path))
-    if not marker.is_file():
+    current = _read_marker(marker)
+    if current is None or not _server_alive(current[0]):
         return
-    edited_at = path.stat().st_mtime
+    want = hashlib.sha256(path.read_bytes()).hexdigest()
     deadline = time.monotonic() + min(_fresh_wait_seconds(), budget)
-    while True:
-        try:
-            if float(marker.read_text()) >= edited_at:
-                return
-        except (OSError, ValueError):
-            return
-        if time.monotonic() >= deadline:
-            return
+    while current is not None and current[1] != want and time.monotonic() < deadline:
         time.sleep(POLL_SECONDS)
+        current = _read_marker(marker)
 
 
 def _lint_in_process(path: Path) -> list[str] | None:
@@ -105,8 +148,11 @@ def main() -> None:
     lines = _lint_in_process(path)
     if lines is None:
         lines = _lint_via_cli(path)
-    # Stay under the SIGALRM cap so the lint output below is never lost.
-    _wait_for_fresh_diagnostics(path, budget=TIMEOUT_SECONDS - 0.5 - (time.monotonic() - started))
+    try:
+        budget = TIMEOUT_SECONDS - EXIT_MARGIN_SECONDS - (time.monotonic() - started)
+        _wait_for_fresh_diagnostics(path, budget=budget)
+    except Exception:
+        pass  # a marker problem must never suppress the lint output below
     if not lines:
         return  # clean file: stay silent, no per-edit context noise
 

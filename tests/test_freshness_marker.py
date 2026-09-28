@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import getpass
 import importlib.util
 import json
 import os
@@ -10,6 +11,7 @@ import sys
 import tempfile
 import threading
 import time
+from collections.abc import Iterator
 from pathlib import Path
 from types import ModuleType
 from typing import Any
@@ -20,6 +22,7 @@ from java_functional_lsp import freshness_marker
 
 HOOK = Path(__file__).parent.parent / "hooks" / "post_tool_lint.py"
 CLEAN_JAVA = "public class Clean {}\n"
+DEAD_PID = 2**22 + 12345  # above the default pid_max on Linux and macOS
 
 
 def _load_hook() -> ModuleType:
@@ -32,22 +35,36 @@ def _load_hook() -> ModuleType:
 
 
 @pytest.fixture
-def private_tmp(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+def private_tmp(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Path]:
     monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
-    return tmp_path
+    freshness_marker._validated.clear()
+    yield tmp_path
+    freshness_marker._validated.clear()
 
 
-def _run_hook(file_path: Path, tmpdir: Path, **env: str) -> tuple[subprocess.CompletedProcess[str], float]:
-    payload = json.dumps({"tool_input": {"file_path": str(file_path)}})
+def _digest_of(path: Path) -> str:
+    return freshness_marker.content_digest(path.read_bytes())
+
+
+def _stamp(java: Path, digest: str, pid: int | None = None) -> None:
+    """Write a marker the way the server does (tempfile.tempdir must point at the test dir)."""
+    if pid is None:
+        freshness_marker.write_marker(str(java), digest)
+        return
+    marker = freshness_marker.marker_path(str(java))
+    marker.write_text(f"{pid} {digest}")
+
+
+def _run_hook(file_path: Path, tmpdir: Path, wait: str = "3") -> tuple[subprocess.CompletedProcess[str], float]:
     started = time.monotonic()
     proc = subprocess.run(
         [sys.executable, str(HOOK)],
-        input=payload,
+        input=json.dumps({"tool_input": {"file_path": str(file_path)}}),
         capture_output=True,
         text=True,
         timeout=30,
         check=False,
-        env={**os.environ, "TMPDIR": str(tmpdir), **env},
+        env={**os.environ, "TMPDIR": str(tmpdir), "JAVA_FUNCTIONAL_LSP_HOOK_WAIT": wait},
     )
     return proc, time.monotonic() - started
 
@@ -57,90 +74,170 @@ class TestMarker:
         java = private_tmp / "A.java"
         assert _load_hook()._marker_path(str(java)) == freshness_marker.marker_path(str(java))
 
-    def test_write_marker_records_time_in_private_dir(self, private_tmp: Path) -> None:
-        java = private_tmp / "A.java"
-        before = time.time()
-        freshness_marker.write_marker(str(java))
-        marker = freshness_marker.marker_path(str(java))
-        assert float(marker.read_text()) >= before
-        assert oct(marker.parent.stat().st_mode & 0o777) == oct(0o700)
-        assert str(java) not in marker.read_text()
+    def test_user_fallback_matches_when_getpass_fails(self, private_tmp: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        def no_user() -> str:
+            raise KeyError("no passwd entry")
 
-    def test_symlinked_marker_dir_is_refused(self, private_tmp: Path) -> None:
+        monkeypatch.setattr(getpass, "getuser", no_user)
+        java = private_tmp / "A.java"
+        assert _load_hook()._marker_path(str(java)) == freshness_marker.marker_path(str(java))
+        assert str(os.getuid()) in str(freshness_marker.marker_dir())
+
+    def test_write_marker_records_pid_and_digest_privately(self, private_tmp: Path) -> None:
+        java = private_tmp / "A.java"
+        freshness_marker.write_marker(str(java), "abc123")
+        marker = freshness_marker.marker_path(str(java))
+        assert marker.read_text() == f"{os.getpid()} abc123"
+        assert marker.stat().st_mode & 0o777 == 0o600
+        assert marker.parent.stat().st_mode & 0o777 == 0o700
+        assert _load_hook()._read_marker(marker) == (os.getpid(), "abc123")
+
+    @pytest.mark.parametrize("level", ["base", "fresh"])
+    def test_symlinked_marker_dir_is_refused(self, private_tmp: Path, level: str) -> None:
         elsewhere = private_tmp / "elsewhere"
         elsewhere.mkdir()
-        base = freshness_marker.marker_dir().parent
-        base.symlink_to(elsewhere)
-        freshness_marker.write_marker(str(private_tmp / "A.java"))
+        directory = freshness_marker.marker_dir()
+        if level == "base":
+            directory.parent.symlink_to(elsewhere)
+        else:
+            directory.parent.mkdir(mode=0o700)
+            directory.symlink_to(elsewhere)
+        freshness_marker.write_marker(str(private_tmp / "A.java"), "abc")
         assert not any(elsewhere.rglob("*"))
+
+    def test_loose_permissions_are_tightened(self, private_tmp: Path) -> None:
+        base = freshness_marker.marker_dir().parent
+        base.mkdir(mode=0o755)
+        base.chmod(0o755)
+        freshness_marker.write_marker(str(private_tmp / "A.java"), "abc")
+        assert base.stat().st_mode & 0o777 == 0o700
 
     def test_write_marker_never_raises(self, private_tmp: Path) -> None:
         freshness_marker.marker_dir().parent.write_text("not a directory")
-        freshness_marker.write_marker(str(private_tmp / "A.java"))
+        freshness_marker.write_marker(str(private_tmp / "A.java"), "abc")
+        assert not freshness_marker.marker_dir().exists()
+
+    @pytest.mark.parametrize("content", ["", "garbage", "1 2 3", "notapid abc"])
+    def test_hook_rejects_malformed_marker(self, private_tmp: Path, content: str) -> None:
+        java = private_tmp / "A.java"
+        freshness_marker.write_marker(str(java), "abc")
+        marker = freshness_marker.marker_path(str(java))
+        marker.write_text(content)
+        assert _load_hook()._read_marker(marker) is None
+
+    def test_hook_rejects_loose_marker_dir(self, private_tmp: Path) -> None:
+        java = private_tmp / "A.java"
+        freshness_marker.write_marker(str(java), "abc")
+        freshness_marker.marker_dir().chmod(0o777)
+        assert _load_hook()._read_marker(freshness_marker.marker_path(str(java))) is None
+
+    def test_hook_does_not_follow_marker_symlink(self, private_tmp: Path) -> None:
+        java = private_tmp / "A.java"
+        freshness_marker.write_marker(str(java), "abc")
+        marker = freshness_marker.marker_path(str(java))
+        target = private_tmp / "planted"
+        target.write_text(f"{os.getpid()} abc")
+        marker.unlink()
+        marker.symlink_to(target)
+        assert _load_hook()._read_marker(marker) is None
 
 
-class TestHookWaits:
-    def _java(self, root: Path) -> Path:
+class TestHookWait:
+    """_wait_for_fresh_diagnostics in-process: real time, small budgets."""
+
+    def _java(self, root: Path, text: str = CLEAN_JAVA) -> Path:
         java = root / "Clean.java"
-        java.write_text(CLEAN_JAVA)
+        java.write_text(text)
         return java
 
-    def _stamp(self, java: Path, at: float, tmpdir: Path) -> None:
-        marker = _load_hook_marker(java, tmpdir)
-        marker.parent.mkdir(parents=True, exist_ok=True)
-        marker.write_text(repr(at))
+    def _timed_wait(self, java: Path, budget: float, monkeypatch: pytest.MonkeyPatch, wait: str = "4") -> float:
+        monkeypatch.setenv("JAVA_FUNCTIONAL_LSP_HOOK_WAIT", wait)
+        started = time.monotonic()
+        _load_hook()._wait_for_fresh_diagnostics(java, budget=budget)
+        return time.monotonic() - started
 
-    def test_waits_until_server_publishes_after_the_edit(self, tmp_path: Path) -> None:
-        java = self._java(tmp_path)
-        self._stamp(java, java.stat().st_mtime - 5, tmp_path)  # previous edit's publish
-        timer = threading.Timer(0.5, lambda: self._stamp(java, time.time(), tmp_path))
+    def test_returns_when_digest_matches(self, private_tmp: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        java = self._java(private_tmp)
+        _stamp(java, "previous-version")
+        timer = threading.Timer(0.3, lambda: _stamp(java, _digest_of(java)))
         timer.start()
         try:
-            proc, elapsed = _run_hook(java, tmp_path)
+            elapsed = self._timed_wait(java, budget=3.0, monkeypatch=monkeypatch)
         finally:
             timer.cancel()
-        assert proc.returncode == 0
-        assert 0.45 <= elapsed < 3.0
+        assert 0.25 <= elapsed < 2.0
 
-    def test_no_marker_means_no_wait(self, tmp_path: Path) -> None:
-        java = self._java(tmp_path)
-        proc, elapsed = _run_hook(java, tmp_path, JAVA_FUNCTIONAL_LSP_HOOK_WAIT="3")
-        assert proc.returncode == 0
-        assert elapsed < 2.5
+    def test_already_matching_returns_at_once(self, private_tmp: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        java = self._java(private_tmp)
+        _stamp(java, _digest_of(java))
+        assert self._timed_wait(java, budget=3.0, monkeypatch=monkeypatch) < 0.2
 
-    def test_already_fresh_marker_returns_at_once(self, tmp_path: Path) -> None:
-        java = self._java(tmp_path)
-        self._stamp(java, time.time() + 1, tmp_path)
-        _, elapsed = _run_hook(java, tmp_path, JAVA_FUNCTIONAL_LSP_HOOK_WAIT="3")
-        assert elapsed < 2.5
+    def test_no_marker_means_no_wait(self, private_tmp: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        assert self._timed_wait(self._java(private_tmp), budget=3.0, monkeypatch=monkeypatch) < 0.2
 
-    def test_wait_is_bounded(self, tmp_path: Path) -> None:
-        java = self._java(tmp_path)
-        self._stamp(java, java.stat().st_mtime - 5, tmp_path)
-        proc, elapsed = _run_hook(java, tmp_path, JAVA_FUNCTIONAL_LSP_HOOK_WAIT="0.6")
-        assert proc.returncode == 0
-        assert 0.55 <= elapsed < 3.0
+    def test_dead_server_means_no_wait(self, private_tmp: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        java = self._java(private_tmp)
+        _stamp(java, "previous-version")  # creates the private dirs
+        _stamp(java, "previous-version", pid=DEAD_PID)
+        assert self._timed_wait(java, budget=3.0, monkeypatch=monkeypatch) < 0.2
+
+    def test_opening_placeholder_waits(self, private_tmp: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        java = self._java(private_tmp)
+        _stamp(java, freshness_marker.OPENING)
+        elapsed = self._timed_wait(java, budget=0.3, monkeypatch=monkeypatch)
+        assert 0.25 <= elapsed < 1.0
+
+    @pytest.mark.parametrize(("budget", "wait", "low", "high"), [(0.3, "4", 0.25, 1.0), (4.0, "0.3", 0.25, 1.0)])
+    def test_wait_bounded_by_budget_and_setting(
+        self, private_tmp: Path, monkeypatch: pytest.MonkeyPatch, budget: float, wait: str, low: float, high: float
+    ) -> None:
+        java = self._java(private_tmp)
+        _stamp(java, "previous-version")
+        assert low <= self._timed_wait(java, budget=budget, monkeypatch=monkeypatch, wait=wait) < high
+
+    @pytest.mark.parametrize("budget", [0.0, -1.0])
+    def test_exhausted_budget_returns_immediately(
+        self, private_tmp: Path, monkeypatch: pytest.MonkeyPatch, budget: float
+    ) -> None:
+        java = self._java(private_tmp)
+        _stamp(java, "previous-version")
+        assert self._timed_wait(java, budget=budget, monkeypatch=monkeypatch) < 0.2
 
     @pytest.mark.parametrize(("value", "expected"), [("1.5", 1.5), ("-1", 0.0), ("99", 4.0), ("soon", 3.0)])
     def test_wait_seconds_parsing(self, monkeypatch: pytest.MonkeyPatch, value: str, expected: float) -> None:
         monkeypatch.setenv("JAVA_FUNCTIONAL_LSP_HOOK_WAIT", value)
         assert _load_hook()._fresh_wait_seconds() == expected
 
-    def test_violations_still_reported_after_wait(self, tmp_path: Path) -> None:
-        java = tmp_path / "Bad.java"
+
+class TestHookSubprocess:
+    """Smoke tests of the hook as Claude Code runs it."""
+
+    def test_waits_for_matching_digest(self, private_tmp: Path) -> None:
+        java = private_tmp / "Clean.java"
+        java.write_text(CLEAN_JAVA)
+        _stamp(java, "previous-version")
+        timer = threading.Timer(1.0, lambda: _stamp(java, _digest_of(java)))
+        timer.start()
+        try:
+            proc, elapsed = _run_hook(java, private_tmp)
+        finally:
+            timer.cancel()
+        assert proc.returncode == 0
+        assert 0.95 <= elapsed < 3.0
+
+    def test_violations_still_reported_after_wait(self, private_tmp: Path) -> None:
+        java = private_tmp / "Bad.java"
         java.write_text("public class Bad { String f() { return null; } }\n")
-        self._stamp(java, java.stat().st_mtime - 5, tmp_path)
-        proc, _ = _run_hook(java, tmp_path, JAVA_FUNCTIONAL_LSP_HOOK_WAIT="0.3")
+        _stamp(java, "previous-version")
+        proc, _ = _run_hook(java, private_tmp, wait="0.3")
+        assert proc.returncode == 0
         out: dict[str, Any] = json.loads(proc.stdout)
         assert "null-return" in out["hookSpecificOutput"]["additionalContext"]
 
-
-def _load_hook_marker(java: Path, tmpdir: Path) -> Path:
-    """The marker path as the hook subprocess (TMPDIR=tmpdir) computes it."""
-    saved = tempfile.tempdir
-    tempfile.tempdir = str(tmpdir)
-    try:
-        path: Path = _load_hook()._marker_path(str(java))
-        return path
-    finally:
-        tempfile.tempdir = saved
+    def test_broken_marker_dir_never_suppresses_lint_output(self, private_tmp: Path) -> None:
+        java = private_tmp / "Bad.java"
+        java.write_text("public class Bad { String f() { return null; } }\n")
+        freshness_marker.marker_dir().parent.write_text("not a directory")
+        proc, _ = _run_hook(java, private_tmp)
+        assert proc.returncode == 0
+        assert "null-return" in json.loads(proc.stdout)["hookSpecificOutput"]["additionalContext"]

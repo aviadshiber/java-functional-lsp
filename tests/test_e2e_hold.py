@@ -120,22 +120,31 @@ class _PublishWatch:
                 return False
         return True
 
-    async def wait_quiet(self, uri: str, since: int) -> None:
+    async def wait_quiet(self, uri: str, since: int) -> bool:
         """Wait until *uri* published at least once after index *since*, then stayed quiet."""
         deadline = asyncio.get_running_loop().time() + _CONVERGE_TIMEOUT_SEC
         while asyncio.get_running_loop().time() < deadline:
             if not await self._next(uri, _QUIET_SEC) and len(self.history.get(uri, [])) > since:
-                return
+                return True
+        return False
 
 
-async def _start_server(root: Path, watch: _PublishWatch, **env: str) -> LanguageClient:
+async def _start_server(root: Path, watch: _PublishWatch, markers: Path, **env: str) -> LanguageClient:
+    """Start the server as Claude Code; markers go to a private TMPDIR, never the user's real one."""
     client = LanguageClient("e2e-hold", "1.0")
 
     def on_publish(params: lsp.PublishDiagnosticsParams) -> None:  # pygls needs a plain function
         watch.on_publish(params)
 
     client.feature(lsp.TEXT_DOCUMENT_PUBLISH_DIAGNOSTICS)(on_publish)
-    await client.start_io(sys.executable, "-m", "java_functional_lsp", env={**os.environ, **env})
+    server_env = {
+        **os.environ,
+        "TMPDIR": str(markers),
+        "JAVA_FUNCTIONAL_LSP_DIAG_HOLD": "custom-first",
+        "JAVA_FUNCTIONAL_LSP_AGENT_DIDSAVE": "on",
+        **env,
+    }
+    await client.start_io(sys.executable, "-m", "java_functional_lsp", env=server_env)
     await client.initialize_async(
         lsp.InitializeParams(
             process_id=os.getpid(),
@@ -179,25 +188,33 @@ def _agent_edit(client: LanguageClient, path: Path, text: str, version: int) -> 
     )
 
 
-def _run_hook(path: Path, tmpdir: Path) -> None:
-    subprocess.run(
+def _run_hook(path: Path, tmpdir: Path) -> int:
+    proc = subprocess.run(
         [sys.executable, str(HOOK)],
         input=json.dumps({"tool_input": {"file_path": str(path)}}),
         capture_output=True,
         text=True,
         timeout=30,
         check=False,
-        env={**os.environ, "TMPDIR": str(tmpdir)},
+        env={**os.environ, "TMPDIR": str(tmpdir), "JAVA_FUNCTIONAL_LSP_HOOK_WAIT": "4"},
     )
+    return proc.returncode
+
+
+def _markers(tmp_path: Path) -> Path:
+    markers = tmp_path / "tmp"
+    markers.mkdir()
+    return markers
 
 
 @pytest.mark.timeout(_READY_TIMEOUT_SEC + 60)
 @pytest.mark.parametrize("mode", ["custom-first", "off"])
 async def test_fixing_import_never_republishes_resolved_error(tmp_path: Path, mode: str) -> None:
+    markers = _markers(tmp_path)
     foo = _write_project(tmp_path, {"q/Bar.java": _BAR, "p/Foo.java": _FOO_BROKEN})["p/Foo.java"]
     uri = foo.as_uri()
     watch = _PublishWatch()
-    client = await _start_server(tmp_path, watch, JAVA_FUNCTIONAL_LSP_DIAG_HOLD=mode)
+    client = await _start_server(tmp_path, watch, markers, JAVA_FUNCTIONAL_LSP_DIAG_HOLD=mode)
     try:
         _open(client, foo)
         if not await watch.wait_for(uri, lambda d: _has(d, _UNRESOLVED), _READY_TIMEOUT_SEC):
@@ -220,20 +237,19 @@ async def test_fixing_import_never_republishes_resolved_error(tmp_path: Path, mo
 @pytest.mark.timeout(_READY_TIMEOUT_SEC + 60)
 async def test_hook_returns_after_fresh_jdtls_publish(tmp_path: Path) -> None:
     """When the PostToolUse hook returns, the client already holds jdtls's result for the edit."""
-    markers = tmp_path / "tmp"
-    markers.mkdir()
-    project = tmp_path / "proj"
-    project.mkdir()
-    foo = _write_project(project, {"q/Bar.java": _BAR, "p/Foo.java": _FOO_BROKEN})["p/Foo.java"]
+    markers = _markers(tmp_path)
+    foo = _write_project(tmp_path, {"q/Bar.java": _BAR, "p/Foo.java": _FOO_BROKEN})["p/Foo.java"]
     uri = foo.as_uri()
     watch = _PublishWatch()
-    client = await _start_server(project, watch, TMPDIR=str(markers))
+    client = await _start_server(tmp_path, watch, markers)
     try:
         _open(client, foo)
         if not await watch.wait_for(uri, lambda d: _has(d, _UNRESOLVED), _READY_TIMEOUT_SEC):
             pytest.skip("jdtls did not report the unresolved type in time (project import too slow)")
         _agent_edit(client, foo, _FOO_FIXED_NEW_ERROR, 2)
-        await asyncio.to_thread(_run_hook, foo, markers)
+        if _has(watch.latest(uri), _TYPE_MISMATCH):
+            pytest.skip("inconclusive: jdtls answered before the hook started")
+        assert await asyncio.to_thread(_run_hook, foo, markers) == 0
         await asyncio.sleep(0.1)  # let the client read what the server sent before the hook returned
         latest = watch.latest(uri)
         assert not _has(latest, _UNRESOLVED), _messages(latest)
@@ -244,12 +260,19 @@ async def test_hook_returns_after_fresh_jdtls_publish(tmp_path: Path) -> None:
 
 @pytest.mark.timeout(_READY_TIMEOUT_SEC + 3 * _CONVERGE_TIMEOUT_SEC + 60)
 async def test_cross_file_arity_change_converges_without_client_did_save(tmp_path: Path) -> None:
-    """Without didSave jdtls left Caller stale in ~2/5 runs; the server now sends it (three cycles)."""
+    """Without didSave jdtls left Caller stale in ~2/5 runs; the server now sends it (three cycles).
+
+    hold-all so every publish carries jdtls results (custom-first's custom-only publish has
+    no jdtls errors and could satisfy the check early). This is a smoke test: the stale case
+    is nondeterministic, and with JAVA_FUNCTIONAL_LSP_AGENT_DIDSAVE=off it failed in only some
+    manual runs. The didSave effect itself is measured in tests/test_e2e_cross_file.py.
+    """
+    markers = _markers(tmp_path)
     paths = _write_project(tmp_path, {"p/Foo.java": _foo(2), "p/Caller.java": _caller(1)})
     foo, caller = paths["p/Foo.java"], paths["p/Caller.java"]
     caller_uri = caller.as_uri()
     watch = _PublishWatch()
-    client = await _start_server(tmp_path, watch)
+    client = await _start_server(tmp_path, watch, markers, JAVA_FUNCTIONAL_LSP_DIAG_HOLD="hold-all")
     try:
         _open(client, foo)
         _open(client, caller)
@@ -264,7 +287,7 @@ async def test_cross_file_arity_change_converges_without_client_did_save(tmp_pat
             since = len(watch.history[caller_uri])
             _agent_edit(client, foo, _foo(arity), version)
             _agent_edit(client, caller, _caller(arity), version)
-            await watch.wait_quiet(caller_uri, since)
+            assert await watch.wait_quiet(caller_uri, since), f"arity {arity}: Caller never published or settled"
             published = [_errors(d) for d in watch.history[caller_uri][since:]]
             assert not _errors(watch.latest(caller_uri)), f"arity {arity}: Caller publishes after the edit: {published}"
     finally:
