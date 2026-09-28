@@ -4,7 +4,8 @@ Reproduces the issue's arity variant against a real jdtls: ``Foo`` gains a const
 parameter, then ``Caller``'s call site is updated, both written to disk like an agent's
 Edit tool does. With didSave jdtls converges every time; without it, in roughly 2 of 5
 runs jdtls's only post-edit publish for Caller still reports the old arity and is never
-corrected (xfail, non-strict — the wrapper-side fix is tracked as #109 Part B).
+corrected (opt-in measurement). The server therefore forwards a didSave after agent edits;
+tests/test_e2e_hold.py covers that end to end.
 """
 
 from __future__ import annotations

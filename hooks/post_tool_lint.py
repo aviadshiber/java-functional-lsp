@@ -3,7 +3,9 @@
 
 Reads the Claude Code PostToolUse JSON payload on stdin, runs java-functional-lsp
 on the edited file, and emits diagnostics as ``hookSpecificOutput.additionalContext``
-so the agent sees them in context and can fix them immediately (issue #70).
+so the agent sees them in context and can fix them immediately (issue #70). Before
+returning it waits (bounded) for the running language server to publish fresh jdtls
+diagnostics for the file, so Claude Code attaches current ones to this edit (#109).
 
 Failure-safe by design: every path exits 0 — a linter problem must never break the
 editing session. Prefers the fast in-process import; falls back to the CLI when the
@@ -12,14 +14,57 @@ package is not importable under this interpreter.
 
 from __future__ import annotations
 
+import getpass
+import hashlib
 import json
+import os
 import signal
 import subprocess
 import sys
+import tempfile
+import time
 from pathlib import Path
 
 TIMEOUT_SECONDS = 5  # hard cap; single-file analysis is typically <200ms
 MAX_DIAGNOSTICS = 25  # keep additionalContext bounded
+POLL_SECONDS = 0.05
+
+
+def _fresh_wait_seconds() -> float:
+    try:
+        return max(0.0, min(float(os.environ.get("JAVA_FUNCTIONAL_LSP_HOOK_WAIT", "3")), 4.0))
+    except ValueError:
+        return 3.0
+
+
+def _marker_path(file_path: str) -> Path:
+    """Must match java_functional_lsp.freshness_marker.marker_path (a test checks)."""
+    digest = hashlib.sha256(os.path.realpath(file_path).encode()).hexdigest()[:32]
+    return Path(tempfile.gettempdir()) / f"java-functional-lsp-{getpass.getuser()}" / "fresh" / digest
+
+
+def _wait_for_fresh_diagnostics(path: Path, budget: float) -> None:
+    """Wait until the language server has published final diagnostics for this edit.
+
+    Claude Code attaches LSP diagnostics right after PostToolUse hooks finish, but jdtls
+    needs 0.4-2.4s to re-validate (#109). The server stamps a marker per file on each
+    final publish; waiting for a stamp newer than the edit puts fresh results in this
+    tool result. No marker means the server doesn't track this file — don't wait.
+    """
+    marker = _marker_path(str(path))
+    if not marker.is_file():
+        return
+    edited_at = path.stat().st_mtime
+    deadline = time.monotonic() + min(_fresh_wait_seconds(), budget)
+    while True:
+        try:
+            if float(marker.read_text()) >= edited_at:
+                return
+        except (OSError, ValueError):
+            return
+        if time.monotonic() >= deadline:
+            return
+        time.sleep(POLL_SECONDS)
 
 
 def _lint_in_process(path: Path) -> list[str] | None:
@@ -48,6 +93,7 @@ def _lint_via_cli(path: Path) -> list[str]:
 
 
 def main() -> None:
+    started = time.monotonic()
     hook_input = json.load(sys.stdin)
     file_path = (hook_input.get("tool_input") or {}).get("file_path", "")
     if not file_path.endswith(".java"):
@@ -59,6 +105,8 @@ def main() -> None:
     lines = _lint_in_process(path)
     if lines is None:
         lines = _lint_via_cli(path)
+    # Stay under the SIGALRM cap so the lint output below is never lost.
+    _wait_for_fresh_diagnostics(path, budget=TIMEOUT_SECONDS - 0.5 - (time.monotonic() - started))
     if not lines:
         return  # clean file: stay silent, no per-edit context noise
 

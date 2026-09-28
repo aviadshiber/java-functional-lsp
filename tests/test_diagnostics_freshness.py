@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import AsyncIterator, Callable
+from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -578,6 +579,66 @@ class TestHoldWiring:
                 await asyncio.gather(task, return_exceptions=True)
             server._session_opened_uris.pop(srv_mod._normalize_uri(client_uri), None)
             server.workspace.remove_text_document(client_uri)
+
+
+class TestAgentHost:
+    """Claude Code support: freshness markers for the PostToolUse hook, didSave after disk writes."""
+
+    async def test_marker_written_on_final_publish_not_custom_first(
+        self, live: MagicMock, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        marker = MagicMock()
+        monkeypatch.setattr(srv_mod, "write_marker", marker)
+        monkeypatch.setattr(server, "_agent_host", True)
+        server._hold_mode = _HOLD_CUSTOM_FIRST
+        await _edit()
+        await _until(lambda: live.call_count == 1)
+        marker.assert_not_called()  # custom-only publish is not final
+        await _past_min_age()
+        _jdtls_publishes([])
+        await _until(lambda: live.call_count == 2)
+        marker.assert_called_once_with("/mod/src/Foo.java")
+
+    async def test_no_marker_for_other_clients(self, live: MagicMock, monkeypatch: pytest.MonkeyPatch) -> None:
+        marker = MagicMock()
+        monkeypatch.setattr(srv_mod, "write_marker", marker)
+        await on_did_save(lsp.DidSaveTextDocumentParams(text_document=lsp.TextDocumentIdentifier(uri=URI)))
+        assert live.call_count == 1
+        marker.assert_not_called()
+
+    @pytest.mark.usefixtures("live")
+    @pytest.mark.parametrize(("on_disk", "expect_save"), [(SOURCE, True), (SOURCE + "// newer", False), (None, False)])
+    async def test_did_save_forwarded_only_when_buffer_matches_disk(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, on_disk: str | None, expect_save: bool
+    ) -> None:
+        java = tmp_path / "Disk.java"
+        if on_disk is not None:
+            java.write_text(on_disk)
+        uri = java.as_uri()
+        _put_document(uri)
+        monkeypatch.setattr(server, "_agent_host", True)
+        try:
+            await _edit(uri)
+            sent = server._proxy.send_notification
+            assert isinstance(sent, AsyncMock)
+            await _until(lambda: sent.await_count >= 1)
+            methods = [call.args[0] for call in sent.call_args_list]
+            assert methods[0] == "textDocument/didChange"
+            assert ("textDocument/didSave" in methods) is expect_save
+        finally:
+            task = srv_mod._pending.pop(uri, None)
+            if task is not None:
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+            server._session_opened_uris.pop(srv_mod._normalize_uri(uri), None)
+            server.workspace.remove_text_document(uri)
+
+    @pytest.mark.usefixtures("live")
+    async def test_ide_clients_do_not_read_disk_on_change(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        forward_save = MagicMock()
+        monkeypatch.setattr(srv_mod, "_forward_save_if_on_disk", forward_save)
+        await _edit()
+        forward_save.assert_not_called()
 
 
 # --- Proxy additions ---

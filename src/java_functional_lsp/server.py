@@ -47,6 +47,7 @@ from .capabilities import (
     StaticCapabilityBuilder,
 )
 from .fixes import get_fix, get_fix_registry_keys
+from .freshness_marker import write_marker
 from .proxy import JdtlsProxy, _module_snapshot_path, _resolve_module_uri
 
 logger = logging.getLogger(__name__)
@@ -278,6 +279,9 @@ class JavaFunctionalLspServer(LanguageServer):
         self._user_suppress_patterns: list[re.Pattern[str]] = []
         self._skip_jdtls: bool = False
         self._hold_mode: str = _HOLD_OFF
+        # Agent host (Claude Code): writes files before didChange and reads diagnostics
+        # right after its PostToolUse hooks — see _forward_save_if_on_disk / write_marker.
+        self._agent_host: bool = False
         self._skip_jdtls_registration: bool = False
         self._init_generation: int = 0
         # Capability entries the negotiator decided to register dynamically
@@ -702,6 +706,7 @@ def on_initialize(params: lsp.InitializeParams) -> lsp.InitializeResult:
     _jdtls_capabilities_registered = False
     _release_all_holds()
     server._hold_mode = _resolve_hold_mode(client_name)
+    server._agent_host = any(token in client_name for token in _CUSTOM_FIRST_CLIENTS)
     logger.info("jdtls diagnostics hold mode: %s", server._hold_mode)
 
     jdtls_override = os.environ.get("JAVA_FUNCTIONAL_LSP_JDTLS", "").strip().lower()
@@ -841,6 +846,29 @@ def _analyze_and_publish(uri: str, *, include_jdtls: bool = True, trigger: str =
             "publish %s trigger=%s java=%d custom=%d", Path(client_uri).name, trigger, java, len(diagnostics) - java
         )
     server.text_document_publish_diagnostics(lsp.PublishDiagnosticsParams(uri=client_uri, diagnostics=diagnostics))
+    if include_jdtls and server._agent_host:
+        fs_path = to_fs_path(client_uri)
+        if fs_path:
+            write_marker(fs_path)
+
+
+def _forward_save_if_on_disk(uri: str) -> None:
+    """Send jdtls a didSave when the edited buffer matches the file on disk.
+
+    Agent hosts write the file themselves and may not send didSave; without it jdtls can
+    re-validate dependent files against the old version of the edited one and never
+    correct them (#109: stale in ~2 of 5 runs, never with didSave).
+    """
+    fs_path = to_fs_path(uri)
+    if not fs_path:
+        return
+    source = server.workspace.get_text_document(uri).source.encode()
+    try:
+        if os.path.getsize(fs_path) != len(source) or Path(fs_path).read_bytes() != source:
+            return
+    except OSError:
+        return
+    _forward_or_queue("textDocument/didSave", {"textDocument": {"uri": uri}})
 
 
 def _resolve_hold_mode(client_name: str) -> str:
@@ -1001,6 +1029,8 @@ async def on_did_change(params: lsp.DidChangeTextDocumentParams) -> None:
     uri = params.text_document.uri
     if _forward_or_queue("textDocument/didChange", _serialize_params(params)):
         _track_forwarded_edit(uri)
+        if server._agent_host:
+            _forward_save_if_on_disk(uri)
     # Cancel pending validation, schedule new one (150ms debounce for IDE typing)
     if uri in _pending:
         _pending[uri].cancel()
