@@ -75,7 +75,8 @@ def _read_marker(marker: Path) -> tuple[int, str] | None:
             pid, digest = os.read(fd, MARKER_MAX_BYTES).decode().split()
         finally:
             os.close(fd)
-        return int(pid), digest
+        server_pid = int(pid)
+        return (server_pid, digest) if server_pid > 0 else None  # kill(0|-n, 0) targets groups
     except (OSError, ValueError):
         return None
 

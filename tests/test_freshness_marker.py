@@ -22,7 +22,7 @@ from java_functional_lsp import freshness_marker
 
 HOOK = Path(__file__).parent.parent / "hooks" / "post_tool_lint.py"
 CLEAN_JAVA = "public class Clean {}\n"
-DEAD_PID = 2**22 + 12345  # above the default pid_max on Linux and macOS
+DEAD_PID = 2**22 + 12345  # above the hard pid limit on Linux (PID_MAX_LIMIT 2**22) and macOS (99999)
 
 
 def _load_hook() -> ModuleType:
@@ -117,7 +117,7 @@ class TestMarker:
         freshness_marker.write_marker(str(private_tmp / "A.java"), "abc")
         assert not freshness_marker.marker_dir().exists()
 
-    @pytest.mark.parametrize("content", ["", "garbage", "1 2 3", "notapid abc"])
+    @pytest.mark.parametrize("content", ["", "garbage", "1 2 3", "notapid abc", "0 abc", "-1 abc"])
     def test_hook_rejects_malformed_marker(self, private_tmp: Path, content: str) -> None:
         java = private_tmp / "A.java"
         freshness_marker.write_marker(str(java), "abc")
