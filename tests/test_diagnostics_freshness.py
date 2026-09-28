@@ -63,7 +63,7 @@ class TestFreshnessState:
         state.note_forwarded_change()
         state.mark_pending(key)
         clock.now += after
-        return state.on_publish(key, "sig")
+        return state.on_publish(key, lambda: "sig")
 
     def test_publish_after_min_age_releases(self) -> None:
         state, clock = self._state()
@@ -75,36 +75,64 @@ class TestFreshnessState:
         assert self._release(state, clock, 0.1) == "too_early"
         assert state.is_pending("k")
 
-    def test_change_to_other_file_makes_publish_too_early(self) -> None:
-        """jdtls has one validation job; any file's change restarts it."""
+    def test_change_to_other_file_does_not_block_release(self) -> None:
+        """A publish reflects this file's latest content once its own edit is old enough."""
         state, clock = self._state()
         state.note_forwarded_change()
         state.mark_pending("a")
         clock.now += 1.0
         state.note_forwarded_change()  # edit to another file
         clock.now += 0.1
-        assert state.on_publish("a", "sig") == "too_early"
+        assert state.on_publish("a", lambda: "sig") == "released"
+
+    def test_signature_is_computed_only_when_needed(self) -> None:
+        state, _ = self._state()
+        signature = MagicMock(return_value="sig")
+        assert state.on_publish("k", signature) == "untracked"
+        signature.assert_not_called()
 
     def test_untracked_uri(self) -> None:
         state, _ = self._state()
-        assert state.on_publish("k", "sig") == "untracked"
+        assert state.on_publish("k", lambda: "sig") == "untracked"
+
+    def test_no_forwarded_change_still_releases_after_min_age(self) -> None:
+        state, clock = self._state()
+        state.mark_pending("k")
+        clock.now += 0.5
+        assert state.on_publish("k", lambda: "sig") == "released"
 
     def test_deadline_extends_with_later_changes_but_caps_at_ceiling(self) -> None:
         state, clock = self._state()
         state.note_forwarded_change()
         state.mark_pending("a")
         start = clock.now
-        assert state.deadline("a") == pytest.approx(start + state.DEADLINE_AFTER_CHANGE)
+        assert state.deadline("a") == pytest.approx(start + state.deadline_after_change)
         for _ in range(20):
             clock.now += 1.0
             state.note_forwarded_change()
-        assert state.deadline("a") == pytest.approx(start + state.CEILING)
+        assert state.deadline("a") == pytest.approx(start + state.ceiling)
+
+    def test_ceiling_counts_from_the_files_latest_edit(self) -> None:
+        state, clock = self._state()
+        for _ in range(20):  # keeps typing in the same file
+            state.note_forwarded_change()
+            state.mark_pending("a")
+            clock.now += 1.0
+        assert state.deadline("a") == pytest.approx(clock.now - 1.0 + state.deadline_after_change)
+
+    def test_constructor_timing_overrides(self) -> None:
+        state = _JdtlsFreshness(clock=FakeClock(), fresh_min_age=0.1, deadline_after_change=1.0, ceiling=2.0)
+        assert (state.fresh_min_age, state.deadline_after_change, state.ceiling) == (0.1, 1.0, 2.0)
+
+    def test_production_defaults_match_readme(self) -> None:
+        state = _JdtlsFreshness()
+        assert (state.fresh_min_age, state.deadline_after_change, state.ceiling) == (0.4, 3.0, 10.0)
 
     def test_expire_only_after_deadline(self) -> None:
         state, clock = self._state()
         state.note_forwarded_change()
         state.mark_pending("k")
-        clock.now += state.DEADLINE_AFTER_CHANGE - 0.01
+        clock.now += state.deadline_after_change - 0.01
         assert not state.expire("k")
         clock.now += 0.02
         assert state.expire("k")
@@ -129,21 +157,29 @@ class TestFreshnessState:
         state.note_forwarded_change()
         state.mark_pending("k")
         clock.now += 0.5
-        state.on_publish("k", "first")
+        state.on_publish("k", lambda: "first")
         clock.now += 0.5
-        assert state.on_publish("k", "first") == "untracked"
-        assert state.on_publish("k", "second") == "late_correction"
-        assert state.on_publish("k", "third") == "untracked"
+        assert state.on_publish("k", lambda: "first") == "untracked"
+        assert state.on_publish("k", lambda: "second") == "late_correction"
+        assert state.on_publish("k", lambda: "third") == "untracked"
         assert state.counts["late_correction"] == 1
+
+    def test_new_edit_closes_late_correction_window(self) -> None:
+        state, clock = self._state()
+        self._release(state, clock, 0.5)
+        state.mark_pending("k")  # next edit
+        clock.now += 0.5
+        assert state.on_publish("k", lambda: "other") == "released"
+        assert state.counts["late_correction"] == 0
 
     def test_different_signature_after_window_is_not_late(self) -> None:
         state, clock = self._state()
         state.note_forwarded_change()
         state.mark_pending("k")
         clock.now += 0.5
-        state.on_publish("k", "first")
+        state.on_publish("k", lambda: "first")
         clock.now += state.LATE_CORRECTION_WINDOW + 1
-        assert state.on_publish("k", "second") == "untracked"
+        assert state.on_publish("k", lambda: "second") == "untracked"
 
     def test_reset_returns_pending_count(self) -> None:
         state, _ = self._state()
@@ -199,10 +235,7 @@ async def live(monkeypatch: pytest.MonkeyPatch) -> AsyncIterator[MagicMock]:
     if created_workspace:
         server.protocol._workspace = Workspace(root_uri=MODULE, sync_kind=lsp.TextDocumentSyncKind.Full)
     _put_document(URI)
-    fresh = _JdtlsFreshness()
-    fresh.FRESH_MIN_AGE = 0.05
-    fresh.DEADLINE_AFTER_CHANGE = 30.0
-    fresh.CEILING = 60.0
+    fresh = _JdtlsFreshness(fresh_min_age=0.05, deadline_after_change=30.0, ceiling=60.0)
     monkeypatch.setattr(srv_mod, "_freshness", fresh)
     monkeypatch.setattr(srv_mod, "_DEBOUNCE_SECONDS", 0.01)
     monkeypatch.setattr(srv_mod, "_resolve_module_uri", MagicMock(return_value=MODULE))
@@ -267,8 +300,8 @@ def _jdtls_publishes(diags: list[dict[str, Any]], uri: str = URI) -> None:
 
 
 def _short_deadlines() -> None:
-    srv_mod._freshness.DEADLINE_AFTER_CHANGE = 0.3
-    srv_mod._freshness.CEILING = 1.0
+    srv_mod._freshness.deadline_after_change = 0.3
+    srv_mod._freshness.ceiling = 1.0
 
 
 class TestHoldWiring:
@@ -338,22 +371,18 @@ class TestHoldWiring:
         assert _messages(published[0], "Java") == []
         assert srv_mod._freshness.counts["too_early"] == 1
 
-    async def test_edit_to_other_file_keeps_first_file_held(self, live: MagicMock) -> None:
+    async def test_edit_to_other_file_does_not_delay_release(self, live: MagicMock) -> None:
         _put_document(OTHER_URI)
         await _edit(URI)
         await _past_min_age()
-        await _edit(OTHER_URI)  # restarts jdtls's single validation job
-        _jdtls_publishes([_java_diag("old snapshot")], uri=URI)
-        await _past_debounce()
-        assert live.call_count == 0
-        await _past_min_age()
-        _jdtls_publishes([], uri=URI)
-        _jdtls_publishes([], uri=OTHER_URI)
-        await _until(lambda: live.call_count == 2)
-        by_uri = {p.uri: p for p in _published(live)}
-        assert _messages(by_uri[URI], "Java") == []
-        assert _messages(by_uri[OTHER_URI], "Java") == []
-        assert srv_mod._freshness.counts["too_early"] == 1
+        await _edit(OTHER_URI)
+        _jdtls_publishes([_java_diag("fresh for Foo")], uri=URI)  # right after Other's change
+        await _until(lambda: live.call_count == 1)
+        published = _published(live)[0]
+        assert published.uri == URI
+        assert _messages(published, "Java") == ["fresh for Foo"]
+        assert srv_mod._freshness.is_pending(srv_mod._normalize_uri(OTHER_URI))
+        assert srv_mod._freshness.counts["too_early"] == 0
 
     async def test_timeout_publishes_cached(self, live: MagicMock) -> None:
         _short_deadlines()
@@ -394,9 +423,10 @@ class TestHoldWiring:
         assert _messages(_published(live)[1], "Java") == ["corrected"]
         assert srv_mod._freshness.counts["late_correction"] == 1
 
-    async def test_did_open_while_pending_publishes_and_hold_still_releases(self, live: MagicMock) -> None:
-        await _edit()
+    async def test_did_open_while_pending_skips_stale_jdtls_and_hold_still_releases(self, live: MagicMock) -> None:
+        _jdtls_publishes([_java_diag("stale")])
         live.reset_mock()
+        await _edit()
         with patch.object(server._proxy, "add_module_if_new", AsyncMock()):
             await on_did_open(
                 lsp.DidOpenTextDocumentParams(
@@ -404,9 +434,12 @@ class TestHoldWiring:
                 )
             )
         assert live.call_count == 1
+        assert _messages(_published(live)[0], "Java") == []
+        assert _messages(_published(live)[0], "java-functional-lsp")
         await _past_min_age()
-        _jdtls_publishes([])
+        _jdtls_publishes([_java_diag("fresh")])
         await _until(lambda: live.call_count == 2)
+        assert _messages(_published(live)[1], "Java") == ["fresh"]
 
     async def test_module_not_ready_uses_debounce_path(self, live: MagicMock) -> None:
         _jdtls_publishes([_java_diag("cached")])
@@ -414,7 +447,17 @@ class TestHoldWiring:
         live.reset_mock()
         await _edit()
         await _until(lambda: live.call_count == 1)
+        assert _messages(_published(live)[0], "Java") == ["cached"]
         assert srv_mod._freshness.counts["ineligible"] == 1
+
+    @pytest.mark.parametrize("patterns", [["**/generated/*.java"], [42]])
+    async def test_non_matching_diagnostic_filter_still_holds(
+        self, live: MagicMock, monkeypatch: pytest.MonkeyPatch, patterns: list[Any]
+    ) -> None:
+        monkeypatch.setattr(server, "_config", {"jdtls": {"settings": {"java": {"diagnostic": {"filter": patterns}}}}})
+        await _edit()
+        assert srv_mod._freshness.is_pending(URI)
+        assert live.call_count == 0
 
     async def test_diagnostic_filter_uri_is_not_held(self, live: MagicMock, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(
@@ -452,14 +495,35 @@ class TestHoldWiring:
         await _edit()
         await _past_debounce()
         server._proxy._mark_stopped()
+        assert server._proxy._diagnostics_cache == {}
         await _until(lambda: live.call_count == 1)
         assert _messages(_published(live)[0], "Java") == []
 
-    async def test_reinitialize_releases_hold(self, live: MagicMock) -> None:
+    async def test_reinitialize_releases_hold(self, live: MagicMock, monkeypatch: pytest.MonkeyPatch) -> None:
+        for attr in (
+            "_config",
+            "_init_params",
+            "_user_suppress_patterns",
+            "_dynamic_features",
+            "_init_generation",
+            "_skip_jdtls_registration",
+        ):
+            monkeypatch.setattr(server, attr, getattr(server, attr))
+        monkeypatch.setattr(srv_mod, "_jdtls_capabilities_registered", srv_mod._jdtls_capabilities_registered)
+        monkeypatch.setattr(srv_mod, "HandlerWiring", MagicMock())
+        monkeypatch.delenv("JAVA_FUNCTIONAL_LSP_DIAG_HOLD", raising=False)
         await _edit()
         await _past_debounce()
         with patch.object(srv_mod, "_load_config", return_value={}):
-            on_initialize(lsp.InitializeParams(capabilities=lsp.ClientCapabilities(), root_uri=MODULE))
+            on_initialize(
+                lsp.InitializeParams(
+                    capabilities=lsp.ClientCapabilities(),
+                    root_uri=MODULE,
+                    client_info=lsp.ClientInfo(name="Claude Code"),
+                )
+            )
+        assert not srv_mod._freshness.is_pending(URI)
+        assert server._hold_mode == _HOLD_CUSTOM_FIRST
         await _until(lambda: live.call_count == 1)
 
     async def test_close_while_pending_cancels_hold(self, live: MagicMock) -> None:
@@ -473,15 +537,19 @@ class TestHoldWiring:
         assert live.call_count == 0
         assert hold_task.cancelled()
         assert not srv_mod._freshness.is_pending(URI)
+        assert URI not in srv_mod._hold_events
 
-    async def test_superseded_hold_task_does_not_publish(self, live: MagicMock) -> None:
+    async def test_superseded_hold_task_does_not_publish_or_steal_event(self, live: MagicMock) -> None:
         srv_mod._freshness.note_forwarded_change()
         srv_mod._freshness.mark_pending(URI)
-        stray = asyncio.create_task(srv_mod._hold_until_fresh(URI, URI))  # not the task in _pending
+        replacement = asyncio.create_task(asyncio.sleep(10))
+        srv_mod._pending[URI] = replacement  # the live task for URI
+        stray = asyncio.create_task(srv_mod._hold_until_fresh(URI, URI))
         await _past_min_age()
         _jdtls_publishes([])
-        await asyncio.gather(stray)
+        await asyncio.wait_for(stray, timeout=2.0)
         assert live.call_count == 0
+        assert URI in srv_mod._hold_events, "the superseded task must not delete the live task's event"
 
     async def test_custom_first_publish_failure_does_not_strand_file(self, live: MagicMock) -> None:
         server._hold_mode = _HOLD_CUSTOM_FIRST
@@ -525,13 +593,33 @@ class TestProxyFreshnessSupport:
         assert not proxy.is_available
         stopped.assert_called_once()
 
-    async def test_reader_eof_marks_stopped(self) -> None:
+    async def test_reader_eof_marks_stopped_once(self) -> None:
         stopped = MagicMock()
         proxy = JdtlsProxy(on_stopped=stopped)
+        proxy._available = True
         reader = asyncio.StreamReader()
         reader.feed_eof()
         await proxy._reader_loop(reader)
+        proxy._mark_stopped()  # stop() after the EOF must not notify again
         stopped.assert_called_once()
+
+    async def test_reader_error_marks_stopped(self) -> None:
+        stopped = MagicMock()
+        proxy = JdtlsProxy(on_stopped=stopped)
+        proxy._available = True
+        with patch("java_functional_lsp.proxy.read_message", AsyncMock(side_effect=ValueError("bad frame"))):
+            await proxy._reader_loop(asyncio.StreamReader())
+        stopped.assert_called_once()
+        assert not proxy.is_available
+
+    def test_dropped_request_method_is_truncated_and_capped(self) -> None:
+        proxy = JdtlsProxy()
+        proxy._note_dropped_request("x" * 500)
+        for i in range(60):
+            proxy._note_dropped_request(f"m{i}")
+        assert "x" * 100 in proxy._dropped_request_counts
+        assert len(proxy._dropped_request_counts) <= 51
+        assert proxy._dropped_request_counts["<other>"] == 11
 
     def test_dropped_requests_counted_by_method(self, caplog: Any) -> None:
         proxy = JdtlsProxy()
@@ -541,5 +629,17 @@ class TestProxyFreshnessSupport:
                     {"id": request_id, "method": "workspace/configuration", "params": {"items": [{"section": "x"}]}}
                 )
         assert proxy._dropped_request_counts == {"workspace/configuration": 2}
-        assert caplog.text.count("workspace/configuration dropped") == 1
+        assert caplog.text.count("'workspace/configuration' dropped") == 1
         assert "section" not in caplog.text
+
+
+class TestLogLevel:
+    @pytest.mark.parametrize(("value", "expected"), [("DEBUG", logging.DEBUG), (" warning ", logging.WARNING)])
+    def test_valid_values(self, monkeypatch: pytest.MonkeyPatch, value: str, expected: int) -> None:
+        monkeypatch.setenv("JAVA_FUNCTIONAL_LSP_LOG_LEVEL", value)
+        assert srv_mod._log_level_from_env() == expected
+
+    @pytest.mark.parametrize("value", ["verbose", "", "basicConfig"])
+    def test_invalid_values_fall_back_to_info(self, monkeypatch: pytest.MonkeyPatch, value: str) -> None:
+        monkeypatch.setenv("JAVA_FUNCTIONAL_LSP_LOG_LEVEL", value)
+        assert srv_mod._log_level_from_env() == logging.INFO

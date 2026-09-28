@@ -324,7 +324,7 @@ Environment variables:
 | Variable | Values | Effect |
 |----------|--------|--------|
 | `JAVA_FUNCTIONAL_LSP_DIAG_HOLD` | `custom-first`, `hold-all`, `off` | Overrides the mode above; `off` restores the previous behavior |
-| `JAVA_FUNCTIONAL_LSP_LOG_LEVEL` | `DEBUG`, `INFO` (default), `WARNING` | Log verbosity; `DEBUG` logs every publish decision (file name, trigger, counts — never code) |
+| `JAVA_FUNCTIONAL_LSP_LOG_LEVEL` | `DEBUG`, `INFO` (default), `WARNING` | Verbosity of java-functional-lsp's own logs; `DEBUG` adds one line per publish decision (file name, trigger, counts). Library logging (pygls) is unaffected — note that pygls already logs the JSON it sends, including diagnostic messages, at `INFO` |
 
 The log reports `jdtls freshness: released=… too_early=… timeout=… late_correction=…` every 100 decisions and when jdtls stops. Repeated `timeout` lines mean jdtls is slow or stuck on that module. A growing `late_correction` count means jdtls results were released too early.
 

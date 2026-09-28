@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import fnmatch
+import functools
 import hashlib
 import json
 import logging
@@ -19,7 +20,7 @@ from collections import Counter, OrderedDict
 from collections.abc import Callable, Coroutine
 from pathlib import Path
 from threading import Event
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 if TYPE_CHECKING:
     from typing import BinaryIO
@@ -83,6 +84,9 @@ _converter = get_converter()
 _MAX_OPENED_URIS = 4096
 
 
+# Cached: jdtls publishes for thousands of workspace files and each is normalized for
+# the diagnostics cache key and the opened-files gate.
+@functools.lru_cache(maxsize=8192)
 def _normalize_uri(uri: str) -> str:
     """Canonicalize a file:// URI so equivalent paths compare equal.
 
@@ -119,25 +123,44 @@ _CUSTOM_FIRST_CLIENTS = ("Claude Code",)
 _CUSTOM_SOURCE = "java-functional-lsp"
 
 
+_PublishOutcome = Literal["released", "too_early", "late_correction", "untracked"]
+_HoldEvent = Literal["released", "too_early", "late_correction", "timeout", "ineligible"]
+
+
 class _JdtlsFreshness:
     """Decides when cached jdtls diagnostics are fresh enough to publish after an edit.
 
     jdtls validates on one debounced job shared by all files — any didChange resets it,
     and it publishes 0.4-2.4s later — and its publishes carry no document version. So
-    freshness is inferred from time since the last change forwarded to jdtls. Pure
-    state with an injectable clock; the server owns the tasks.
+    freshness is inferred from timing: a publish for a file is fresh once jdtls's minimum
+    debounce has passed since that file's last edit, and the wait is bounded by the last
+    change to any file (which restarts the job). The server owns the tasks.
     """
 
-    FRESH_MIN_AGE = 0.4  # jdtls minimum publish debounce
+    # jdtls 1.61.0 BaseDocumentLifeCycleHandler: validation debounce <=400ms, publish
+    # debounce 400-2000ms, any didChange reschedules; BaseDiagnosticsHandler.endReporting
+    # publishes without a version. Re-check on jdtls upgrades:
+    # https://github.com/eclipse-jdtls/eclipse.jdt.ls/blob/v1.61.0/org.eclipse.jdt.ls.core/src/org/eclipse/jdt/ls/core/internal/handlers/BaseDocumentLifeCycleHandler.java
+    FRESH_MIN_AGE = 0.4
     DEADLINE_AFTER_CHANGE = 3.0
     CEILING = 10.0
     LATE_CORRECTION_WINDOW = 2.0
     EWMA_ALPHA = 0.3
     SUMMARY_EVERY = 100
 
-    def __init__(self, clock: Callable[[], float] = time.monotonic) -> None:
+    def __init__(
+        self,
+        clock: Callable[[], float] = time.monotonic,
+        *,
+        fresh_min_age: float = FRESH_MIN_AGE,
+        deadline_after_change: float = DEADLINE_AFTER_CHANGE,
+        ceiling: float = CEILING,
+    ) -> None:
         self.clock = clock
-        self._pending: dict[str, float] = {}
+        self.fresh_min_age = fresh_min_age
+        self.deadline_after_change = deadline_after_change
+        self.ceiling = ceiling
+        self._pending: dict[str, float] = {}  # key -> time of its last forwarded change
         self._released: dict[str, tuple[float, str]] = {}
         self._last_change: float | None = None
         self._latency_ewma = 0.0
@@ -148,44 +171,58 @@ class _JdtlsFreshness:
         self._last_change = self.clock()
 
     def mark_pending(self, key: str) -> None:
-        self._pending.setdefault(key, self.clock())
+        self._pending[key] = self.clock()
         self._released.pop(key, None)
 
     def is_pending(self, key: str) -> bool:
         return key in self._pending
 
     def deadline(self, key: str) -> float | None:
-        since = self._pending.get(key)
-        if since is None:
+        changed = self._pending.get(key)
+        if changed is None:
             return None
-        last = self._last_change if self._last_change is not None else since
-        after_change = max(self.DEADLINE_AFTER_CHANGE, 2 * self._latency_ewma)
-        return min(last + after_change, since + self.CEILING)
+        last_any = self._last_change if self._last_change is not None else changed
+        after_change = max(self.deadline_after_change, 2 * self._latency_ewma)
+        return min(last_any + after_change, changed + self.ceiling)
 
-    def on_publish(self, key: str, signature: str) -> str:
-        """Classify a jdtls publish as released, too_early, late_correction or untracked."""
+    def on_publish(self, key: str, signature: Callable[[], str]) -> _PublishOutcome:
+        """Classify a jdtls publish; *signature* is computed only when it is needed."""
         now = self.clock()
-        if key in self._pending:
-            age = now - self._last_change if self._last_change is not None else self.FRESH_MIN_AGE
+        changed = self._pending.get(key)
+        if changed is not None:
+            age = now - changed
             # Fixed floor, not adaptive: an adaptive floor would reject normal-latency
             # publishes after one slow one and could never come back down.
-            if age < self.FRESH_MIN_AGE:
-                return self.record("too_early")
+            if age < self.fresh_min_age:
+                self.record("too_early")
+                return "too_early"
             del self._pending[key]
-            self._released[key] = (now, signature)
+            self._released[key] = (now, signature())
             self._latency_max = max(self._latency_max, age)
             self._latency_ewma = (
                 age if not self._latency_ewma else self._latency_ewma + self.EWMA_ALPHA * (age - self._latency_ewma)
             )
-            return self.record("released")
-        released = self._released.pop(key, None)
-        if released is not None:
-            at, released_signature = released
-            if now - at <= self.LATE_CORRECTION_WINDOW:
-                if released_signature != signature:
-                    return self.record("late_correction")
-                self._released[key] = released
-        return "untracked"
+            self.record("released")
+            return "released"
+        return self._after_release(key, now, signature)
+
+    def _after_release(self, key: str, now: float, signature: Callable[[], str]) -> _PublishOutcome:
+        """A jdtls publish that changes the set shortly after a release means that release was stale.
+
+        Counted at most once per release; identical republishes keep the window open.
+        """
+        released = self._released.get(key)
+        if released is None:
+            return "untracked"
+        at, released_signature = released
+        if now - at > self.LATE_CORRECTION_WINDOW:
+            del self._released[key]
+            return "untracked"
+        if signature() == released_signature:
+            return "untracked"
+        del self._released[key]
+        self.record("late_correction")
+        return "late_correction"
 
     def expire(self, key: str) -> bool:
         """Drop *key* once its deadline has passed. Returns True when it timed out."""
@@ -208,11 +245,10 @@ class _JdtlsFreshness:
         self._last_change = None
         return pending
 
-    def record(self, outcome: str) -> str:
-        self.counts[outcome] += 1
+    def record(self, event: _HoldEvent) -> None:
+        self.counts[event] += 1
         if sum(self.counts.values()) % self.SUMMARY_EVERY == 0:
             logger.info("%s", self.summary())
-        return outcome
 
     def summary(self) -> str:
         counts = " ".join(f"{name}={n}" for name, n in sorted(self.counts.items())) or "no-holds"
@@ -258,6 +294,9 @@ class JavaFunctionalLspServer(LanguageServer):
         # Reset on initialize. Values are the URI string exactly as the client
         # sent it, so publishes triggered by jdtls go out under the client's form.
         self._session_opened_uris: OrderedDict[str, str] = OrderedDict()
+        # Module root per opened file (normalized key), resolved once: the lookup walks
+        # the filesystem and didChange arrives per keystroke in IDEs.
+        self._module_uris: dict[str, str | None] = {}
 
     def _record_opened(self, uri: str) -> None:
         """Record *uri* as opened this session, evicting the oldest entry at cap.
@@ -277,7 +316,9 @@ class JavaFunctionalLspServer(LanguageServer):
         # then evict. The transient overshoot is invisible to other callers
         # because asyncio is single-threaded and no await intervenes here.
         if len(self._session_opened_uris) > _MAX_OPENED_URIS:
-            self._session_opened_uris.popitem(last=False)
+            evicted, _ = self._session_opened_uris.popitem(last=False)
+            self._module_uris.pop(evicted, None)
+            _freshness.forget(evicted)
 
     def _on_jdtls_diagnostics(self, uri: str, diagnostics: list[Any]) -> None:
         """Called when jdtls publishes diagnostics — merge with custom and re-publish.
@@ -324,7 +365,7 @@ class JavaFunctionalLspServer(LanguageServer):
         if uri not in self._session_opened_uris and _normalize_uri(uri) not in self._session_opened_uris:
             return
         key = _normalize_uri(uri)
-        outcome = _freshness.on_publish(key, _diagnostics_signature(diagnostics))
+        outcome = _freshness.on_publish(key, lambda: _diagnostics_signature(diagnostics))
         if outcome == "too_early":
             logger.debug("jdtls publish for %s arrived too soon after the last edit; still holding", Path(uri).name)
             return
@@ -343,7 +384,7 @@ class JavaFunctionalLspServer(LanguageServer):
             # between didOpen and this late jdtls publish. Benign.
             pass
         except Exception as e:
-            logger.error("Error re-publishing diagnostics for %s: %s", Path(uri).name, e)
+            logger.error("Error re-publishing diagnostics for %s: %s", Path(uri).name, type(e).__name__)
 
     def _on_jdtls_stopped(self) -> None:
         """Release every held file: no fresh jdtls publish can arrive from a dead process."""
@@ -615,7 +656,7 @@ def _run_analysis(source: str, uri: str, *, include_jdtls: bool = True) -> list[
             ]
             jdtls_diags = _jdtls_raw_to_lsp_diagnostics(raw)
         except Exception as e:
-            logger.warning("jdtls diagnostic processing failed for %s: %s", Path(uri).name, e)
+            logger.warning("jdtls diagnostic processing failed for %s: %s", Path(uri).name, type(e).__name__)
 
     return jdtls_diags + custom_diags
 
@@ -657,6 +698,7 @@ def on_initialize(params: lsp.InitializeParams) -> lsp.InitializeResult:
     server._skip_jdtls_registration = False
     server._init_generation += 1
     server._session_opened_uris.clear()
+    server._module_uris.clear()
     _jdtls_capabilities_registered = False
     _release_all_holds()
     server._hold_mode = _resolve_hold_mode(client_name)
@@ -820,9 +862,11 @@ def _matches_diagnostic_filter(uri: str) -> bool:
     return any(isinstance(p, str) and fnmatch.fnmatch(path, p) for p in patterns)
 
 
-def _hold_eligible(uri: str) -> bool:
+def _hold_eligible(uri: str, key: str) -> bool:
     """Whether an edit to *uri* should wait for jdtls to publish fresh diagnostics."""
-    module_uri = _resolve_module_uri(uri)
+    if key not in server._module_uris:
+        server._module_uris[key] = _resolve_module_uri(uri)
+    module_uri = server._module_uris[key]
     # Until the module is imported jdtls publishes late or only syntax errors (code 16).
     if module_uri is None or not server._proxy.modules.is_ready(module_uri):
         return False
@@ -841,6 +885,19 @@ def _is_current_task(uri: str) -> bool:
     # On Python 3.10/3.11 wait_for can swallow a cancel() racing with the event,
     # leaving a superseded hold task running next to its replacement.
     return _pending.get(uri) is asyncio.current_task()
+
+
+def _track_forwarded_edit(uri: str) -> None:
+    """Record an edit jdtls received; mark the file as waiting for jdtls when eligible."""
+    _freshness.note_forwarded_change()
+    if server._hold_mode == _HOLD_OFF:
+        return
+    key = _normalize_uri(uri)
+    # jdtls publishes for files outside the opened set are gated out, so they could never release.
+    if key in server._session_opened_uris and _hold_eligible(uri, key):
+        _freshness.mark_pending(key)
+    else:
+        _freshness.record("ineligible")
 
 
 async def _hold_until_fresh(uri: str, key: str) -> None:
@@ -882,7 +939,7 @@ async def _deferred_validate(uri: str) -> None:
         # Never leave a file pending without a hold task: its jdtls publish would be swallowed.
         if _is_current_task(uri):
             _freshness.forget(key)
-        logger.error("Validation failed for %s: %s", Path(uri).name, e)
+        logger.error("Validation failed for %s: %s", Path(uri).name, type(e).__name__)
 
 
 def _forward_or_queue(method: str, serialized: Any) -> bool:
@@ -930,11 +987,12 @@ async def on_did_open(params: lsp.DidOpenTextDocumentParams) -> None:
             server._proxy._lazy_start_fired = True
             _fire_and_forget(_lazy_start_jdtls(uri))
 
-    # Custom diagnostics always publish immediately — never blocked by jdtls.
+    # Custom diagnostics always publish immediately — never blocked by jdtls. A file
+    # still waiting for jdtls gets its jdtls set from the hold, not the stale cache.
     try:
-        _analyze_and_publish(uri)
+        _analyze_and_publish(uri, include_jdtls=not _freshness.is_pending(_normalize_uri(uri)))
     except Exception as e:
-        logger.error("Analysis failed on open for %s: %s", uri, e)
+        logger.error("Analysis failed on open for %s: %s", Path(uri).name, type(e).__name__)
 
 
 @server.feature(lsp.TEXT_DOCUMENT_DID_CHANGE)
@@ -942,14 +1000,7 @@ async def on_did_change(params: lsp.DidChangeTextDocumentParams) -> None:
     """Forward to jdtls and schedule debounced re-analysis."""
     uri = params.text_document.uri
     if _forward_or_queue("textDocument/didChange", _serialize_params(params)):
-        _freshness.note_forwarded_change()
-        if server._hold_mode != _HOLD_OFF:
-            key = _normalize_uri(uri)
-            # jdtls publishes for files outside the opened set are gated out, so they could never release.
-            if key in server._session_opened_uris and _hold_eligible(uri):
-                _freshness.mark_pending(key)
-            else:
-                _freshness.record("ineligible")
+        _track_forwarded_edit(uri)
     # Cancel pending validation, schedule new one (150ms debounce for IDE typing)
     if uri in _pending:
         _pending[uri].cancel()
@@ -976,7 +1027,11 @@ async def on_did_close(params: lsp.DidCloseTextDocumentParams) -> None:
     if uri in _pending:
         _pending[uri].cancel()
         del _pending[uri]
-    _freshness.forget(_normalize_uri(uri))
+    key = _normalize_uri(uri)
+    _freshness.forget(key)
+    event = _hold_events.pop(key, None)
+    if event is not None:
+        event.set()
     # Clear diagnostics for the closed document (LSP best practice)
     server.text_document_publish_diagnostics(lsp.PublishDiagnosticsParams(uri=uri, diagnostics=[]))
     _forward_or_queue("textDocument/didClose", _serialize_params(params))
@@ -1503,12 +1558,16 @@ class _EternalStdinBuffer:
         return data
 
 
+def _log_level_from_env() -> int:
+    level = getattr(logging, os.environ.get("JAVA_FUNCTIONAL_LSP_LOG_LEVEL", "INFO").strip().upper(), None)
+    return level if isinstance(level, int) else logging.INFO
+
+
 def main() -> None:
     """Entry point for the LSP server."""
-    level = getattr(logging, os.environ.get("JAVA_FUNCTIONAL_LSP_LOG_LEVEL", "INFO").strip().upper(), None)
-    logging.basicConfig(
-        level=level if isinstance(level, int) else logging.INFO, format="%(name)s %(levelname)s: %(message)s"
-    )
+    logging.basicConfig(level=logging.INFO, format="%(name)s %(levelname)s: %(message)s")
+    # Only this package's loggers: root DEBUG would also enable pygls/jdtls payload logging.
+    logging.getLogger("java_functional_lsp").setLevel(_log_level_from_env())
     server.start_io(stdin=_EternalStdinBuffer(sys.stdin.buffer))  # type: ignore[arg-type]
 
 

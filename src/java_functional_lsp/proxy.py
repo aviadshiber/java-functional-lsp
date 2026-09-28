@@ -57,6 +57,9 @@ _DEFAULT_JDTLS_SETTINGS: dict[str, Any] = {
 #: Java 21"`` before the server even starts.
 _MIN_JDTLS_JAVA_MAJOR = 21
 
+#: Distinct jdtls→client request methods tracked individually; the rest count as "<other>".
+_MAX_DROPPED_METHODS = 50
+
 #: Matches the first version token in ``java -version`` output. Handles:
 #: - modern format: ``openjdk version "21.0.10" 2026-01-20``
 #: - legacy Java 8: ``openjdk version "1.8.0_452"`` (captures ``1``; caller
@@ -848,6 +851,8 @@ class JdtlsProxy:
 
     def _mark_stopped(self) -> None:
         """Drop state that belongs to the dead jdtls process and notify the owner."""
+        if not self._available and not self._diagnostics_cache:
+            return  # already handled (reader EOF, then stop())
         self._available = False
         cached = len(self._diagnostics_cache)
         self._diagnostics_cache.clear()
@@ -1338,12 +1343,15 @@ class JdtlsProxy:
 
     def _note_dropped_request(self, method: str) -> None:
         """Count jdtls→client requests the proxy leaves unanswered (method names only, never params)."""
+        method = method[:100]
+        if method not in self._dropped_request_counts and len(self._dropped_request_counts) >= _MAX_DROPPED_METHODS:
+            method = "<other>"
         count = self._dropped_request_counts.get(method, 0) + 1
         self._dropped_request_counts[method] = count
         if count == 1:
-            logger.info("jdtls request %s dropped (no client-side handler)", method)
+            logger.info("jdtls request %r dropped (no client-side handler)", method)
         else:
-            logger.debug("jdtls request %s dropped (%d times)", method, count)
+            logger.debug("jdtls request %r dropped (%d times)", method, count)
 
     def _handle_notification(self, msg: dict[str, Any]) -> None:
         """Handle a notification from jdtls."""
