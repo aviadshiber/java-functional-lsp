@@ -19,6 +19,8 @@ def isolate_diagnostics_hold(monkeypatch: pytest.MonkeyPatch) -> None:
     from java_functional_lsp import server as srv_mod
 
     monkeypatch.setattr(srv_mod.server, "_hold_mode", srv_mod._HOLD_OFF)
+    monkeypatch.setattr(srv_mod.server, "_agent_host", False)
+    monkeypatch.setattr(srv_mod.server, "_marker_dirty", set())
     monkeypatch.setattr(srv_mod, "_freshness", srv_mod._JdtlsFreshness())
     monkeypatch.setattr(srv_mod, "_hold_events", {})
 

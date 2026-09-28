@@ -201,7 +201,7 @@ moving on. Fix any type errors or missing imports immediately.
 | "java-functional-lsp not found" | Run `brew install aviadshiber/tap/java-functional-lsp` |
 | Plugin not active | Run `claude plugin list` to verify, then `/reload-plugins` |
 | Diagnostics slow on first open | Normal — tree-sitter parses on first load, then incremental |
-| Java errors show up one tool call after the edit | Claude Code doesn't wait for LSP diagnostics after Edit/Write ([anthropics/claude-code#93321](https://github.com/anthropics/claude-code/issues/93321)); jdtls results arrive with the next tool result. See [Fresh jdtls diagnostics after edits](#fresh-jdtls-diagnostics-after-edits) |
+| Java errors show up one tool call after the edit | Claude Code doesn't wait for LSP diagnostics after Edit/Write ([anthropics/claude-code#93321](https://github.com/anthropics/claude-code/issues/93321)). The plugin's hook waits up to 3s for them; if jdtls is slower (large projects), raise `JAVA_FUNCTIONAL_LSP_HOOK_WAIT` (max 4). See [Fresh jdtls diagnostics after edits](#fresh-jdtls-diagnostics-after-edits) |
 
 ### Other Editors
 
@@ -317,6 +317,11 @@ jdtls re-validates a file 0.4–2.4s after the last edit to *any* file, and its 
 | `hold-all` | Other editors | Nothing is published for the file until jdtls has re-validated (no flickering squiggles) |
 | `off` | — | Previous behavior: custom diagnostics plus the last known jdtls diagnostics after 150ms |
 
+With Claude Code two more things happen:
+
+- **The plugin's PostToolUse hook waits for fresh results.** Claude Code attaches diagnostics as soon as its PostToolUse hooks finish, without waiting for the server ([anthropics/claude-code#93321](https://github.com/anthropics/claude-code/issues/93321)). The server records when it last published final diagnostics for each file, and `hooks/post_tool_lint.py` waits until that is newer than the edit (at most `JAVA_FUNCTIONAL_LSP_HOOK_WAIT` seconds, default 3, max 4), so jdtls's result for the edit arrives in the same tool result. The markers live in a private per-user temp directory and contain only a timestamp.
+- **jdtls gets a didSave after each edit.** Claude Code writes the file itself; when the edited buffer matches the file on disk, the server forwards a didSave. Without it, jdtls can re-check dependent files against the old version of the edited one (e.g. a caller keeps reporting a constructor's old arity) and never correct them.
+
 If jdtls doesn't publish in time (3s after the last edit, stretched when jdtls is slow, 10s at most), the last known jdtls diagnostics are used. Files whose module is still being imported, and files matched by `java.diagnostic.filter`, are never held. While you edit the same file in quick succession, its diagnostics update only once the burst settles.
 
 Environment variables:
@@ -324,6 +329,7 @@ Environment variables:
 | Variable | Values | Effect |
 |----------|--------|--------|
 | `JAVA_FUNCTIONAL_LSP_DIAG_HOLD` | `custom-first`, `hold-all`, `off` | Overrides the mode above; `off` restores the previous behavior |
+| `JAVA_FUNCTIONAL_LSP_HOOK_WAIT` | seconds, `0`–`4` (default `3`) | How long the Claude Code PostToolUse hook waits for fresh jdtls diagnostics; `0` disables the wait |
 | `JAVA_FUNCTIONAL_LSP_LOG_LEVEL` | `DEBUG`, `INFO` (default), `WARNING` | Verbosity of java-functional-lsp's own logs; `DEBUG` adds one line per publish decision (file name, trigger, counts). Library logging (pygls) is unaffected — note that pygls already logs the JSON it sends, including diagnostic messages, at `INFO` |
 
 The log reports `jdtls freshness: released=… too_early=… timeout=… late_correction=…` every 100 decisions and when jdtls stops. Repeated `timeout` lines mean jdtls is slow or stuck on that module. A growing `late_correction` count means jdtls results were released too early.

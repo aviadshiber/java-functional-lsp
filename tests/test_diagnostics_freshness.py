@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import AsyncIterator, Callable
+from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -13,6 +14,7 @@ from lsprotocol import types as lsp
 from pygls.workspace import Workspace
 
 from java_functional_lsp import server as srv_mod
+from java_functional_lsp.freshness_marker import OPENING, content_digest
 from java_functional_lsp.proxy import JdtlsProxy
 from java_functional_lsp.server import (
     _HOLD_ALL,
@@ -578,6 +580,144 @@ class TestHoldWiring:
                 await asyncio.gather(task, return_exceptions=True)
             server._session_opened_uris.pop(srv_mod._normalize_uri(client_uri), None)
             server.workspace.remove_text_document(client_uri)
+
+
+class TestAgentHost:
+    """Claude Code support: freshness markers for the PostToolUse hook, didSave after disk writes."""
+
+    @pytest.fixture
+    def marker(self, monkeypatch: pytest.MonkeyPatch) -> MagicMock:
+        written = MagicMock()
+        monkeypatch.setattr(srv_mod, "write_marker", written)
+        monkeypatch.setattr(server, "_agent_host", True)
+        return written
+
+    async def test_marker_on_final_publish_not_custom_first(self, live: MagicMock, marker: MagicMock) -> None:
+        server._hold_mode = _HOLD_CUSTOM_FIRST
+        await _edit()
+        await _until(lambda: live.call_count == 1)
+        marker.assert_not_called()  # custom-only publish is not final
+        await _past_min_age()
+        _jdtls_publishes([])
+        await _until(lambda: live.call_count == 2)
+        marker.assert_called_once_with("/mod/src/Foo.java", content_digest(SOURCE.encode()))
+
+    async def test_background_republish_of_unedited_file_writes_no_marker(
+        self, live: MagicMock, marker: MagicMock
+    ) -> None:
+        _jdtls_publishes([_java_diag("x")])  # untracked jdtls republish, no edit since the last marker
+        assert live.call_count == 1
+        marker.assert_not_called()
+
+    async def test_one_marker_per_edit(self, live: MagicMock, marker: MagicMock) -> None:
+        await _edit()
+        await _past_min_age()
+        _jdtls_publishes([])
+        await _until(lambda: live.call_count == 1)
+        _jdtls_publishes([_java_diag("later cycle")])
+        assert marker.call_count == 1
+
+    async def test_off_mode_debounce_publish_is_not_final(self, live: MagicMock, marker: MagicMock) -> None:
+        server._hold_mode = _HOLD_OFF
+        _jdtls_publishes([_java_diag("stale")])
+        await _edit()
+        await _until(lambda: live.call_count == 2)
+        marker.assert_not_called()  # it carries the previous edit's jdtls set
+        _jdtls_publishes([])
+        marker.assert_called_once()
+
+    async def test_unheld_change_publish_is_final(self, live: MagicMock, marker: MagicMock) -> None:
+        server._proxy.modules.clear()  # module not imported: not held, nothing fresher is coming
+        await _edit()
+        await _until(lambda: live.call_count == 1)
+        marker.assert_called_once()
+
+    async def test_did_open_writes_placeholder(self, live: MagicMock, marker: MagicMock) -> None:
+        with patch.object(server._proxy, "add_module_if_new", AsyncMock()):
+            await on_did_open(
+                lsp.DidOpenTextDocumentParams(
+                    text_document=lsp.TextDocumentItem(uri=URI, language_id="java", version=1, text=SOURCE)
+                )
+            )
+        marker.assert_called_once_with("/mod/src/Foo.java", OPENING)  # the open's own publish isn't final
+        assert live.call_count == 1
+        _jdtls_publishes([])
+        assert marker.call_count == 2
+
+    async def test_no_marker_for_other_clients(self, live: MagicMock, monkeypatch: pytest.MonkeyPatch) -> None:
+        written = MagicMock()
+        monkeypatch.setattr(srv_mod, "write_marker", written)
+        await _edit()
+        await _past_min_age()
+        _jdtls_publishes([])
+        await _until(lambda: live.call_count == 1)
+        written.assert_not_called()
+
+    @pytest.mark.usefixtures("live", "marker")
+    @pytest.mark.parametrize(
+        ("on_disk", "expect_save"),
+        [(SOURCE, True), (SOURCE + "// newer", False), (SOURCE.replace("null", "NULL"), False), (None, False)],
+        ids=["same", "longer", "same-size-different", "missing"],
+    )
+    async def test_did_save_forwarded_only_when_buffer_matches_disk(
+        self, tmp_path: Path, on_disk: str | None, expect_save: bool
+    ) -> None:
+        java = tmp_path / "Disk.java"
+        if on_disk is not None:
+            java.write_text(on_disk)
+        uri = java.as_uri()
+        _put_document(uri)
+        try:
+            await _edit(uri)
+            await _past_debounce()
+            sent = server._proxy.send_notification
+            assert isinstance(sent, AsyncMock)
+            methods = [call.args[0] for call in sent.call_args_list]
+            assert methods[0] == "textDocument/didChange"
+            assert ("textDocument/didSave" in methods) is expect_save
+        finally:
+            task = srv_mod._pending.pop(uri, None)
+            if task is not None:
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+            server._session_opened_uris.pop(srv_mod._normalize_uri(uri), None)
+            server.workspace.remove_text_document(uri)
+
+    @pytest.mark.usefixtures("live", "marker")
+    async def test_no_did_save_when_jdtls_not_running(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        forward_save = MagicMock()
+        monkeypatch.setattr(srv_mod, "_forward_save_if_on_disk", forward_save)
+        server._proxy._available = False
+        await _edit()
+        forward_save.assert_not_called()
+
+    @pytest.mark.usefixtures("live", "marker")
+    async def test_did_save_kill_switch(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        forward_save = MagicMock()
+        monkeypatch.setattr(srv_mod, "_forward_save_if_on_disk", forward_save)
+        monkeypatch.setenv("JAVA_FUNCTIONAL_LSP_AGENT_DIDSAVE", "off")
+        await _edit()
+        forward_save.assert_not_called()
+
+    @pytest.mark.usefixtures("live", "marker")
+    async def test_did_save_check_failure_keeps_hold(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(srv_mod, "to_fs_path", MagicMock(side_effect=UnicodeEncodeError("utf-8", "", 0, 1, "x")))
+        await _edit()
+        assert srv_mod._freshness.is_pending(URI)
+        assert URI in srv_mod._pending
+
+    @pytest.mark.usefixtures("live")
+    async def test_ide_clients_do_not_read_disk_on_change(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        forward_save = MagicMock()
+        monkeypatch.setattr(srv_mod, "_forward_save_if_on_disk", forward_save)
+        await _edit()
+        forward_save.assert_not_called()
+
+    @pytest.mark.parametrize(
+        ("client", "agent"), [("Claude Code", True), ("Visual Studio Code", False), ("Neovim", False), ("", False)]
+    )
+    def test_agent_host_detection(self, client: str, agent: bool) -> None:
+        assert srv_mod._is_agent_host(client) is agent
 
 
 # --- Proxy additions ---
