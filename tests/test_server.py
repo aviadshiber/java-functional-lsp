@@ -469,7 +469,7 @@ class TestServerInternals:
                 patch("java_functional_lsp.server._fire_and_forget"),
             ):
                 server._on_jdtls_diagnostics(uri, [real_diag])
-                mock_pub.assert_called_once_with(uri)
+                mock_pub.assert_called_once_with(uri, trigger="jdtls")
             assert server._proxy.modules.get_state("file:///mod") == ModuleState.READY
         finally:
             server._proxy.modules.clear()
@@ -861,7 +861,7 @@ class TestServerInternals:
             patch("java_functional_lsp.server._fire_and_forget"),
         ):
             server._on_jdtls_diagnostics("file:///a/has%20space.java", [])
-        mock_pub.assert_called_once_with("file:///a/has%20space.java")
+        mock_pub.assert_called_once_with("file:///a/has%20space.java", trigger="jdtls")
 
     @pytest.mark.parametrize(
         "entry",

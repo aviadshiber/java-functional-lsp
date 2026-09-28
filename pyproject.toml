@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "java-functional-lsp"
-version = "0.12.0"
+version = "0.12.1"
 description = "Java LSP server enforcing functional programming best practices — null safety, immutability, no exceptions"
 readme = "README.md"
 license = { text = "MIT" }
@@ -65,6 +65,8 @@ python_classes = ["Test*"]
 python_functions = ["test_*"]
 addopts = "--cov=java_functional_lsp --cov-report=term-missing --cov-fail-under=80"
 asyncio_mode = "auto"
+# Safety net so a hung await fails the test instead of the CI job; e2e tests set their own.
+timeout = 120
 markers = [
     "e2e: end-to-end tests that spawn a real jdtls subprocess (require jdtls + Java 21+; skipped when unavailable)",
 ]

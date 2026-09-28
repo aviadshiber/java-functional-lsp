@@ -57,6 +57,9 @@ _DEFAULT_JDTLS_SETTINGS: dict[str, Any] = {
 #: Java 21"`` before the server even starts.
 _MIN_JDTLS_JAVA_MAJOR = 21
 
+#: Distinct jdtls→client request methods tracked individually; the rest count as "<other>".
+_MAX_DROPPED_METHODS = 50
+
 #: Matches the first version token in ``java -version`` output. Handles:
 #: - modern format: ``openjdk version "21.0.10" 2026-01-20``
 #: - legacy Java 8: ``openjdk version "1.8.0_452"`` (captures ``1``; caller
@@ -788,14 +791,24 @@ def _build_effective_params(
 class JdtlsProxy:
     """Manages a jdtls subprocess and provides async request/notification forwarding."""
 
-    def __init__(self, on_diagnostics: Callable[[str, list[Any]], None] | None = None) -> None:
+    def __init__(
+        self,
+        on_diagnostics: Callable[[str, list[Any]], None] | None = None,
+        uri_key: Callable[[str], str] = lambda uri: uri,
+        on_stopped: Callable[[], None] | None = None,
+    ) -> None:
         self._process: asyncio.subprocess.Process | None = None
         self._reader_task: asyncio.Task[None] | None = None
         self._stderr_task: asyncio.Task[None] | None = None
         self._next_id: int = 1
         self._pending: dict[int, asyncio.Future[Any]] = {}
+        # Keyed by uri_key(uri): jdtls may echo a URI in a different encoding than
+        # the client sent, so lookups must go through the same canonical key.
         self._diagnostics_cache: dict[str, list[Any]] = {}
+        self._uri_key = uri_key
         self._on_diagnostics = on_diagnostics
+        self._on_stopped = on_stopped
+        self._dropped_request_counts: dict[str, int] = {}
         self._available = False
         self._jdtls_capabilities: dict[str, Any] = {}
         # Lazy-start state
@@ -834,7 +847,19 @@ class JdtlsProxy:
 
     def get_cached_diagnostics(self, uri: str) -> list[Any]:
         """Get the latest jdtls diagnostics for a URI."""
-        return list(self._diagnostics_cache.get(uri, []))
+        return list(self._diagnostics_cache.get(self._uri_key(uri), []))
+
+    def _mark_stopped(self) -> None:
+        """Drop state that belongs to the dead jdtls process and notify the owner."""
+        if not self._available and not self._diagnostics_cache:
+            return  # already handled (reader EOF, then stop())
+        self._available = False
+        cached = len(self._diagnostics_cache)
+        self._diagnostics_cache.clear()
+        if cached:
+            logger.info("jdtls stopped: cleared cached diagnostics for %d files", cached)
+        if self._on_stopped:
+            self._on_stopped()
 
     def check_available(self) -> bool:
         """Check if jdtls is on PATH (lightweight, no subprocess started)."""
@@ -929,6 +954,8 @@ class JdtlsProxy:
 
             self._jdtls_capabilities = result.get("capabilities", {})
             logger.info("jdtls initialized (capabilities: %s)", list(self._jdtls_capabilities.keys()))
+            server_info = result.get("serverInfo") or {}
+            logger.info("jdtls server: %s %s", server_info.get("name", "?"), server_info.get("version", "?"))
 
             await self.send_notification("initialized", {})
             self._available = True
@@ -1170,7 +1197,7 @@ class JdtlsProxy:
 
     async def stop(self) -> None:
         """Shutdown jdtls subprocess gracefully."""
-        self._available = False
+        self._mark_stopped()
 
         if self._reader_task and not self._reader_task.done():
             self._reader_task.cancel()
@@ -1258,7 +1285,7 @@ class JdtlsProxy:
                 msg = await read_message(reader)
                 if msg is None:
                     logger.warning("jdtls stdout closed — subprocess may have exited")
-                    self._available = False
+                    self._mark_stopped()
                     break
 
                 self._dispatch_message(msg)
@@ -1266,7 +1293,7 @@ class JdtlsProxy:
             pass
         except Exception as e:
             logger.error("jdtls reader loop error: %s", e)
-            self._available = False
+            self._mark_stopped()
 
     async def _stderr_reader(self, stderr: asyncio.StreamReader) -> None:
         """Background task: log jdtls stderr output for debugging.
@@ -1311,6 +1338,20 @@ class JdtlsProxy:
         elif "method" in msg and "id" not in msg:
             # Notification from jdtls
             self._handle_notification(msg)
+        elif "method" in msg:
+            self._note_dropped_request(str(msg["method"]))
+
+    def _note_dropped_request(self, method: str) -> None:
+        """Count jdtls→client requests the proxy leaves unanswered (method names only, never params)."""
+        method = method[:100]
+        if method not in self._dropped_request_counts and len(self._dropped_request_counts) >= _MAX_DROPPED_METHODS:
+            method = "<other>"
+        count = self._dropped_request_counts.get(method, 0) + 1
+        self._dropped_request_counts[method] = count
+        if count == 1:
+            logger.info("jdtls request %r dropped (no client-side handler)", method)
+        else:
+            logger.debug("jdtls request %r dropped (%d times)", method, count)
 
     def _handle_notification(self, msg: dict[str, Any]) -> None:
         """Handle a notification from jdtls."""
@@ -1320,7 +1361,7 @@ class JdtlsProxy:
         if method == "textDocument/publishDiagnostics":
             uri = params.get("uri", "")
             diagnostics = params.get("diagnostics", [])
-            self._diagnostics_cache[uri] = diagnostics
+            self._diagnostics_cache[self._uri_key(uri)] = diagnostics
             if self._on_diagnostics:
                 self._on_diagnostics(uri, diagnostics)
         # Other notifications (window/logMessage, etc.) are silently ignored
