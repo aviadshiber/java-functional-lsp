@@ -9,6 +9,20 @@ import pytest
 from java_functional_lsp.analyzers.base import get_parser
 
 
+@pytest.fixture(autouse=True)
+def isolate_diagnostics_hold(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep the server singleton's hold mode and freshness state from leaking between tests.
+
+    on_initialize switches the mode to hold-all/custom-first; later in-process tests
+    would otherwise hold their publishes.
+    """
+    from java_functional_lsp import server as srv_mod
+
+    monkeypatch.setattr(srv_mod.server, "_hold_mode", srv_mod._HOLD_OFF)
+    monkeypatch.setattr(srv_mod, "_freshness", srv_mod._JdtlsFreshness())
+    monkeypatch.setattr(srv_mod, "_hold_events", {})
+
+
 @pytest.fixture
 def parser():  # type: ignore[no-untyped-def]
     """Return a reusable tree-sitter Java parser."""

@@ -154,9 +154,6 @@ class _JdtlsFreshness:
     def is_pending(self, key: str) -> bool:
         return key in self._pending
 
-    def fresh_min_age(self) -> float:
-        return max(self.FRESH_MIN_AGE, 0.5 * self._latency_ewma)
-
     def deadline(self, key: str) -> float | None:
         since = self._pending.get(key)
         if since is None:
@@ -170,7 +167,9 @@ class _JdtlsFreshness:
         now = self.clock()
         if key in self._pending:
             age = now - self._last_change if self._last_change is not None else self.FRESH_MIN_AGE
-            if age < self.fresh_min_age():
+            # Fixed floor, not adaptive: an adaptive floor would reject normal-latency
+            # publishes after one slow one and could never come back down.
+            if age < self.FRESH_MIN_AGE:
                 return self.record("too_early")
             del self._pending[key]
             self._released[key] = (now, signature)
@@ -348,9 +347,7 @@ class JavaFunctionalLspServer(LanguageServer):
 
     def _on_jdtls_stopped(self) -> None:
         """Release every held file: no fresh jdtls publish can arrive from a dead process."""
-        released = _freshness.reset()
-        for event in _hold_events.values():
-            event.set()
+        released = _release_all_holds()
         if released:
             logger.info("jdtls stopped: released %d files waiting for diagnostics", released)
         logger.info("%s", _freshness.summary())
@@ -661,7 +658,7 @@ def on_initialize(params: lsp.InitializeParams) -> lsp.InitializeResult:
     server._init_generation += 1
     server._session_opened_uris.clear()
     _jdtls_capabilities_registered = False
-    _freshness.reset()
+    _release_all_holds()
     server._hold_mode = _resolve_hold_mode(client_name)
     logger.info("jdtls diagnostics hold mode: %s", server._hold_mode)
 
@@ -832,13 +829,27 @@ def _hold_eligible(uri: str) -> bool:
     return not _matches_diagnostic_filter(uri)
 
 
+def _release_all_holds() -> int:
+    """Stop tracking every held file and wake its hold task; returns how many were held."""
+    released = _freshness.reset()
+    for event in _hold_events.values():
+        event.set()
+    return released
+
+
+def _is_current_task(uri: str) -> bool:
+    # On Python 3.10/3.11 wait_for can swallow a cancel() racing with the event,
+    # leaving a superseded hold task running next to its replacement.
+    return _pending.get(uri) is asyncio.current_task()
+
+
 async def _hold_until_fresh(uri: str, key: str) -> None:
     """Publish once jdtls has re-validated *uri* after the latest edit, or its deadline passes."""
-    if server._hold_mode == _HOLD_CUSTOM_FIRST:
-        _analyze_and_publish(uri, include_jdtls=False, trigger="custom-first")
     event = _hold_events.setdefault(key, asyncio.Event())
     trigger = "jdtls"
     try:
+        if server._hold_mode == _HOLD_CUSTOM_FIRST:
+            _analyze_and_publish(uri, include_jdtls=False, trigger="custom-first")
         while _freshness.is_pending(key):
             if _freshness.expire(key):
                 trigger = "timeout"
@@ -854,19 +865,22 @@ async def _hold_until_fresh(uri: str, key: str) -> None:
     finally:
         if _hold_events.get(key) is event:
             del _hold_events[key]
-    _analyze_and_publish(uri, trigger=trigger)
+    if _is_current_task(uri):
+        _analyze_and_publish(uri, trigger=trigger)
 
 
 async def _deferred_validate(uri: str) -> None:
     """Debounced validation — waits before analyzing to batch rapid edits."""
     await asyncio.sleep(_DEBOUNCE_SECONDS)
+    key = _normalize_uri(uri)
     try:
-        key = _normalize_uri(uri)
         if _freshness.is_pending(key):
             await _hold_until_fresh(uri, key)
         else:
             _analyze_and_publish(uri, trigger="change")
     except Exception as e:
+        # Never leave a file pending without a hold task: its jdtls publish would be swallowed.
+        _freshness.forget(key)
         logger.error("Validation failed for %s: %s", Path(uri).name, e)
 
 
@@ -929,8 +943,10 @@ async def on_did_change(params: lsp.DidChangeTextDocumentParams) -> None:
     if _forward_or_queue("textDocument/didChange", _serialize_params(params)):
         _freshness.note_forwarded_change()
         if server._hold_mode != _HOLD_OFF:
-            if _hold_eligible(uri):
-                _freshness.mark_pending(_normalize_uri(uri))
+            key = _normalize_uri(uri)
+            # jdtls publishes for files outside the opened set are gated out, so they could never release.
+            if key in server._session_opened_uris and _hold_eligible(uri):
+                _freshness.mark_pending(key)
             else:
                 _freshness.record("ineligible")
     # Cancel pending validation, schedule new one (150ms debounce for IDE typing)
