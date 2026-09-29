@@ -841,15 +841,26 @@ _POM_DIAG_MSG_MAX_CHARS = 300
 
 #: LSP ``MessageType`` (window/logMessage) → proxy log level. Info/Log are DEBUG.
 _LOG_MESSAGE_LEVELS: dict[int, int] = {1: logging.WARNING, 2: logging.INFO}
+#: Known kinds; anything else is logged as ``other`` so jdtls-provided values never
+#: reach the log line unsanitized and the per-kind rate-limit buckets stay bounded.
+_LOG_MESSAGE_TYPES = frozenset({1, 2, 3, 4, 5})
+_LANGUAGE_STATUS_TYPES = frozenset({"Starting", "Started", "Error", "Message", "ProjectStatus", "ServiceReady"})
 
-_URL_USERINFO_RE = re.compile(r"([A-Za-z][A-Za-z0-9+.\-]*://)[^/\s@]+@")
-_SECRET_QUERY_RE = re.compile(
-    r"([?&;][^=&;#\s]*(?:token|key|secret|password|auth|sig)[^=&;#\s]*=)[^&;#\s]*",
-    re.IGNORECASE,
-)
+# All patterns must stay linear in the input: they run on jdtls text (which can echo
+# pom content) synchronously on the reader loop.  The userinfo run cannot contain "/",
+# so matches starting at different "://" never overlap; query names are bounded and the
+# secret keyword is checked in the callback instead of inside the pattern.
+_URL_USERINFO_RE = re.compile(r"(://)[^/\s@]+@")
+_QUERY_PARAM_RE = re.compile(r"([?&;][^=&;#\s?]{1,64}=)[^&;#\s?]*")
+_SECRET_PARAM_NAME_RE = re.compile(r"token|key|secret|password|auth|sig", re.IGNORECASE)
 _AUTH_HEADER_RE = re.compile(r"(authorization\s*[:=]\s*)(?:(bearer|basic|token|digest)\s+)?[^\s,;]+", re.IGNORECASE)
 _BEARER_RE = re.compile(r"\b(bearer)\s+[A-Za-z0-9._~+/=\-]+", re.IGNORECASE)
 _CONTROL_CHARS_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]")
+
+
+def _secret_query_sub(match: re.Match[str]) -> str:
+    name = match.group(1)
+    return f"{name}***" if _SECRET_PARAM_NAME_RE.search(name) else match.group(0)
 
 
 def _auth_header_sub(match: re.Match[str]) -> str:
@@ -869,7 +880,7 @@ def _sanitize_jdtls_log(text: str, max_chars: int = _JDTLS_LOG_MAX_CHARS) -> str
     """
     text = text[:_JDTLS_LOG_PRECAP_CHARS]
     text = _URL_USERINFO_RE.sub(r"\1***@", text)
-    text = _SECRET_QUERY_RE.sub(r"\1***", text)
+    text = _QUERY_PARAM_RE.sub(_secret_query_sub, text)
     text = _AUTH_HEADER_RE.sub(_auth_header_sub, text)
     text = _BEARER_RE.sub(r"\1 ***", text)
     text = text.replace("\r", "\\r").replace("\n", "\\n").replace("\t", " ")
@@ -1016,6 +1027,7 @@ class JdtlsProxy:
         cached = len(self._diagnostics_cache)
         self._diagnostics_cache.clear()
         self._pom_errors.clear()
+        self._log_forwarder.flush()
         if cached:
             logger.info("jdtls stopped: cleared cached diagnostics for %d files", cached)
         if self._on_stopped:
@@ -1542,11 +1554,13 @@ class JdtlsProxy:
         elif method == "window/logMessage" and isinstance(params, dict):
             msg_type = params.get("type")
             level = _LOG_MESSAGE_LEVELS.get(msg_type, logging.DEBUG) if isinstance(msg_type, int) else logging.DEBUG
-            self._log_forwarder.forward(level, f"log:{msg_type}", params.get("message", ""))
+            kind = f"log:{msg_type}" if msg_type in _LOG_MESSAGE_TYPES else "log:other"
+            self._log_forwarder.forward(level, kind, params.get("message", ""))
         elif method == "language/status" and isinstance(params, dict):
             status_type = params.get("type")
             level = logging.INFO if status_type == "Error" else logging.DEBUG
-            self._log_forwarder.forward(level, f"status:{str(status_type)[:32]}", params.get("message", ""))
+            kind = f"status:{status_type}" if status_type in _LANGUAGE_STATUS_TYPES else "status:other"
+            self._log_forwarder.forward(level, kind, params.get("message", ""))
         # Other notifications are silently ignored
 
     def _note_pom_diagnostics(self, uri: str, diagnostics: Any) -> None:

@@ -182,6 +182,24 @@ class TestSanitize:
         assert "topsecret" not in _sanitize_jdtls_log(text)
 
 
+class TestSanitizeIsLinear:
+    """Hostile jdtls text (it can echo pom content) must not stall the reader loop."""
+
+    @pytest.mark.parametrize(
+        "text",
+        ["?token" * 3000, "a" * 16384, "?a" * 8000, "x://" * 4000, "&" + "k" * 16000],
+    )
+    def test_pathological_input_is_fast(self, text: str) -> None:
+        import time
+
+        started = time.monotonic()
+        _sanitize_jdtls_log(text)
+        assert time.monotonic() - started < 0.5
+
+    def test_non_secret_params_are_kept(self) -> None:
+        assert _sanitize_jdtls_log("https://h/p?version=1&token=abc") == "https://h/p?version=1&token=***"
+
+
 class _Clock:
     def __init__(self) -> None:
         self.now = 1000.0
@@ -210,7 +228,7 @@ class TestLogForwarding:
             (logging.WARNING, "jdtls[log:1]: boom"),
             (logging.INFO, "jdtls[log:2]: careful"),
             (logging.DEBUG, "jdtls[log:3]: fyi"),
-            (logging.DEBUG, "jdtls[log:None]: no type"),
+            (logging.DEBUG, "jdtls[log:other]: no type"),
         ]
 
     def test_language_status_levels(self, caplog: pytest.LogCaptureFixture) -> None:
@@ -219,6 +237,14 @@ class TestLogForwarding:
             self._notify(proxy, "language/status", {"type": "Starting", "message": "Init..."})
             self._notify(proxy, "language/status", {"type": "Error", "message": "import failed"})
         assert _jdtls_lines(caplog) == ["jdtls[status:Error]: import failed"]
+
+    def test_unknown_kinds_are_folded(self, caplog: pytest.LogCaptureFixture) -> None:
+        proxy = JdtlsProxy()
+        with caplog.at_level(logging.DEBUG, logger="java_functional_lsp.proxy"):
+            self._notify(proxy, "window/logMessage", {"type": "1\nFAKE LINE", "message": "a"})
+            self._notify(proxy, "language/status", {"type": "Err\x1b[31m", "message": "b"})
+        assert _jdtls_lines(caplog) == ["jdtls[log:other]: a", "jdtls[status:other]: b"]
+        assert set(proxy._log_forwarder._buckets) == {"log:other", "status:other"}
 
     def test_format_characters_are_logged_literally(self, caplog: pytest.LogCaptureFixture) -> None:
         proxy = JdtlsProxy()
