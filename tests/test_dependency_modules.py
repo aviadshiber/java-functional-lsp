@@ -140,6 +140,31 @@ class TestDependencyModules:
         assert h.sent == []
         assert h.deps.used == 0
 
+    async def test_aggregators_are_never_imported(self, tmp_path: Path) -> None:
+        from java_functional_lsp.reactor import build_reactor_index
+
+        agg = "<project><groupId>g</groupId><artifactId>{a}</artifactId><modules>{m}</modules></project>"
+        root = tmp_path / "root"
+        for rel, text in {
+            "": agg.format(a="root", m="<module>grp</module>"),
+            "grp": agg.format(a="grp", m="<module>leaf</module>"),
+            "grp/leaf": "<project><groupId>g</groupId><artifactId>leaf</artifactId></project>",
+        }.items():
+            (root / rel).mkdir(parents=True, exist_ok=True)
+            (root / rel / "pom.xml").write_text(text)
+        send = AsyncMock()
+        deps = DependencyModules(
+            send_folders=send,
+            covered_roots=list,
+            reactor_root_for=lambda _d: root,
+            to_uri=str,
+            debounce=0,
+            index_builder=build_reactor_index,
+        )
+        deps.note_missing(tmp_path / "other" / "pom.xml", ["g:root", "g:grp"])
+        await asyncio.sleep(0.1)
+        send.assert_not_called()
+
     async def test_already_added_is_not_re_added(self) -> None:
         h = _Harness()
         h.deps.note_missing(IT / "pom.xml", ["com.example:common"])

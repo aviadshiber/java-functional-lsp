@@ -70,9 +70,14 @@ class TestIndex:
         real = reactor.resolve()
         assert index.get("com.example:common") == real / "groupA" / "common"
         assert index.get("com.example:it") == real / "groupB" / "it"  # namespace-less pom
-        assert index.get("com.example:root") == real
         assert index.poms_read == 5
         assert not index.truncated
+
+    def test_aggregators_are_never_resolved(self, reactor: Path) -> None:
+        index = build_reactor_index(reactor)
+        assert index.get("com.example:root") is None
+        assert index.get("com.example:groupA") is None
+        assert index.aggregators == {"com.example:root", "com.example:groupA", "com.example:groupB"}
 
     def test_own_group_id_wins_over_parent(self, reactor: Path) -> None:
         _write(reactor, "groupA/common", _pom("common", group="org.other"))
@@ -106,14 +111,14 @@ class TestIndex:
         malicious = _pom("groupA", modules=("common",)).replace("<project", declaration + "\n<project", 1)
         _write(reactor, "groupA", malicious)
         index = build_reactor_index(reactor)
-        assert index.get("com.example:groupA") is None
+        assert index.poms_read == 4  # groupA read and rejected, common never reached
         assert index.get("com.example:common") is None  # its modules are not followed either
         assert index.get("com.example:it") is not None
 
     def test_oversized_pom_is_rejected(self, reactor: Path) -> None:
         big = _pom("groupA", modules=("common",)).replace("</project>", "<!--" + "x" * MAX_POM_BYTES + "--></project>")
         _write(reactor, "groupA", big)
-        assert build_reactor_index(reactor).get("com.example:groupA") is None
+        assert build_reactor_index(reactor).get("com.example:common") is None
 
     def test_malformed_pom_is_tolerated(self, reactor: Path) -> None:
         _write(reactor, "groupA/common", "<project><artifactId>common</artifactId>")
@@ -159,8 +164,8 @@ class TestIndex:
         (reactor / "groupA" / "common" / "loop").symlink_to(reactor / "groupA", target_is_directory=True)
         _write(reactor, "groupA/common", _pom("common", modules=("loop",)))
         index = build_reactor_index(reactor)
-        assert index.get("com.example:common") is not None
-        assert index.poms_read == 5
+        assert index.poms_read == 5  # groupA is not read a second time through the link
+        assert index.get("com.example:it") is not None
 
     def test_pom_count_bound(self, reactor: Path) -> None:
         index = build_reactor_index(reactor, max_poms=2)

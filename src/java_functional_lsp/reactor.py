@@ -44,6 +44,9 @@ class ReactorIndex:
     modules: dict[str, Path] = field(default_factory=dict)
     #: GAs declared by more than one module directory (never resolved).
     ambiguous: set[str] = field(default_factory=set)
+    #: GAs of aggregator poms (with ``<modules>``). Never resolved: importing one would pull
+    #: in its whole subtree (a group, or the entire reactor) as a single folder.
+    aggregators: set[str] = field(default_factory=set)
     poms_read: int = 0
     #: True when the walk stopped early at the pom-count or time bound.
     truncated: bool = False
@@ -143,6 +146,18 @@ def _contained_dir(pom: Path, real_root: Path) -> Path | None:
     return module_dir if module_dir.is_relative_to(real_root) else None
 
 
+def _resolve_found(index: ReactorIndex, found: dict[str, set[Path]]) -> None:
+    """Keep GAs declared by exactly one non-aggregator directory; log the ambiguous ones once."""
+    for ga, dirs in found.items():
+        if ga in index.aggregators:
+            continue
+        if len(dirs) == 1:
+            index.modules[ga] = next(iter(dirs))
+        else:
+            index.ambiguous.add(ga)
+            logger.info("reactor: ignoring %s, declared by %d module directories", ga, len(dirs))
+
+
 def build_reactor_index(
     root: Path,
     *,
@@ -189,16 +204,13 @@ def build_reactor_index(
         g, a = parsed.group_id, parsed.artifact_id
         if g and a and "${" not in g and "${" not in a:
             found.setdefault(f"{g}:{a}", set()).add(module_dir)
+            if parsed.modules:
+                index.aggregators.add(f"{g}:{a}")
         for entry in parsed.modules:
             if "${" in entry:
                 continue
             queue.append(_module_pom(module_dir, entry))
-    for ga, dirs in found.items():
-        if len(dirs) == 1:
-            index.modules[ga] = next(iter(dirs))
-        else:
-            index.ambiguous.add(ga)
-            logger.info("reactor: ignoring %s, declared by %d module directories", ga, len(dirs))
+    _resolve_found(index, found)
     return index
 
 
