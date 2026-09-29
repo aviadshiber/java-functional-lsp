@@ -202,7 +202,7 @@ moving on. Fix any type errors or missing imports immediately.
 | Plugin not active | Run `claude plugin list` to verify, then `/reload-plugins` |
 | Diagnostics slow on first open | Normal — tree-sitter parses on first load, then incremental |
 | Java errors show up one tool call after the edit | Claude Code doesn't wait for LSP diagnostics after Edit/Write ([anthropics/claude-code#93321](https://github.com/anthropics/claude-code/issues/93321)). The plugin's hook waits up to 3s for them; if jdtls is slower (large projects), raise `JAVA_FUNCTIONAL_LSP_HOOK_WAIT` (max 4). See [Fresh jdtls diagnostics after edits](#fresh-jdtls-diagnostics-after-edits) |
-| False "X cannot be resolved" / "The hierarchy of the type X is inconsistent" on classes from another Maven group of the same repository | jdtls imports only the opened file's Maven group, so a sibling module from another group must come from the local Maven repository; if it was never installed at the reactor's version, its types are missing. Check the server's log (stderr, as captured by your LSP client) for `jdtls: pom.xml errors changed for <module>/pom.xml: ... Missing artifact g:a:jar:v`, `jdtls[log:1]: ...` and `jdtls[status:Error]: ...` lines, and `jdtls: group scope: ...` for which folder was imported. Workaround: `mvn install` the missing modules. Automatic import of in-repo dependencies is tracked in [#110](https://github.com/aviadshiber/java-functional-lsp/issues/110) |
+| False "X cannot be resolved" / "The hierarchy of the type X is inconsistent" on classes from another Maven group of the same repository | The server imports such modules automatically when m2e reports them missing. See [Dependencies on modules in other Maven groups](#dependencies-on-modules-in-other-maven-groups) for the log lines to check, the budget (`JAVA_FUNCTIONAL_LSP_DEPENDENCY_MODULES`) and the stale-install case |
 
 ### Other Editors
 
@@ -307,6 +307,42 @@ Custom settings fully replace the defaults (no merge). See the [jdtls Preference
 The jdtls Eclipse workspace index is cached in `~/.cache/jdtls-data/`. Warm starts (~10-20s) reuse this cache; cold starts (60-120s) rebuild from scratch. The cache is automatically invalidated when jdtls or Java is upgraded, but **not** when java-functional-lsp is upgraded — our Python code changes don't affect the Eclipse index.
 
 To force a clean rebuild: `rm -rf ~/.cache/jdtls-data/`
+
+### Dependencies on modules in other Maven groups
+
+To keep jdtls fast and within its heap, the server imports only the Maven *group* of the file you open (its tightest parent pom with `<modules>`), plus up to 5 more groups as you navigate. A module in that group can depend on a reactor module in *another* group. m2e then looks that dependency up in the local Maven repository at the reactor's version, often a `${revision}` default that is never installed. Every symbol from that module then shows as a false error: "cannot be resolved", "is undefined for the type", or "The hierarchy of the type X is inconsistent" ([#110](https://github.com/aviadshiber/java-functional-lsp/issues/110)). The server fixes this by importing the missing module itself.
+
+How it works:
+
+1. m2e reports the dependency as an error on the dependent's `pom.xml`: `Missing artifact com.example:common:jar:1.0` (prefixed with `Offline / ` when offline).
+2. The server looks the `groupId:artifactId` up in an index of the reactor. The index is built once per session and covers the modules reachable from the reactor root through `<modules>`, with all profiles included.
+3. If the artifact is a module of the repository and no imported folder covers it yet, the server adds the module's directory as a jdtls workspace folder. Additions are batched into one `didChangeWorkspaceFolders` per 500 ms. An added module that is missing its own in-repo dependencies reports them the same way, so the dependency closure is imported only as far as it is actually missing.
+4. jdtls fixes the dependent's classpath within a fraction of a second, but it does not re-check files that are already open. When jdtls reports that a project's classpath was updated, the server asks it to re-validate every open `.java` file of that project (`java.project.refreshDiagnostics`). Those results go through the [diagnostics hold](#fresh-jdtls-diagnostics-after-edits).
+
+If you later open a file in a group that contains one of these modules, the group folder replaces the module folder in the same workspace change. That module folder is never re-added.
+
+Configuration:
+
+| Setting | Values | Effect |
+|---------|--------|--------|
+| `JAVA_FUNCTIONAL_LSP_DEPENDENCY_MODULES` (environment) | `0`–`200` (default `60`) | Session budget of dependency-module folders; `0` disables the import |
+| `{"jdtls": {"dependencyModules": N}}` in `.java-functional-lsp.json` | same | Same budget; the environment variable wins |
+
+Limits:
+
+- **Budget.** At most N module folders are added per session. A folder that a group later replaces still counts. When the budget runs out, the log shows a `WARNING` listing the modules left unresolved. Raise the budget, or open a file in those modules' group.
+- **Stale local installs are not detected.** If an old build of the sibling is installed at the same version in your local repository, m2e resolves the dependency from that jar and reports nothing. You then see the installed version's API, not the source. Run `mvn install` for that module again, or delete it from the local repository.
+- **Maven only.** Gradle projects are unchanged.
+- **Index bounds.** The index skips poms larger than 1 MB, poms with `<!DOCTYPE`/`<!ENTITY` declarations (in any encoding), symlinked poms, modules outside the reactor root, coordinates with characters other than letters, digits, `_`, `.` and `-` (such as `${revision}`), and any `groupId:artifactId` declared by two directories. It reads at most 5000 poms, for at most 10 s.
+
+Troubleshooting (the server log is its stderr, as captured by your LSP client):
+
+- `jdtls: pom.xml errors changed for <pom>: … Missing artifact g:a:…` means m2e could not resolve that dependency.
+- `jdtls: reactor index of <root>: N modules from M poms` means the index was built. `(truncated)` means it hit a bound.
+- `jdtls: importing K dependency module(s) (used/budget): g:a (path), …` means those modules were added.
+- `jdtls: classpath of <project> updated, refreshing K open file(s)` means open files were re-checked.
+- If the errors stay and nothing was imported, the artifact is not a module of this reactor (check the `<modules>` path that should reach it), or it is a real external artifact missing from your repository.
+- m2e caches failed lookups: `*.lastUpdated` files in the local repository, and the jdtls workspace in `~/.cache/jdtls-data/`. If errors persist after the module is imported, clear the jdtls cache as described above.
 
 ### Fresh jdtls diagnostics after edits
 

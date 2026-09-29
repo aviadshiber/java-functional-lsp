@@ -14,12 +14,14 @@ import shutil
 import subprocess
 import time
 from collections import deque
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
+from .dependency_modules import ClasspathRefresher, DependencyModules, path_from_uri, resolve_budget
 from .merkle import _BUILD_FILES, ModuleSnapshot, TreeDiff
+from .reactor import find_reactor_root, parse_missing_artifacts
 
 logger = logging.getLogger(__name__)
 
@@ -346,6 +348,8 @@ async def read_message(reader: asyncio.StreamReader) -> dict[str, Any] | None:
 
 
 _WORKSPACE_DID_CHANGE_FOLDERS = "workspace/didChangeWorkspaceFolders"
+#: jdtls ``language/eventNotification`` eventType for "classpath of project <data> updated".
+_EVENT_CLASSPATH_UPDATED = 100
 _MAX_QUEUED_NOTIFICATIONS = 200
 _MODULE_READY_TIMEOUT = 30.0
 
@@ -962,6 +966,7 @@ class JdtlsProxy:
         on_diagnostics: Callable[[str, list[Any]], None] | None = None,
         uri_key: Callable[[str], str] = lambda uri: uri,
         on_stopped: Callable[[], None] | None = None,
+        open_uris: Callable[[], Iterable[str]] | None = None,
     ) -> None:
         self._process: asyncio.subprocess.Process | None = None
         self._reader_task: asyncio.Task[None] | None = None
@@ -1004,6 +1009,18 @@ class JdtlsProxy:
         self._pending_diff_tasks: dict[str, asyncio.Task[None]] = {}
         # Background tasks created by this proxy (prevents GC of fire-and-forget tasks).
         self._proxy_bg_tasks: set[asyncio.Task[Any]] = set()
+        # In-repo modules imported because m2e reported them missing (#110). Own registry:
+        # never part of ``modules`` / ``_expanded_groups``.
+        self.dependency_modules = DependencyModules(
+            send_folders=self._send_folder_change,
+            covered_roots=self._imported_folder_paths,
+            reactor_root_for=_reactor_root_for,
+            to_uri=_path_to_uri,
+        )
+        self._classpath_refresher = ClasspathRefresher(
+            open_uris=open_uris or (lambda: ()),
+            send_refresh=self._refresh_file_diagnostics,
+        )
 
     @property
     def is_available(self) -> bool:
@@ -1028,6 +1045,8 @@ class JdtlsProxy:
         self._diagnostics_cache.clear()
         self._pom_errors.clear()
         self._log_forwarder.flush()
+        self.dependency_modules.reset()
+        self._classpath_refresher.reset()
         if cached:
             logger.info("jdtls stopped: cleared cached diagnostics for %d files", cached)
         if self._on_stopped:
@@ -1065,6 +1084,10 @@ class JdtlsProxy:
         # from concurrent coroutines during the executor yield below.
         self._initial_module_uri = module_root_uri
         self.modules.mark_added(effective_root_uri)
+        self.dependency_modules.reset()
+        self.dependency_modules.budget = resolve_budget(config)
+        if not self.dependency_modules.enabled:
+            logger.info("jdtls: importing missing in-repo dependency modules is disabled")
 
         # All blocking startup I/O in a single executor call: cache version check
         # (may rmtree on upgrade), Lombok discovery, and jdtls env build.
@@ -1301,6 +1324,7 @@ class JdtlsProxy:
             p = Path(to_fs_path(uri) or uri)
             if p == group_path or p.is_relative_to(group_path):
                 removed.append({"uri": uri, "name": p.name})
+        removed.extend(self.dependency_modules.take_covered_by(group_path))
 
         # Mark ADDED before await — atomic in asyncio, prevents duplicate sends.
         self.modules.mark_added(module_uri)
@@ -1371,6 +1395,7 @@ class JdtlsProxy:
             p = Path(to_fs_path(uri) or uri)
             if p == root_path_obj or p.is_relative_to(root_path_obj):
                 removed.append({"uri": uri, "name": p.name})
+        removed.extend(self.dependency_modules.take_covered_by(root_path_obj))
 
         logger.info("jdtls: expanding workspace to module group %s", _redact_path(root_path))
         await self.send_notification(
@@ -1561,6 +1586,11 @@ class JdtlsProxy:
             level = logging.INFO if status_type == "Error" else logging.DEBUG
             kind = f"status:{status_type}" if status_type in _LANGUAGE_STATUS_TYPES else "status:other"
             self._log_forwarder.forward(level, kind, params.get("message", ""))
+        elif method == "language/eventNotification" and isinstance(params, dict):
+            if params.get("eventType") == _EVENT_CLASSPATH_UPDATED:
+                project = path_from_uri(params.get("data"))  # type: ignore[arg-type]
+                if project is not None:
+                    self._classpath_refresher.note_updated(project)
         # Other notifications are silently ignored
 
     def _note_pom_diagnostics(self, uri: str, diagnostics: Any) -> None:
@@ -1580,8 +1610,10 @@ class JdtlsProxy:
                 if isinstance(d, dict) and d.get("severity") == 1  # DiagnosticSeverity.Error
             )
         key = self._uri_key(uri)
-        if self._pom_errors.get(key, ()) == errors:
+        previous = self._pom_errors.get(key, ())
+        if previous == errors:
             return
+        self._react_to_missing_artifacts(uri, previous, errors)
         if errors:
             self._pom_errors[key] = errors
         else:
@@ -1608,3 +1640,55 @@ class JdtlsProxy:
             except ValueError:
                 pass
         return _sanitize_jdtls_log(_redact_path(path), _POM_DIAG_MSG_MAX_CHARS)
+
+    def _react_to_missing_artifacts(self, uri: str, previous: tuple[str, ...], errors: tuple[str, ...]) -> None:
+        """Import in-repo modules m2e reports missing; refresh open files once they resolve."""
+        pom = path_from_uri(uri)
+        if pom is None:
+            return
+        missing = parse_missing_artifacts(errors)
+        if missing:
+            self.dependency_modules.note_missing(pom, missing)
+        elif parse_missing_artifacts(previous):
+            self._classpath_refresher.note_updated(pom.parent)
+
+    def _imported_folder_paths(self) -> list[Path]:
+        """Folders jdtls imported for groups/modules (the dependency registry is separate)."""
+        from pygls.uris import to_fs_path
+
+        paths: list[Path] = []
+        for uri in {*self.modules.uris(), *self._expanded_groups}:
+            fs = to_fs_path(uri)
+            if fs:
+                paths.append(Path(fs))
+        return paths
+
+    async def _send_folder_change(self, added: list[dict[str, str]], removed: list[dict[str, str]]) -> None:
+        if not self._available:
+            return
+        await self.send_notification(_WORKSPACE_DID_CHANGE_FOLDERS, {"event": {"added": added, "removed": removed}})
+
+    async def _refresh_file_diagnostics(self, uri: str) -> None:
+        """jdtls does not republish diagnostics for open files after a classpath change; ask it to."""
+        if not self._available:
+            return
+        await self.send_request(
+            "workspace/executeCommand",
+            {"command": "java.project.refreshDiagnostics", "arguments": [uri, "thisFile", False]},
+            timeout=_REFRESH_DIAGNOSTICS_TIMEOUT,
+        )
+
+
+_REFRESH_DIAGNOSTICS_TIMEOUT = 10.0
+
+
+def _path_to_uri(path: Path) -> str:
+    from pygls.uris import from_fs_path
+
+    return from_fs_path(str(path)) or path.as_uri()
+
+
+def _reactor_root_for(module_dir: Path) -> Path:
+    """Reactor root of *module_dir*, bounded by its repository (``.git``) boundary."""
+    resolved = module_dir.resolve()
+    return find_reactor_root(resolved, _find_repo_boundary(resolved))
