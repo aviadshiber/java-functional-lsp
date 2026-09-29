@@ -476,15 +476,46 @@ def _version_key(name: str) -> tuple[int, ...]:
 
 
 @lru_cache(maxsize=64)
+def _find_repo_boundary(resolved_module: Path) -> Path:
+    """Return the repository/reactor boundary enclosing *resolved_module*.
+
+    The boundary is the nearest ancestor (the module itself included) that
+    contains ``.git`` — a directory, or a file for git worktrees/submodules.
+    Without any ``.git`` ancestor it is the topmost directory reachable from the
+    module through consecutive ``pom.xml``-bearing ancestors (the reactor root).
+
+    *resolved_module* must already be resolved (``Path.resolve()``) so symlinked
+    and real paths share one cache entry and the walk cannot escape via links.
+    """
+    current = resolved_module
+    while True:
+        if (current / ".git").exists():
+            return current
+        parent = current.parent
+        if parent == current:
+            break
+        current = parent
+    top = resolved_module
+    while top.parent != top and (top.parent / "pom.xml").is_file():
+        top = top.parent
+    return top
+
+
+@lru_cache(maxsize=64)
 def _find_maven_group_root(initial_module: Path, workspace_root: Path) -> Path:
     """Return the tightest Maven multi-module parent of *initial_module*.
 
-    Walks up from ``initial_module.parent`` toward (but NOT including)
-    ``workspace_root``, returning the first ancestor whose ``pom.xml``
+    Walks up from ``initial_module.parent`` toward (but NOT including) the
+    exclusive upper bound, returning the first ancestor whose ``pom.xml``
     contains a ``<modules>`` section.  Falls back to ``initial_module``
     itself when no intermediate group pom exists (e.g. modules that sit
-    directly under ``workspace_root``), keeping the scope as tight as
+    directly under the reactor root), keeping the scope as tight as
     possible and avoiding accidental full-monorepo indexing.
+
+    The exclusive upper bound is the repository/reactor boundary (see
+    ``_find_repo_boundary``), or *workspace_root* when the client root lies
+    below that boundary.  A client root *above* the repository (e.g. ``~/git``)
+    therefore never makes the repository's aggregator pom a candidate (#110).
 
     This keeps the jdtls index bounded to a module *group* (typically
     5-20 modules) rather than the full IDE workspace (potentially 200+ modules)
@@ -501,10 +532,16 @@ def _find_maven_group_root(initial_module: Path, workspace_root: Path) -> Path:
     # outside workspace_root).
     if not current.is_relative_to(workspace_root):
         return workspace_root
-    # Walk up to (but NOT including) workspace_root.  Inspecting workspace_root's
-    # own pom.xml would include the entire monorepo (e.g. 200+ modules) → OOM.
+    boundary = _find_repo_boundary(resolved_module)
+    # The client root stays the bound only when it is strictly below the boundary.
+    bound = workspace_root if workspace_root != boundary and workspace_root.is_relative_to(boundary) else boundary
+    # Case 2: the module IS the bound (e.g. the repository root) — nothing to walk.
+    if not current.is_relative_to(bound):
+        return resolved_module
+    # Walk up to (but NOT including) the bound.  Inspecting the reactor root's
+    # own pom.xml would include the entire monorepo (e.g. 1000+ modules) → OOM.
     # `current.parent == current` detects the filesystem root (POSIX `/` or Windows drive).
-    while current not in (workspace_root, current.parent):
+    while current not in (bound, current.parent):
         pom = current / "pom.xml"
         if pom.is_file():
             try:
@@ -513,8 +550,8 @@ def _find_maven_group_root(initial_module: Path, workspace_root: Path) -> Path:
             except OSError:
                 pass
         current = current.parent
-    # Case 2: no intermediate group pom found — use the initial module as its own scope
-    # (tightest possible; avoids full-monorepo indexing for flat modules under workspace_root).
+    # Case 3: no intermediate group pom found — use the initial module as its own scope
+    # (tightest possible; avoids full-monorepo indexing for modules directly under the bound).
     return resolved_module
 
 
@@ -788,6 +825,124 @@ def _build_effective_params(
     return effective_params
 
 
+#: Forwarded jdtls log text is capped at this many characters (after sanitizing).
+_JDTLS_LOG_MAX_CHARS = 2048
+#: Raw text is pre-capped before redaction to bound regex cost on huge stack traces.
+#: Far above ``_JDTLS_LOG_MAX_CHARS`` so a secret straddling the final cut is still redacted.
+_JDTLS_LOG_PRECAP_CHARS = 16384
+#: Token bucket per message kind: at most this many lines per window.
+_JDTLS_LOG_RATE = 20
+_JDTLS_LOG_WINDOW_SEC = 10.0
+#: Bound on remembered message fingerprints used for in-window dedupe.
+_JDTLS_LOG_DEDUPE_MAX = 512
+#: Pom.xml diagnostics summary: messages shown per change, each capped at this length.
+_POM_DIAG_SHOWN = 3
+_POM_DIAG_MSG_MAX_CHARS = 300
+
+#: LSP ``MessageType`` (window/logMessage) → proxy log level. Info/Log are DEBUG.
+_LOG_MESSAGE_LEVELS: dict[int, int] = {1: logging.WARNING, 2: logging.INFO}
+
+_URL_USERINFO_RE = re.compile(r"([A-Za-z][A-Za-z0-9+.\-]*://)[^/\s@]+@")
+_SECRET_QUERY_RE = re.compile(
+    r"([?&;][^=&;#\s]*(?:token|key|secret|password|auth|sig)[^=&;#\s]*=)[^&;#\s]*",
+    re.IGNORECASE,
+)
+_AUTH_HEADER_RE = re.compile(r"(authorization\s*[:=]\s*)(?:(bearer|basic|token|digest)\s+)?[^\s,;]+", re.IGNORECASE)
+_BEARER_RE = re.compile(r"\b(bearer)\s+[A-Za-z0-9._~+/=\-]+", re.IGNORECASE)
+_CONTROL_CHARS_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]")
+
+
+def _auth_header_sub(match: re.Match[str]) -> str:
+    scheme = match.group(2)
+    return f"{match.group(1)}{scheme} ***" if scheme else f"{match.group(1)}***"
+
+
+def _sanitize_jdtls_log(text: str, max_chars: int = _JDTLS_LOG_MAX_CHARS) -> str:
+    """Return a log-safe single-line version of jdtls-provided *text*.
+
+    Redacts URL userinfo (``scheme://***@``), secret-looking query parameters
+    (``token``/``key``/``secret``/``password``/``auth``/``sig``), and
+    ``Authorization``/``Bearer`` values; escapes CR/LF; strips every other
+    C0/C1 control character (incl. ESC, so no terminal escape injection); and
+    truncates to *max_chars*.  Redaction runs before truncation so a cut can
+    never split a secret out of its matching context.
+    """
+    text = text[:_JDTLS_LOG_PRECAP_CHARS]
+    text = _URL_USERINFO_RE.sub(r"\1***@", text)
+    text = _SECRET_QUERY_RE.sub(r"\1***", text)
+    text = _AUTH_HEADER_RE.sub(_auth_header_sub, text)
+    text = _BEARER_RE.sub(r"\1 ***", text)
+    text = text.replace("\r", "\\r").replace("\n", "\\n").replace("\t", " ")
+    text = _CONTROL_CHARS_RE.sub("", text)
+    if len(text) > max_chars:
+        text = text[:max_chars] + "...(truncated)"
+    return text
+
+
+class _JdtlsLogForwarder:
+    """Forward jdtls log notifications to the proxy logger, sanitized and rate limited.
+
+    Each message kind (e.g. ``logMessage:1``) has its own token bucket of
+    ``_JDTLS_LOG_RATE`` lines per ``_JDTLS_LOG_WINDOW_SEC``.  A message identical
+    to one logged within the window is dropped.  Dropped lines are counted and
+    reported as one ``suppressed N jdtls log messages`` line once the window
+    has rolled over.  The clock is injectable for tests.
+    """
+
+    def __init__(self, clock: Callable[[], float] = time.monotonic) -> None:
+        self._clock = clock
+        self._buckets: dict[str, tuple[float, float]] = {}  # kind -> (tokens, last refill)
+        self._recent: dict[tuple[str, str], float] = {}  # (kind, text) -> last logged at
+        self._suppressed = 0
+        self._report_at = clock()
+
+    def forward(self, level: int, kind: str, raw: object) -> None:
+        """Log *raw* under *kind* at *level* unless rate limited or duplicated."""
+        if not logger.isEnabledFor(level):
+            return
+        now = self._clock()
+        self._maybe_report(now)
+        text = _sanitize_jdtls_log(raw if isinstance(raw, str) else str(raw))
+        key = (kind, text)
+        last = self._recent.get(key)
+        if last is not None and now - last < _JDTLS_LOG_WINDOW_SEC:
+            self._suppressed += 1
+            return
+        if not self._take_token(kind, now):
+            self._suppressed += 1
+            return
+        if len(self._recent) >= _JDTLS_LOG_DEDUPE_MAX:
+            self._recent = {k: t for k, t in self._recent.items() if now - t < _JDTLS_LOG_WINDOW_SEC}
+            if len(self._recent) >= _JDTLS_LOG_DEDUPE_MAX:
+                self._recent.clear()
+        self._recent[key] = now
+        logger.log(level, "jdtls[%s]: %s", kind, text)
+
+    def _take_token(self, kind: str, now: float) -> bool:
+        tokens, last = self._buckets.get(kind, (float(_JDTLS_LOG_RATE), now))
+        tokens = min(float(_JDTLS_LOG_RATE), tokens + (now - last) * _JDTLS_LOG_RATE / _JDTLS_LOG_WINDOW_SEC)
+        if tokens < 1.0:
+            self._buckets[kind] = (tokens, now)
+            return False
+        self._buckets[kind] = (tokens - 1.0, now)
+        return True
+
+    def _maybe_report(self, now: float) -> None:
+        if now - self._report_at < _JDTLS_LOG_WINDOW_SEC:
+            return
+        if self._suppressed:
+            logger.info("jdtls: suppressed %d jdtls log messages", self._suppressed)
+            self._suppressed = 0
+        self._report_at = now
+
+    def flush(self) -> None:
+        """Report any pending suppressed count (called on stop)."""
+        if self._suppressed:
+            logger.info("jdtls: suppressed %d jdtls log messages", self._suppressed)
+            self._suppressed = 0
+        self._report_at = self._clock()
+
+
 class JdtlsProxy:
     """Manages a jdtls subprocess and provides async request/notification forwarding."""
 
@@ -809,6 +964,10 @@ class JdtlsProxy:
         self._on_diagnostics = on_diagnostics
         self._on_stopped = on_stopped
         self._dropped_request_counts: dict[str, int] = {}
+        # jdtls window/logMessage + language/status → proxy log (sanitized, rate limited).
+        self._log_forwarder = _JdtlsLogForwarder()
+        # uri_key(pom.xml URI) → Error diagnostic messages last seen (m2e import errors, #110).
+        self._pom_errors: dict[str, tuple[str, ...]] = {}
         self._available = False
         self._jdtls_capabilities: dict[str, Any] = {}
         # Lazy-start state
@@ -856,6 +1015,7 @@ class JdtlsProxy:
         self._available = False
         cached = len(self._diagnostics_cache)
         self._diagnostics_cache.clear()
+        self._pom_errors.clear()
         if cached:
             logger.info("jdtls stopped: cleared cached diagnostics for %d files", cached)
         if self._on_stopped:
@@ -1095,6 +1255,12 @@ class JdtlsProxy:
         if module_path and workspace_path:
             group_root = _find_maven_group_root(Path(module_path), Path(workspace_path))
             group_uri = from_fs_path(str(group_root)) or module_uri
+            logger.debug(
+                "jdtls: group scope for %s: boundary %s, group root %s",
+                _redact_path(module_path),
+                _redact_path(str(_find_repo_boundary(Path(module_path).resolve()))),
+                _redact_path(str(group_root)),
+            )
         else:
             group_uri = module_uri
 
@@ -1166,6 +1332,12 @@ class JdtlsProxy:
         if self._initial_module_uri:
             initial_path = to_fs_path(self._initial_module_uri) or self._initial_module_uri
             group_root_path = str(_find_maven_group_root(Path(initial_path), Path(workspace_path)))
+            logger.info(
+                "jdtls: group scope: client root %s, repository boundary %s, group root %s",
+                _redact_path(workspace_path),
+                _redact_path(str(_find_repo_boundary(Path(initial_path).resolve()))),
+                _redact_path(group_root_path),
+            )
 
         root_path = group_root_path
         root_uri = from_fs_path(root_path) or self._original_root_uri
@@ -1198,6 +1370,7 @@ class JdtlsProxy:
     async def stop(self) -> None:
         """Shutdown jdtls subprocess gracefully."""
         self._mark_stopped()
+        self._log_forwarder.flush()
 
         if self._reader_task and not self._reader_task.done():
             self._reader_task.cancel()
@@ -1364,4 +1537,60 @@ class JdtlsProxy:
             self._diagnostics_cache[self._uri_key(uri)] = diagnostics
             if self._on_diagnostics:
                 self._on_diagnostics(uri, diagnostics)
-        # Other notifications (window/logMessage, etc.) are silently ignored
+            if isinstance(uri, str) and uri.endswith("/pom.xml"):
+                self._note_pom_diagnostics(uri, diagnostics)
+        elif method == "window/logMessage" and isinstance(params, dict):
+            msg_type = params.get("type")
+            level = _LOG_MESSAGE_LEVELS.get(msg_type, logging.DEBUG) if isinstance(msg_type, int) else logging.DEBUG
+            self._log_forwarder.forward(level, f"log:{msg_type}", params.get("message", ""))
+        elif method == "language/status" and isinstance(params, dict):
+            status_type = params.get("type")
+            level = logging.INFO if status_type == "Error" else logging.DEBUG
+            self._log_forwarder.forward(level, f"status:{str(status_type)[:32]}", params.get("message", ""))
+        # Other notifications are silently ignored
+
+    def _note_pom_diagnostics(self, uri: str, diagnostics: Any) -> None:
+        """Log a one-line summary whenever the Error diagnostics set of a pom.xml changes.
+
+        m2e reports import failures (e.g. ``Missing artifact g:a:t:v``) only as
+        diagnostics on the module's pom.xml, which the server never publishes
+        (it filters to ``.java``).  Logging them here makes the cause of false
+        "cannot be resolved" errors visible (#110).  Does not alter what is
+        published to the client.
+        """
+        errors: tuple[str, ...] = ()
+        if isinstance(diagnostics, list):
+            errors = tuple(
+                str(d.get("message", ""))
+                for d in diagnostics
+                if isinstance(d, dict) and d.get("severity") == 1  # DiagnosticSeverity.Error
+            )
+        key = self._uri_key(uri)
+        if self._pom_errors.get(key, ()) == errors:
+            return
+        if errors:
+            self._pom_errors[key] = errors
+        else:
+            self._pom_errors.pop(key, None)
+        shown = "; ".join(_sanitize_jdtls_log(m, _POM_DIAG_MSG_MAX_CHARS) for m in errors[:_POM_DIAG_SHOWN])
+        more = f" (+{len(errors) - _POM_DIAG_SHOWN} more)" if len(errors) > _POM_DIAG_SHOWN else ""
+        logger.info(
+            "jdtls: pom.xml errors changed for %s: %d error(s)%s%s",
+            self._pom_display_path(uri),
+            len(errors),
+            f": {shown}" if shown else "",
+            more,
+        )
+
+    def _pom_display_path(self, uri: str) -> str:
+        """Return *uri*'s path relative to the client root, else a redacted basename."""
+        from pygls.uris import to_fs_path
+
+        path = to_fs_path(uri)
+        root = to_fs_path(self._original_root_uri) if self._original_root_uri else None
+        if path and root:
+            try:
+                return _sanitize_jdtls_log(str(Path(path).relative_to(root)), _POM_DIAG_MSG_MAX_CHARS)
+            except ValueError:
+                pass
+        return _sanitize_jdtls_log(_redact_path(path), _POM_DIAG_MSG_MAX_CHARS)
