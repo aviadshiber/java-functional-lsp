@@ -3,6 +3,7 @@
 
 Usage: python3 scripts/generate-formula.py <version>
 """
+
 from __future__ import annotations
 
 import json

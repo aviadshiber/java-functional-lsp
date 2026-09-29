@@ -202,6 +202,7 @@ moving on. Fix any type errors or missing imports immediately.
 | Plugin not active | Run `claude plugin list` to verify, then `/reload-plugins` |
 | Diagnostics slow on first open | Normal — tree-sitter parses on first load, then incremental |
 | Java errors show up one tool call after the edit | Claude Code doesn't wait for LSP diagnostics after Edit/Write ([anthropics/claude-code#93321](https://github.com/anthropics/claude-code/issues/93321)). The plugin's hook waits up to 3s for them; if jdtls is slower (large projects), raise `JAVA_FUNCTIONAL_LSP_HOOK_WAIT` (max 4). See [Fresh jdtls diagnostics after edits](#fresh-jdtls-diagnostics-after-edits) |
+| False "X cannot be resolved" / "The hierarchy of the type X is inconsistent" on classes from another Maven group of the same repository | jdtls imports only the opened file's Maven group, so a sibling module from another group must come from the local Maven repository; if it was never installed at the reactor's version, its types are missing. Check the server's log (stderr, as captured by your LSP client) for `jdtls: pom.xml errors changed for <module>/pom.xml: ... Missing artifact g:a:jar:v`, `jdtls[log:1]: ...` and `jdtls[status:Error]: ...` lines, and `jdtls: group scope: ...` for which folder was imported. Workaround: `mvn install` the missing modules. Automatic import of in-repo dependencies is tracked in [#110](https://github.com/aviadshiber/java-functional-lsp/issues/110) |
 
 ### Other Editors
 

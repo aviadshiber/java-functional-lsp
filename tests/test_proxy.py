@@ -989,9 +989,10 @@ class TestLazyStart:
     @pytest.fixture(autouse=True)
     def _clear_group_root_cache(self) -> None:  # type: ignore[override]
         """Clear _find_maven_group_root lru_cache between tests."""
-        from java_functional_lsp.proxy import _find_maven_group_root
+        from java_functional_lsp.proxy import _find_maven_group_root, _find_repo_boundary
 
         _find_maven_group_root.cache_clear()
+        _find_repo_boundary.cache_clear()
 
     def test_check_available_true(self) -> None:
         from java_functional_lsp.proxy import JdtlsProxy
@@ -1204,6 +1205,7 @@ class TestLazyStart:
         for d in (module_a, module_b):
             d.mkdir(parents=True)
         (group / "pom.xml").write_text("<project><modules><module>module-a</module></modules></project>")
+        (monorepo / ".git").mkdir()  # repository boundary: group sits below it, so it is a candidate
 
         module_a_uri = module_a.as_uri()
         module_b_uri = module_b.as_uri()
@@ -1270,6 +1272,7 @@ class TestLazyStart:
             (d / "pom.xml").write_text("<project/>")
         (group_a / "pom.xml").write_text("<project><modules><module>mod-a</module></modules></project>")
         (group_b / "pom.xml").write_text("<project><modules><module>mod-b</module></modules></project>")
+        (monorepo / ".git").mkdir()  # repository boundary: the groups sit below it
 
         proxy = JdtlsProxy()
         proxy._available = True
@@ -1310,6 +1313,7 @@ class TestLazyStart:
         (group / "pom.xml").write_text(
             "<project><modules><module>mod-a</module><module>mod-b</module></modules></project>"
         )
+        (monorepo / ".git").mkdir()  # repository boundary: group sits below it
 
         proxy = JdtlsProxy()
         proxy._available = True
