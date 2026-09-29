@@ -8,9 +8,12 @@ workspace folder".
 
 The poms come from the user's checkout, so parsing is defensive: files over
 ``MAX_POM_BYTES`` or containing a ``<!DOCTYPE``/``<!ENTITY`` declaration are
-rejected before XML parsing (no entity expansion), symlinked poms are skipped,
+rejected before ElementTree sees them (no entity expansion): a byte scan catches the
+ASCII-compatible spellings, and an expat pass that refuses any doctype or entity
+declaration catches the rest (e.g. a UTF-16 pom). Symlinked poms are skipped,
 every module must resolve inside the reactor root, and the walk is bounded by a
-pom count and a wall-clock budget.
+pom count and a wall-clock budget. Coordinates outside Maven's usual character set
+are ignored, so nothing from a pom reaches the log unfiltered.
 """
 
 from __future__ import annotations
@@ -23,6 +26,7 @@ from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
+from xml.parsers import expat
 
 logger = logging.getLogger(__name__)
 
@@ -31,9 +35,36 @@ MAX_POMS = 5000
 MAX_SECONDS = 10.0
 
 _FORBIDDEN_MARKUP = re.compile(rb"<!\s*(?:DOCTYPE|ENTITY)", re.IGNORECASE)
+_COORDINATE = r"[A-Za-z0-9_.\-]+"
+_COORDINATE_RE = re.compile(_COORDINATE)
 #: m2e: "[<prefix> / ]Missing artifact g:a:type[:classifier]:version". ``${revision}`` is
 #: already interpolated. Only groupId and artifactId are kept.
-_MISSING_ARTIFACT_RE = re.compile(r"(?:^|/\s*)Missing artifact ([A-Za-z0-9_.\-]+):([A-Za-z0-9_.\-]+):\S+")
+_MISSING_ARTIFACT_RE = re.compile(rf"(?:^|/\s*)Missing artifact ({_COORDINATE}):({_COORDINATE}):\S+")
+
+
+class _ForbiddenDeclarationError(Exception):
+    pass
+
+
+def _forbid(*_args: object) -> None:
+    raise _ForbiddenDeclarationError
+
+
+def _declares_dtd(data: bytes) -> bool:
+    """True when expat meets a doctype or entity declaration in *data*, in any encoding.
+
+    Only declarations are rejected here; a malformed document is left to ElementTree.
+    """
+    parser = expat.ParserCreate()
+    parser.StartDoctypeDeclHandler = _forbid
+    parser.EntityDeclHandler = _forbid
+    try:
+        parser.Parse(data, True)
+    except _ForbiddenDeclarationError:
+        return True
+    except (expat.ExpatError, ValueError):  # ValueError: an encoding expat cannot decode
+        return False
+    return False
 
 
 @dataclass
@@ -97,7 +128,7 @@ def _read_pom_bytes(pom: Path) -> bytes | None:
         return None
     if len(data) > MAX_POM_BYTES:
         return None
-    if _FORBIDDEN_MARKUP.search(data):
+    if _FORBIDDEN_MARKUP.search(data) or _declares_dtd(data):
         logger.info("reactor: skipping %s (DOCTYPE/ENTITY declarations are not allowed)", pom.name)
         return None
     return data
@@ -110,7 +141,7 @@ def parse_pom(pom: Path) -> _Pom | None:
         return None
     try:
         project = ET.fromstring(data)
-    except ET.ParseError:
+    except (ET.ParseError, ValueError):  # ValueError: e.g. encoding="UTF-16-BE"
         return None
     if _local(project.tag) != "project":
         return None
@@ -169,8 +200,9 @@ def build_reactor_index(
 
     Breadth-first; each pom is read at most once. A module whose resolved directory
     is outside the resolved root, or whose pom is a symlink, is skipped. Coordinates
-    containing ``${`` are skipped. A GA declared by two directories is dropped
-    entirely and logged once. Blocking: run it in an executor.
+    with characters outside ``[A-Za-z0-9_.-]`` (such as ``${...}`` placeholders) are
+    skipped. A GA declared by two directories is dropped entirely and logged once.
+    Blocking: run it in an executor.
     """
     try:
         real_root = root.resolve()
@@ -202,7 +234,7 @@ def build_reactor_index(
         if parsed is None:
             continue
         g, a = parsed.group_id, parsed.artifact_id
-        if g and a and "${" not in g and "${" not in a:
+        if g and a and _COORDINATE_RE.fullmatch(g) and _COORDINATE_RE.fullmatch(a):
             found.setdefault(f"{g}:{a}", set()).add(module_dir)
             if parsed.modules:
                 index.aggregators.add(f"{g}:{a}")

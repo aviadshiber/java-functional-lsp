@@ -90,6 +90,19 @@ def _is_under(path: Path, folder: Path) -> bool:
     return path == folder or path.is_relative_to(folder)
 
 
+def _real(path: Path) -> Path:
+    """*path* with symlinks resolved, or unchanged when it cannot be resolved.
+
+    Registry entries come from the reactor index, which is always resolved; folders the
+    proxy imported are spelled as the client sent them. Both sides are compared resolved,
+    so a client root reached through a symlink still matches (#110).
+    """
+    try:
+        return path.resolve()
+    except (OSError, RuntimeError):
+        return path
+
+
 def _display(path: Path, root: Path) -> str:
     try:
         return str(path.relative_to(root)) or "."
@@ -185,9 +198,10 @@ class DependencyModules:
         return index
 
     def _is_covered(self, module_dir: Path) -> bool:
+        module_dir = _real(module_dir)
         if any(_is_under(module_dir, folder) for folder in self.registry.values()):
             return True
-        return any(_is_under(module_dir, folder) for folder in self._covered_roots())
+        return any(_is_under(module_dir, _real(folder)) for folder in self._covered_roots())
 
     async def _consider(self, module_dir: Path, gas: list[str]) -> None:
         index = await self._index_for(module_dir)
@@ -210,8 +224,13 @@ class DependencyModules:
             self._flush_task.add_done_callback(self._tasks.discard)
 
     async def _flush_after_debounce(self, root: Path) -> None:
-        await asyncio.sleep(self.debounce)
-        await self.flush(root)
+        # Candidates queued while a flush awaits its send see this task still running and do
+        # not schedule a flush of their own, so keep flushing until nothing is pending.
+        while True:
+            await asyncio.sleep(self.debounce)
+            await self.flush(root)
+            if not self._pending:
+                return
 
     async def flush(self, root: Path) -> None:
         """Send one didChangeWorkspaceFolders add for the queued modules, within the budget."""
@@ -258,6 +277,7 @@ class DependencyModules:
 
         Returns them as ``removed`` entries for the same didChangeWorkspaceFolders event.
         """
+        folder = _real(folder)
         removed: list[Folder] = []
         for ga, target in list(self.registry.items()):
             if _is_under(target, folder):

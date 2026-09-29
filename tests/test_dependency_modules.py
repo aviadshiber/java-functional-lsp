@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
@@ -118,6 +119,17 @@ class _Harness:
     async def settle(self) -> None:
         for _ in range(5):
             await asyncio.sleep(0.03)
+        await _drain(self.deps)
+
+
+async def _drain(deps: DependencyModules) -> None:
+    """Wait until every background task of *deps* has finished (absence is then meaningful)."""
+    for _ in range(200):
+        running = [t for t in deps._tasks if not t.done()]
+        if not running:
+            return
+        await asyncio.gather(*running, return_exceptions=True)
+    raise AssertionError("dependency-module tasks never settled")
 
 
 class TestDependencyModules:
@@ -137,6 +149,7 @@ class TestDependencyModules:
         h = _Harness()
         h.deps.note_missing(IT / "pom.xml", ["org.external:lib", "com.example:it"])  # it: under groupB
         await h.settle()
+        assert h.builds == 1  # positive control: the index was built and consulted
         assert h.sent == []
         assert h.deps.used == 0
 
@@ -153,17 +166,26 @@ class TestDependencyModules:
             (root / rel).mkdir(parents=True, exist_ok=True)
             (root / rel / "pom.xml").write_text(text)
         send = AsyncMock()
+        indexes: list[ReactorIndex] = []
+
+        def build(r: Path) -> ReactorIndex:
+            indexes.append(build_reactor_index(r))
+            return indexes[-1]
+
         deps = DependencyModules(
             send_folders=send,
             covered_roots=list,
             reactor_root_for=lambda _d: root,
             to_uri=str,
             debounce=0,
-            index_builder=build_reactor_index,
+            index_builder=build,
         )
-        deps.note_missing(tmp_path / "other" / "pom.xml", ["g:root", "g:grp"])
-        await asyncio.sleep(0.1)
-        send.assert_not_called()
+        deps.note_missing(tmp_path / "other" / "pom.xml", ["g:root", "g:grp", "g:leaf"])
+        await _drain(deps)
+        assert [i.aggregators for i in indexes] == [{"g:root", "g:grp"}]
+        # Positive control: the leaf in the same batch was imported, the aggregators were not.
+        send.assert_awaited_once()
+        assert [a["name"] for a in send.await_args.args[0]] == ["leaf"]
 
     async def test_already_added_is_not_re_added(self) -> None:
         h = _Harness()
@@ -214,17 +236,54 @@ class TestDependencyModules:
         h.deps.note_missing(IT / "pom.xml", ["com.example:common"])
         await asyncio.sleep(0.05)  # indexed and pending, not flushed yet
         assert h.deps.take_covered_by(ROOT / "groupA") == []
-        await asyncio.sleep(0.3)
+        await h.settle()
         assert h.sent == []
 
     async def test_group_expanded_before_flush_skips_candidate(self) -> None:
         h = _Harness()
-        h.deps.debounce = 0.1
-        h.deps.note_missing(IT / "pom.xml", ["com.example:common"])
-        await asyncio.sleep(0.03)
-        h.covered.append(ROOT / "groupA")
-        await asyncio.sleep(0.2)
-        assert h.sent == []
+        h.deps.debounce = 0.2
+        h.deps.note_missing(IT / "pom.xml", ["com.example:common", "com.example:util"])
+        for _ in range(100):  # until both are queued, well before the debounce ends
+            if len(h.deps._pending) == 2:
+                break
+            await asyncio.sleep(0.005)
+        assert set(h.deps._pending) == {"com.example:common", "com.example:util"}
+        h.covered.append(COMMON)  # the group holding common was imported meanwhile
+        await h.settle()
+        # Positive control: the flush ran and sent util; only the covered candidate was skipped.
+        assert [[a["name"] for a in added] for added, _ in h.sent] == [["util"]]
+
+    async def test_candidate_queued_during_a_send_is_flushed(self) -> None:
+        release = asyncio.Event()
+        sent: list[list[str]] = []
+
+        async def slow_send(added: list[dict[str, str]], _removed: list[dict[str, str]]) -> None:
+            sent.append([a["name"] for a in added])
+            if len(sent) == 1:
+                await release.wait()  # e.g. stdin.drain() in the real proxy
+
+        deps = DependencyModules(
+            send_folders=slow_send,
+            covered_roots=list,
+            reactor_root_for=lambda _d: ROOT,
+            to_uri=str,
+            debounce=0.01,
+            index_builder=lambda _r: _index(),
+        )
+        deps.note_missing(IT / "pom.xml", ["com.example:common"])
+        for _ in range(100):
+            if sent:
+                break
+            await asyncio.sleep(0.005)
+        assert sent == [["common"]]
+        deps.note_missing(IT / "pom.xml", ["com.example:util"])  # while the first send is in flight
+        for _ in range(10):
+            await asyncio.sleep(0.01)
+        release.set()
+        await _drain(deps)
+        assert sent == [["common"], ["util"]]
+        assert deps._pending == {}
+        assert set(deps.registry) == {"com.example:common", "com.example:util"}
 
     async def test_index_failure_is_contained(self, caplog: pytest.LogCaptureFixture) -> None:
         def boom(_root: Path) -> ReactorIndex:
@@ -256,7 +315,63 @@ class TestDependencyModules:
         assert h.builds == 2
 
     def test_note_missing_without_loop_is_a_no_op(self) -> None:
-        _Harness().deps.note_missing(IT / "pom.xml", ["com.example:common"])
+        h = _Harness()
+        h.deps.note_missing(IT / "pom.xml", ["com.example:common"])
+        assert h.deps._tasks == set()
+        assert h.deps._pending == {}
+        assert h.deps.registry == {}
+        assert h.deps.used == 0
+        assert h.builds == 0
+        assert h.sent == []
+
+
+@pytest.mark.skipif(os.name == "nt", reason="symlinks")
+class TestSymlinkedRoot:
+    """Registry entries are resolved; folders the proxy imported may be spelled through a symlink."""
+
+    @pytest.fixture
+    def linked(self, tmp_path: Path) -> tuple[Path, Path]:
+        real = tmp_path / "real"
+        (real / "groupA" / "common").mkdir(parents=True)
+        (real / "groupB" / "it").mkdir(parents=True)
+        link = tmp_path / "link"
+        link.symlink_to(real, target_is_directory=True)
+        return real.resolve(), link
+
+    def _deps(self, real: Path, covered: list[Path], sent: list[list[str]]) -> DependencyModules:
+        async def send(added: list[dict[str, str]], _removed: list[dict[str, str]]) -> None:
+            sent.append([a["name"] for a in added])
+
+        return DependencyModules(
+            send_folders=send,
+            covered_roots=lambda: covered,
+            reactor_root_for=lambda _d: real,
+            to_uri=str,
+            debounce=0,
+            index_builder=lambda _r: ReactorIndex(real, {"com.example:common": real / "groupA" / "common"}),
+        )
+
+    def test_take_covered_by_matches_the_symlinked_spelling(self, linked: tuple[Path, Path]) -> None:
+        real, link = linked
+        deps = self._deps(real, [], [])
+        deps.registry["com.example:common"] = real / "groupA" / "common"
+        removed = deps.take_covered_by(link / "groupA")
+        assert [r["name"] for r in removed] == ["common"]
+        assert deps.registry == {}
+
+    async def test_symlinked_covered_root_prevents_import(self, linked: tuple[Path, Path]) -> None:
+        real, link = linked
+        sent: list[list[str]] = []
+        deps = self._deps(real, [link / "groupA"], sent)
+        deps.note_missing(link / "groupB" / "it" / "pom.xml", ["com.example:common"])
+        await _drain(deps)
+        assert sent == []
+        assert deps.registry == {}
+        # Positive control: with nothing covering it, the same report imports it.
+        deps2 = self._deps(real, [], sent)
+        deps2.note_missing(link / "groupB" / "it" / "pom.xml", ["com.example:common"])
+        await _drain(deps2)
+        assert sent == [["common"]]
 
 
 class TestClasspathRefresher:
@@ -449,6 +564,40 @@ class TestProxyGroupDedupe:
         assert proxy._expanded_groups == set()
         assert two_groups["common"].as_uri() not in proxy.modules.uris()
         assert "com.example:common" in deps.registry
+
+    @pytest.mark.skipif(os.name == "nt", reason="symlinks")
+    async def test_symlinked_client_root_still_retires_dependency_folders(
+        self, two_groups: dict[str, Path], tmp_path: Path
+    ) -> None:
+        link = tmp_path / "link"
+        link.symlink_to(two_groups["root"], target_is_directory=True)
+        proxy = JdtlsProxy()
+        proxy._available = True
+        proxy._original_root_uri = link.as_uri()  # the client reaches the checkout through a symlink
+        proxy.send_notification = AsyncMock()  # type: ignore[method-assign]
+        proxy.dependency_modules.registry["com.example:common"] = two_groups["common"].resolve()
+        await proxy.expand_full_workspace()  # no initial module: the root keeps the client's spelling
+        params = proxy.send_notification.await_args.args[1]
+        assert [r["name"] for r in params["event"]["removed"]] == ["common"]
+        assert proxy.dependency_modules.registry == {}
+
+    @pytest.mark.skipif(os.name == "nt", reason="symlinks")
+    async def test_symlinked_module_folder_counts_as_covered(self, two_groups: dict[str, Path], tmp_path: Path) -> None:
+        link = tmp_path / "link"
+        link.symlink_to(two_groups["root"], target_is_directory=True)
+        proxy = JdtlsProxy()
+        proxy._available = True
+        proxy.send_notification = AsyncMock()  # type: ignore[method-assign]
+        proxy.modules.mark_added((link / "groupA" / "common").as_uri())  # imported via the symlink
+        proxy.modules.mark_added((link / "groupB" / "it").as_uri())
+        deps = proxy.dependency_modules
+        deps.debounce = 0
+        common = two_groups["common"].resolve()
+        deps._index_builder = lambda _r: ReactorIndex(two_groups["root"].resolve(), {"com.example:common": common})
+        deps.note_missing(link / "groupB" / "it" / "pom.xml", ["com.example:common"])
+        await _drain(deps)
+        proxy.send_notification.assert_not_called()
+        assert deps.registry == {}
 
     async def test_stop_resets_dependency_state(self) -> None:
         proxy = JdtlsProxy()

@@ -333,7 +333,7 @@ Limits:
 - **Budget.** At most N module folders are added per session. A folder that a group later replaces still counts. When the budget runs out, the log shows a `WARNING` listing the modules left unresolved. Raise the budget, or open a file in those modules' group.
 - **Stale local installs are not detected.** If an old build of the sibling is installed at the same version in your local repository, m2e resolves the dependency from that jar and reports nothing. You then see the installed version's API, not the source. Run `mvn install` for that module again, or delete it from the local repository.
 - **Maven only.** Gradle projects are unchanged.
-- **Index bounds.** The index skips poms larger than 1 MB, poms with `<!DOCTYPE`/`<!ENTITY` declarations, symlinked poms, modules outside the reactor root, coordinates containing `${`, and any `groupId:artifactId` declared by two directories. It reads at most 5000 poms, for at most 10 s.
+- **Index bounds.** The index skips poms larger than 1 MB, poms with `<!DOCTYPE`/`<!ENTITY` declarations (in any encoding), symlinked poms, modules outside the reactor root, coordinates with characters other than letters, digits, `_`, `.` and `-` (such as `${revision}`), and any `groupId:artifactId` declared by two directories. It reads at most 5000 poms, for at most 10 s.
 
 Troubleshooting (the server log is its stderr, as captured by your LSP client):
 

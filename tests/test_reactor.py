@@ -107,13 +107,67 @@ class TestIndex:
             '<!ENTITY x SYSTEM "file:///etc/passwd">',
         ],
     )
-    def test_doctype_or_entity_pom_is_rejected(self, reactor: Path, declaration: str) -> None:
+    def test_doctype_or_entity_pom_is_rejected(
+        self, reactor: Path, declaration: str, caplog: pytest.LogCaptureFixture
+    ) -> None:
         malicious = _pom("groupA", modules=("common",)).replace("<project", declaration + "\n<project", 1)
         _write(reactor, "groupA", malicious)
-        index = build_reactor_index(reactor)
+        with caplog.at_level(logging.INFO, logger="java_functional_lsp.reactor"):
+            index = build_reactor_index(reactor)
         assert index.poms_read == 4  # groupA read and rejected, common never reached
         assert index.get("com.example:common") is None  # its modules are not followed either
         assert index.get("com.example:it") is not None
+        # The guard itself rejected it, not an incidental XML parse error.
+        assert "DOCTYPE/ENTITY declarations are not allowed" in caplog.text
+
+    @pytest.mark.parametrize(
+        ("codec", "bom"),
+        [("utf-16", b""), ("utf-16-be", b"\xfe\xff"), ("utf-16-le", b"")],  # "utf-16" writes its own BOM
+    )
+    def test_doctype_in_non_ascii_encoding_is_rejected(
+        self, reactor: Path, codec: str, bom: bytes, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        # The byte regex cannot see "<!DOCTYPE" in UTF-16; without the parser-level guard the
+        # internal entity expands and the pom parses as groupA.
+        text = _pom("groupA", modules=("common",)).replace(
+            "<artifactId>groupA</artifactId>", "<artifactId>&a;</artifactId>", 1
+        )
+        body = '<?xml version="1.0" encoding="UTF-16"?>\n<!DOCTYPE project [<!ENTITY a "groupA">]>\n' + text
+        data = bom + body.encode(codec)
+        pom = reactor / "groupA" / "pom.xml"
+        pom.write_bytes(data)
+        with caplog.at_level(logging.INFO, logger="java_functional_lsp.reactor"):
+            assert parse_pom(pom) is None
+            index = build_reactor_index(reactor)
+        assert index.get("com.example:common") is None
+        assert index.get("com.example:it") is not None
+        assert "DOCTYPE/ENTITY declarations are not allowed" in caplog.text
+
+    def test_pom_in_an_encoding_expat_rejects_does_not_abort_the_index(self, reactor: Path) -> None:
+        text = '<?xml version="1.0" encoding="UTF-16-BE"?>\n' + _pom("groupA", modules=("common",))
+        (reactor / "groupA" / "pom.xml").write_bytes(b"\xfe\xff" + text.encode("utf-16-be"))
+        index = build_reactor_index(reactor)  # expat raises ValueError for this declaration
+        assert index.get("com.example:common") is None
+        assert index.get("com.example:it") is not None
+
+    def test_utf16_pom_without_declarations_still_parses(self, reactor: Path) -> None:
+        text = '<?xml version="1.0" encoding="UTF-16"?>\n' + _pom("groupA", modules=("common",))
+        (reactor / "groupA" / "pom.xml").write_bytes(text.encode("utf-16"))
+        assert build_reactor_index(reactor).get("com.example:common") is not None
+
+    @pytest.mark.parametrize("artifact", ["com\nmon", "com mon", "jdtls: importing"])
+    def test_coordinates_outside_the_maven_charset_are_skipped(
+        self, reactor: Path, artifact: str, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        # Declared by two directories, so it would be logged as ambiguous if it were kept.
+        _write(reactor, "groupA/common", _pom(artifact))
+        _write(reactor, "groupB", _pom("groupB", modules=("it", "copy")))
+        _write(reactor, "groupB/copy", _pom(artifact))
+        with caplog.at_level(logging.INFO, logger="java_functional_lsp.reactor"):
+            index = build_reactor_index(reactor)
+        assert not [ga for ga in [*index.modules, *index.ambiguous] if "mon" in ga or "importing" in ga]
+        assert index.get("com.example:it") is not None
+        assert "ignoring" not in caplog.text
 
     def test_oversized_pom_is_rejected(self, reactor: Path) -> None:
         big = _pom("groupA", modules=("common",)).replace("</project>", "<!--" + "x" * MAX_POM_BYTES + "--></project>")

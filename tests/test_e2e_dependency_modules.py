@@ -261,6 +261,29 @@ class _Watch:
         return True
 
 
+async def _collect(stream: asyncio.StreamReader | None, lines: list[str]) -> None:
+    """Keep the server's stderr (its log) drained and captured."""
+    if stream is None:
+        return
+    while line := await stream.readline():
+        lines.append(line.decode(errors="replace").rstrip())
+
+
+async def _assert_dependency_module_imported(server_log: list[str]) -> None:
+    """The fix itself resolved it: common was imported as a dependency module and the open
+    file refreshed, rather than jdtls resolving it some other way (e.g. a leaked artifact)."""
+    imports = [line for line in server_log if "importing 1 dependency module(s)" in line]
+    assert imports, "\n".join(server_log)[-4000:]
+    assert "com.example:common" in imports[0]
+    # The refresh follows the pom's "Missing artifact" clearing after a debounce, and may land
+    # after jdtls's own clean publish.
+    for _ in range(100):
+        if any("classpath of it updated, refreshing" in line for line in server_log):
+            return
+        await asyncio.sleep(0.1)
+    raise AssertionError("open file never refreshed:\n" + "\n".join(server_log)[-4000:])
+
+
 def _errors(diags: list[lsp.Diagnostic]) -> list[str]:
     """Error messages other than the deliberate marker."""
     return [d.message for d in diags if d.severity == lsp.DiagnosticSeverity.Error and _JDTLS_MARKER not in d.message]
@@ -319,7 +342,10 @@ async def test_cross_group_dependency_resolves(tmp_path: Path) -> None:
         "TMPDIR": str(markers),
     }
     env.pop("JAVA_FUNCTIONAL_LSP_DEPENDENCY_MODULES", None)
+    env["JAVA_FUNCTIONAL_LSP_LOG_LEVEL"] = "INFO"
     await client.start_io(sys.executable, "-m", "java_functional_lsp", env=env)
+    server_log: list[str] = []
+    stderr_task = asyncio.create_task(_collect(client._server.stderr, server_log))
     uri = test_file.as_uri()
     try:
         await client.initialize_async(
@@ -342,6 +368,7 @@ async def test_cross_group_dependency_resolves(tmp_path: Path) -> None:
         errors = _errors(watch.latest(uri))
         assert clean, f"cross-group symbols still unresolved: {errors}"
         assert not any(marker in e for e in errors for marker in _FALSE_ERRORS)
+        await _assert_dependency_module_imported(server_log)
     finally:
         try:
             await asyncio.wait_for(client.shutdown_async(None), timeout=5.0)
@@ -352,3 +379,4 @@ async def test_cross_group_dependency_resolves(tmp_path: Path) -> None:
             await asyncio.wait_for(client.stop(), timeout=5.0)
         except Exception:
             pass
+        stderr_task.cancel()
