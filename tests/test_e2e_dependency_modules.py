@@ -3,12 +3,14 @@
 Real server + real jdtls on ``${revision}`` reactors whose in-repo artifacts are missing from
 an isolated, offline local repository (see ``e2e_maven``).
 
-* ``test_cross_group_dependency_resolves`` ("no re-publish"): jdtls never re-publishes an open
-  file after its classpath gains a module, so the file only becomes clean because the proxy
-  refreshes it after build-idle.
-* ``test_parent_inherited_chain_stops_when_clean``: the needed type comes from a module that is
-  declared only in an intermediate module's *parent* pom; the owner itself depends on a deeper
-  module that the open file does not need. The import must stop once the file is clean.
+* ``test_cross_group_dependency_resolves``: one missing sibling is imported, and the round's
+  post-idle refresh (not an older publish) confirms the file clean.
+* ``test_parent_inherited_chain_stops_when_clean`` (also the "no re-publish" case): the needed
+  type comes from a module that is declared only in an intermediate module's *parent* pom; the
+  owner itself depends on a deeper module that the open file does not need. jdtls does not
+  re-publish the file after round 1's import (verified by disabling the post-idle refresh: the
+  file then keeps "The import com.example.mid cannot be resolved"), so only the refresh can
+  decide round 2. The import must stop once the file is clean.
 * ``test_sigterm_leaves_no_jdtls``: SIGTERM on the server stops its jdtls JVM too.
 
 Skipped when jdtls, Java 21+, or Maven (for the one-time priming) is unavailable.
@@ -72,6 +74,11 @@ async def test_cross_group_dependency_resolves(tmp_path: Path) -> None:
         # the refresh that published the clean set.
         await wait_log(session.log, "dependency-module import stopped", 60.0)
         assert imported_gas(session.log) == ["com.example:common"], log_tail(session.log)
+        # The probe and the post-idle refresh both ran, and the round's refresh saw the clean set.
+        stop = next(line for line in session.log if "dependency-module import stopped" in line)
+        assert "(clean)" in stop
+        assert int(stop.split("refreshes ")[1].split()[0].rstrip(";")) >= 2, stop
+        assert any("dependency round 1" in line and "refresh clean" in line for line in session.log)
 
 
 # groupB/app -> groupA/mid (Target extends Mid). The module is not named "target": jdtls

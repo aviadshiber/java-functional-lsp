@@ -665,6 +665,36 @@ class TestFreshness:
         assert fake.refreshed == [MAIN_FILE, MAIN_FILE]
         assert fake.deps.last_stop == STOP_CLEAN
 
+    async def test_unsolicited_publish_never_decides_a_round(self) -> None:
+        fake = _Fake()
+        original = fake._send
+
+        async def send_and_publish(added: list[dict[str, str]], removed: list[dict[str, str]]) -> None:
+            await original(added, removed)
+            fake.deps.note_publish(MAIN_FILE, CLEAN)  # jdtls re-validated on its own, mid-build
+
+        fake.deps._send_folders = send_and_publish
+        fake.start()
+        await fake.settle()
+        # Each round still refreshed the file and decided on that fresh publish.
+        assert fake.refreshed == [MAIN_FILE] * 3
+        assert fake.sent == [["g:mid"], ["g:owner"]]
+        assert fake.deps.last_stop == STOP_CLEAN
+
+    async def test_closed_demand_file_is_not_refreshed(self) -> None:
+        fake = _Fake()
+        original = fake._send
+
+        async def send_and_close(added: list[dict[str, str]], removed: list[dict[str, str]]) -> None:
+            await original(added, removed)
+            fake.open.clear()
+
+        fake.deps._send_folders = send_and_close
+        fake.start()
+        await fake.settle()
+        assert fake.refreshed == [MAIN_FILE]  # the probe only
+        assert fake.deps.last_stop == STOP_CLEAN
+
     async def test_refresh_cap_per_round_and_one_in_flight(self) -> None:
         files = [f"file://{TARGET}/src/main/java/F{i}.java" for i in range(5)]
         fake = _Fake(needed=set(), open_files=files)

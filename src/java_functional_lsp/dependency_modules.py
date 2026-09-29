@@ -781,7 +781,11 @@ class DependencyModules:
         if not await self.idle.wait(sent_at, self.timing.round_timeout):
             log("skipped (busy)", demand)
             return STOP_BUSY
-        fresh = await self._refresh(self._demand_files(None))
+        # The files with demand in this round (already most recent first), still open: an
+        # unsolicited publish in between never decides the round.
+        open_keys = self._open_keys()
+        files = [uri for uri in demand if self._uri_key(uri) in open_keys][: self.limits.refreshes_per_round]
+        fresh = await self._refresh(files)
         if fresh is None:
             log("failed", demand)
             return STOP_NO_FRESH
