@@ -529,6 +529,25 @@ class TestStopReasons:
         assert fake.sent == [["g:mid"], ["g:owner"]]
         assert fake.deps.last_stop == STOP_CLEAN
 
+    async def test_wall_clock_counts_import_phases_not_session_age(self) -> None:
+        other = f"file://{X}/src/main/java/X.java"
+        index = _index()
+        index.dependencies[X] = (Dependency("g:y"),)
+        fake = _Fake(
+            index=index, needed={"g:mid"}, limits=Limits(wall_clock=0.15), open_files=[MAIN_FILE, other], markers={}
+        )
+        fake.start()
+        await fake.settle()
+        assert fake.deps.last_stop == STOP_CLEAN
+        await asyncio.sleep(0.3)  # idle time between phases is not import time
+        fake.needed = {"g:mid", "g:y"}
+        fake.deps.note_pom(X / "pom.xml", [Marker("g:y")])
+        fake.deps.note_publish(other, DEMAND)  # a new module re-arms
+        await fake.settle()
+        assert fake.sent == [["g:mid"], ["g:y"]]
+        assert fake.deps.last_stop == STOP_CLEAN
+        assert fake.deps._import_time() < 0.15
+
     async def test_busy_before_the_probe(self) -> None:
         fake = _Fake(timing=Timing(idle_quiet=0.01, round_timeout=0.05, refresh_backoff=0.01, marker_wait=0.1))
         fake.deps.idle.note_progress(_progress("build"))  # never completes

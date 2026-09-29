@@ -332,7 +332,7 @@ Configuration (the repository config can only **lower** a limit; the environment
 | `JAVA_FUNCTIONAL_LSP_DEPENDENCY_ROUNDS` (environment) | `0`–`20` (default `6`) | Rounds per session |
 | `{"jdtls": {"dependencyRounds": N}}` in `.java-functional-lsp.json` | `0`–default | Lowers the rounds |
 
-The remaining limits are fixed: 8 modules per round, a 5-minute import wall clock (counted from the round-1 import, excluding refresh time), 3 refreshes per round (20 per session), a 20 s refresh timeout with one retry, and a 90 s build-idle wait per round.
+The remaining limits are fixed: 8 modules per round, a 5-minute import wall clock per session (counted only while imports run: from a round-1 import to its stop, excluding refresh time and the idle time between sessions of demand), 3 refreshes per round (20 per session), a 20 s refresh timeout with one retry, and a 90 s build-idle wait per round.
 
 Stop reasons (`jdtls: dependency-module import stopped (<reason>)`):
 

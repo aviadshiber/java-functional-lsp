@@ -402,8 +402,11 @@ class _Fresh:
 class _Session:
     rounds: int = 0
     refreshes: int = 0
-    wall_start: float | None = None
-    refresh_time: float = 0.0
+    #: Import time of finished phases (round-1 import to STOP, minus refreshes), all re-arms.
+    import_time: float = 0.0
+    #: The current phase: when its round-1 import was sent, and refresh time since then.
+    phase_start: float | None = None
+    phase_refresh: float = 0.0
     terminal: str | None = None
     last_stop: str | None = None
     stops: int = 0
@@ -697,7 +700,8 @@ class DependencyModules:
             finally:
                 self._window.pop(key, None)
                 self._window_uri.pop(key, None)
-                self._session.refresh_time += self._clock() - started
+                if self._session.phase_start is not None:
+                    self._session.phase_refresh += self._clock() - started
             seen = self._closed.pop(key, None)
             if answered and seen is not None and seen.digest is not None and seen.digest == self._safe_digest(uri):
                 self._latest[key] = seen.demand
@@ -713,7 +717,10 @@ class DependencyModules:
         try:
             while self._pending_modules:
                 new, self._pending_modules = self._pending_modules, []
-                reason = await self._process(new)
+                try:
+                    reason = await self._process(new)
+                finally:
+                    self._close_phase()
                 self._stop(reason)
         except asyncio.CancelledError:
             raise
@@ -772,8 +779,8 @@ class DependencyModules:
         await self._import(batch)
         self._session.rounds += 1
         sent_at = self._clock()
-        if self._session.wall_start is None:
-            self._session.wall_start = sent_at
+        if self._session.phase_start is None:
+            self._session.phase_start = sent_at
 
         def log(refresh: str, files: list[str]) -> None:
             self._log_round(files, frontier, candidates, batch, index, self._clock() - sent_at, refresh)
@@ -798,8 +805,8 @@ class DependencyModules:
             return STOP_BUDGET
         if self._session.rounds >= self.limits.rounds:
             return STOP_ROUNDS
-        start = self._session.wall_start
-        if start is not None and (self._clock() - start) - self._session.refresh_time >= self.limits.wall_clock:
+        # The wall clock starts at the session's first import.
+        if self._session.rounds and self._import_time() >= self.limits.wall_clock:
             return STOP_WALL_CLOCK
         return None
 
@@ -893,14 +900,26 @@ class DependencyModules:
             shown,
         )
 
+    def _import_time(self) -> float:
+        """Session import time: finished phases plus the current one (idle gaps between phases excluded)."""
+        session = self._session
+        current = 0.0
+        if session.phase_start is not None:
+            current = max(self._clock() - session.phase_start - session.phase_refresh, 0.0)
+        return session.import_time + current
+
+    def _close_phase(self) -> None:
+        session = self._session
+        session.import_time = self._import_time()
+        session.phase_start = None
+        session.phase_refresh = 0.0
+
     def _stop(self, reason: str) -> None:
         session = self._session
         repeated = reason == session.last_stop and reason in _TERMINAL
         session.last_stop = reason
         session.stops += 1
-        import_sec = 0.0
-        if session.wall_start is not None:
-            import_sec = max(self._clock() - session.wall_start - session.refresh_time, 0.0)
+        import_sec = self._import_time()
         text = (
             f"dependency-module import stopped ({reason}): rounds {session.rounds}/{self.limits.rounds}, "
             f"imported {self.used}/{self.limits.budget}, import time {import_sec:.0f}s, "
