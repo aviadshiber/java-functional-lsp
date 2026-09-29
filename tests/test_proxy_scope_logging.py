@@ -317,9 +317,13 @@ class TestPomDiagnosticsSummary:
 
     def test_logs_only_on_change_and_keeps_publishing(self, tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
         published: list[tuple[str, list[object]]] = []
-        proxy = JdtlsProxy(on_diagnostics=lambda u, d: published.append((u, d)))
+        module = tmp_path / "groupB" / "it"
+        (module / "src").mkdir(parents=True)
+        (module / "pom.xml").write_text("<project/>")
+        opened = [(module / "src" / "A.java").as_uri()]  # a file of this module is open: INFO
+        proxy = JdtlsProxy(on_diagnostics=lambda u, d: published.append((u, d)), open_uris=lambda: opened)
         proxy._original_root_uri = tmp_path.as_uri()
-        pom_uri = (tmp_path / "groupB" / "it" / "pom.xml").as_uri()
+        pom_uri = (module / "pom.xml").as_uri()
         missing = [
             {"severity": 1, "message": f"Offline / Missing artifact com.example:c{i}:jar:X-DEFAULT"} for i in range(5)
         ]
@@ -349,11 +353,24 @@ class TestPomDiagnosticsSummary:
             self._publish(proxy, uri, [{"severity": 1, "message": "x cannot be resolved"}])
         assert _jdtls_lines(caplog) == []
 
+    def test_churn_of_modules_without_open_files_is_debug(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        proxy = JdtlsProxy(open_uris=lambda: [(tmp_path / "other" / "A.java").as_uri()])
+        proxy._original_root_uri = tmp_path.as_uri()
+        uri = (tmp_path / "dep" / "pom.xml").as_uri()
+        with caplog.at_level(logging.INFO, logger="java_functional_lsp.proxy"):
+            self._publish(proxy, uri, [{"severity": 1, "message": "Missing artifact g:a:jar:1"}])
+        assert _jdtls_lines(caplog) == []
+        with caplog.at_level(logging.DEBUG, logger="java_functional_lsp.proxy"):
+            self._publish(proxy, uri, [])
+        assert _jdtls_lines(caplog) == [f"jdtls: pom.xml errors changed for {Path('dep') / 'pom.xml'}: 0 error(s)"]
+
     def test_pom_outside_client_root_is_redacted(self, tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
         proxy = JdtlsProxy()
         proxy._original_root_uri = (tmp_path / "elsewhere").as_uri()
         uri = (tmp_path / "secret-user" / "pom.xml").as_uri()
-        with caplog.at_level(logging.INFO, logger="java_functional_lsp.proxy"):
+        with caplog.at_level(logging.DEBUG, logger="java_functional_lsp.proxy"):
             self._publish(proxy, uri, [{"severity": 1, "message": "Missing artifact g:a:jar:1\n\x1b[0m"}])
         assert _jdtls_lines(caplog) == [
             "jdtls: pom.xml errors changed for .../pom.xml: 1 error(s): Missing artifact g:a:jar:1\\n[0m"

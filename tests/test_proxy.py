@@ -108,7 +108,10 @@ class TestJdtlsProxy:
 
         proxy._dispatch_message({"id": 2, "error": {"code": -1, "message": "fail"}})
         assert future.done()
-        assert future.result() is None
+        # An error sentinel: send_request still returns None, _request reports "not answered".
+        from java_functional_lsp.proxy import _ErrorResponse
+
+        assert isinstance(future.result(), _ErrorResponse)
         loop.close()
 
     def test_dispatch_diagnostics_notification(self) -> None:

@@ -1,52 +1,86 @@
-"""Tests for importing missing in-repo Maven modules and refreshing open files (#110 part B)."""
+"""Tests for the demand-driven import of missing in-repo Maven modules (#110, v0.14.1).
+
+The round controller is driven by a fake jdtls (``_Fake``): it records imports and
+refreshes, publishes diagnostics for the open file during a refresh (clean once every
+needed module is imported), and publishes the pom markers a real import would surface.
+All waits are milliseconds (``Timing``).
+"""
 
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock
 
 import pytest
 
 from java_functional_lsp.dependency_modules import (
     DEFAULT_BUDGET,
+    DEFAULT_ROUNDS,
     ENV_BUDGET,
+    ENV_ROUNDS,
     MAX_BUDGET,
-    ClasspathRefresher,
+    MAX_ROUNDS,
+    STOP_BUDGET,
+    STOP_BUSY,
+    STOP_CLEAN,
+    STOP_NO_CANDIDATES_JAR,
+    STOP_NO_CANDIDATES_MARKERS,
+    STOP_NO_CANDIDATES_NONE,
+    STOP_NO_FRESH,
+    STOP_REASONS,
+    STOP_ROUNDS,
+    STOP_WALL_CLOCK,
+    BuildIdle,
     DependencyModules,
+    Limits,
+    Timing,
+    has_demand,
+    is_demand_diagnostic,
     path_from_uri,
     resolve_budget,
+    resolve_rounds,
 )
 from java_functional_lsp.proxy import JdtlsProxy, _find_maven_group_root, _find_repo_boundary
-from java_functional_lsp.reactor import ReactorIndex
+from java_functional_lsp.reactor import Dependency, Marker, ReactorIndex
+
+# --- knobs -----------------------------------------------------------------------------------
 
 
-class TestBudget:
-    def test_default(self) -> None:
-        assert resolve_budget({}, {}) == DEFAULT_BUDGET == 60
+class TestKnobs:
+    def test_defaults(self) -> None:
+        assert resolve_budget({}, {}) == DEFAULT_BUDGET == 30
+        assert resolve_rounds({}, {}) == DEFAULT_ROUNDS == 6
 
-    def test_env(self) -> None:
-        assert resolve_budget({}, {ENV_BUDGET: "7"}) == 7
+    def test_env_may_raise_up_to_the_hard_max(self, caplog: pytest.LogCaptureFixture) -> None:
+        assert resolve_budget({}, {ENV_BUDGET: "70"}) == 70
+        assert resolve_rounds({}, {ENV_ROUNDS: "9"}) == 9
+        with caplog.at_level(logging.WARNING):
+            assert resolve_budget({}, {ENV_BUDGET: "5000"}) == MAX_BUDGET == 200
+            assert resolve_rounds({}, {ENV_ROUNDS: "99"}) == MAX_ROUNDS == 20
+        assert "above the maximum" in caplog.text
 
-    def test_config(self) -> None:
+    def test_repo_config_can_only_lower(self, caplog: pytest.LogCaptureFixture) -> None:
         assert resolve_budget({"jdtls": {"dependencyModules": 9}}, {}) == 9
+        assert resolve_rounds({"jdtls": {"dependencyRounds": 2}}, {}) == 2
+        with caplog.at_level(logging.WARNING):
+            assert resolve_budget({"jdtls": {"dependencyModules": 150}}, {}) == DEFAULT_BUDGET
+            assert resolve_rounds({"jdtls": {"dependencyRounds": 10}}, {}) == DEFAULT_ROUNDS
+        assert "can only lower" in caplog.text
 
     def test_env_wins_over_config(self) -> None:
         assert resolve_budget({"jdtls": {"dependencyModules": 9}}, {ENV_BUDGET: "3"}) == 3
+        assert resolve_budget({"jdtls": {"dependencyModules": 9}}, {ENV_BUDGET: "50"}) == 50
 
-    def test_zero_disables(self) -> None:
+    def test_zero_disables_and_negative_is_zero(self) -> None:
         assert resolve_budget({}, {ENV_BUDGET: "0"}) == 0
-
-    def test_clamped_to_max(self, caplog: pytest.LogCaptureFixture) -> None:
-        with caplog.at_level(logging.WARNING):
-            assert resolve_budget({}, {ENV_BUDGET: "5000"}) == MAX_BUDGET == 200
-        assert "above the maximum" in caplog.text
-
-    def test_negative_is_zero(self) -> None:
         assert resolve_budget({}, {ENV_BUDGET: "-4"}) == 0
+        assert resolve_budget({"jdtls": {"dependencyModules": -1}}, {}) == 0
 
     @pytest.mark.parametrize("raw", ["lots", "1.5"])
     def test_invalid_env_uses_default(self, raw: str, caplog: pytest.LogCaptureFixture) -> None:
@@ -54,13 +88,15 @@ class TestBudget:
             assert resolve_budget({}, {ENV_BUDGET: raw}) == DEFAULT_BUDGET
         assert "invalid" in caplog.text
 
-    @pytest.mark.parametrize("raw", [True, [1], {"max": 1}])
+    @pytest.mark.parametrize("raw", [True, [1], {"max": 1}, "x"])
     def test_invalid_config_uses_default(self, raw: Any) -> None:
         assert resolve_budget({"jdtls": {"dependencyModules": raw}}, {}) == DEFAULT_BUDGET
 
     def test_reads_os_environ_by_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv(ENV_BUDGET, "11")
+        monkeypatch.setenv(ENV_ROUNDS, "3")
         assert resolve_budget() == 11
+        assert resolve_rounds() == 3
 
 
 class TestPathFromUri:
@@ -80,426 +116,820 @@ class TestPathFromUri:
         assert path_from_uri(uri) is None
 
 
-ROOT = Path("/repo")
-COMMON = ROOT / "groupA" / "common"
-UTIL = ROOT / "groupA" / "util"
-IT = ROOT / "groupB" / "it"
+# --- demand classification -------------------------------------------------------------------
 
 
-def _index() -> ReactorIndex:
-    return ReactorIndex(
-        ROOT,
-        {"com.example:common": COMMON, "com.example:util": UTIL, "com.example:it": IT},
+def _err(message: str, code: str | None = None, severity: int = 1) -> dict[str, Any]:
+    diag: dict[str, Any] = {"severity": severity, "message": message, "range": {}}
+    if code is not None:
+        diag["code"] = code
+    return diag
+
+
+class TestDemand:
+    @pytest.mark.parametrize(
+        "diag",
+        [
+            # Real jdtls 1.61 messages (spike S1 / S2 logs).
+            _err("The import com.example.common cannot be resolved", "268435846"),
+            _err("BaseIntegrationTest cannot be resolved to a type", "16777218"),
+            _err("The method cleanCaches() is undefined for the type MyIntegrationTest"),
+            _err("sut cannot be resolved or is not a field"),
+            _err("The hierarchy of the type DeltaProductConfigReportConsumerConfiguration is inconsistent"),
+            _err("The type com.taboola.X cannot be resolved. It is indirectly referenced from required .class files"),
+            _err("The method configure() of type Foo must override or implement a supertype method"),
+            _err("unknown text", "16777218"),  # by problem id alone
+        ],
     )
+    def test_demand(self, diag: dict[str, Any]) -> None:
+        assert is_demand_diagnostic(diag)
+
+    @pytest.mark.parametrize(
+        "diag",
+        [
+            _err("Type mismatch: cannot convert from String to int"),
+            _err("X cannot be resolved to a type", severity=2),  # a warning
+            _err("The project cannot be built until build path errors are resolved", "0"),
+            _err("The container 'Maven Dependencies' references non existing library '/m2/x.jar'", "964"),
+            _err("X cannot be resolved", "16"),  # non-project file
+            {"severity": 1, "message": None},
+            "not a dict",
+        ],
+    )
+    def test_not_demand(self, diag: Any) -> None:
+        assert not is_demand_diagnostic(diag)
+
+    def test_scan_is_bounded(self) -> None:
+        noise = [_err("Type mismatch")] * 500
+        assert not has_demand([*noise, _err("X cannot be resolved to a type")])
+        assert has_demand([_err("X cannot be resolved to a type"), *noise])
+        assert not has_demand("nope")
 
 
-class _Harness:
-    def __init__(self, *, budget: int = DEFAULT_BUDGET, covered: list[Path] | None = None) -> None:
-        self.sent: list[tuple[list[dict[str, str]], list[dict[str, str]]]] = []
-        self.covered = covered if covered is not None else [ROOT / "groupB"]
-        self.builds = 0
+# --- build-idle ------------------------------------------------------------------------------
 
-        async def send(added: list[dict[str, str]], removed: list[dict[str, str]]) -> None:
-            self.sent.append((added, removed))
 
-        def build(_root: Path) -> ReactorIndex:
-            self.builds += 1
-            return _index()
+def _progress(task_id: str, task: str = "Building", *, complete: bool = False) -> dict[str, Any]:
+    return {"id": task_id, "task": task, "subTask": None, "status": "0% ", "complete": complete}
 
+
+class TestBuildIdle:
+    async def test_idle_after_the_quiet_window(self) -> None:
+        idle = BuildIdle(quiet=0.03)
+        assert not idle.is_idle()
+        assert await idle.wait(None, timeout=1.0)
+
+    async def test_open_task_blocks_until_complete_then_quiet(self) -> None:
+        idle = BuildIdle(quiet=0.03)
+        idle.note_progress(_progress("a"))
+        assert not await idle.wait(None, timeout=0.1)  # still open: never idle
+        idle.note_progress(_progress("a", complete=True))
+        assert not idle.is_idle()  # the complete event itself restarts the quiet window
+        assert await idle.wait(None, timeout=1.0)
+
+    async def test_indexing_tasks_never_block(self) -> None:
+        idle = BuildIdle(quiet=0.03)
+        await idle.wait(None, timeout=1.0)
+        idle.note_progress(_progress("s", "Searching..."))
+        idle.note_progress(_progress("i", "Indexing sources"))
+        assert idle.open_tasks == 0
+        assert idle.is_idle()
+
+    async def test_since_extends_the_window(self) -> None:
+        idle = BuildIdle(quiet=0.05)
+        await idle.wait(None, timeout=1.0)
+        loop = asyncio.get_running_loop()
+        since = time_now = loop.time()
+        del time_now
+        assert idle.is_idle()
+        import time as _time
+
+        assert not idle.is_idle(_time.monotonic())
+        started = loop.time()
+        assert await idle.wait(_time.monotonic(), timeout=1.0)
+        assert loop.time() - started >= 0.04
+        assert since
+
+    async def test_single_timer(self) -> None:
+        idle = BuildIdle(quiet=10.0)
+        handles = []
+        for i in range(3):
+            idle.note_progress(_progress(str(i), complete=True))
+            handles.append(idle._timer)
+        assert all(h is not None for h in handles)
+        assert [h.cancelled() for h in handles if h is not None] == [True, True, False]
+        idle.reset()
+        assert idle._timer is None
+
+    async def test_timeout(self) -> None:
+        idle = BuildIdle(quiet=0.02)
+        idle.note_progress(_progress("x"))
+        assert not await idle.wait(None, timeout=0.05)
+
+    def test_malformed_progress_is_ignored(self) -> None:
+        idle = BuildIdle(quiet=0.01)
+        for params in (None, [], {"task": "Building"}, {"id": 3}):
+            idle.note_progress(params)
+        assert idle.open_tasks == 0
+
+
+# --- the round controller --------------------------------------------------------------------
+
+ROOT = Path("/repo")
+TARGET = ROOT / "groupB" / "target"
+A = ROOT / "groupA"
+MID = A / "mid"
+OWNER = ROOT / "groupC" / "owner"
+DEEPER = ROOT / "groupC" / "deeper"
+X = ROOT / "groupD" / "x"
+Y = ROOT / "groupD" / "y"
+HUB = ROOT / "groupD" / "hub"
+TJ = ROOT / "groupD" / "testlib"
+MODULES = {
+    "g:target": TARGET,
+    "g:mid": MID,
+    "g:owner": OWNER,
+    "g:deeper": DEEPER,
+    "g:x": X,
+    "g:y": Y,
+    "g:hub": HUB,
+    "g:testlib": TJ,
+}
+MAIN_FILE = f"file://{TARGET}/src/main/java/T.java"
+TEST_FILE = f"file://{TARGET}/src/test/java/TTest.java"
+DEMAND = [_err("Base cannot be resolved to a type", "16777218")]
+CLEAN: list[dict[str, Any]] = []
+FAST = Timing(idle_quiet=0.01, round_timeout=0.5, refresh_backoff=0.01, marker_wait=0.1)
+
+
+def _index(target_deps: tuple[Dependency, ...] = (Dependency("g:mid"),)) -> ReactorIndex:
+    """target -> mid; mid's parent groupA declares owner; owner -> deeper."""
+    index = ReactorIndex(ROOT, dict(MODULES))
+    index.poms = {**MODULES, "g:groupA": A}
+    index.dependencies = {TARGET: target_deps, A: (Dependency("g:owner"),), OWNER: (Dependency("g:deeper"),)}
+    index.parent_of = {MID: "g:groupA"}
+    return index
+
+
+class _Fake:
+    """A fake jdtls around one DependencyModules."""
+
+    def __init__(
+        self,
+        *,
+        index: ReactorIndex | None = None,
+        needed: set[str] | None = None,
+        limits: Limits | None = None,
+        timing: Timing = FAST,
+        open_files: list[str] | None = None,
+        markers: dict[str, list[tuple[Path, list[Marker]]]] | None = None,
+    ) -> None:
+        self.index = index or _index()
+        self.needed = needed if needed is not None else {"g:mid", "g:owner"}
+        self.open = open_files if open_files is not None else [MAIN_FILE]
+        self.digest: dict[str, str] = dict.fromkeys(self.open, "d1")
+        self.sent: list[list[str]] = []
+        self.refreshed: list[str] = []
+        self.inflight = 0
+        self.max_inflight = 0
+        self.answer = True
+        self.publish = True
+        self.refresh_delay = 0.0
+        self.notified: list[str] = []
+        self.on_refresh: Callable[[str], None] | None = None
+        # GA imported -> pom publishes it causes (the next layer's markers).
+        self.markers = (
+            markers
+            if markers is not None
+            else {
+                "g:mid": [(MID / "pom.xml", [Marker("g:owner")]), (TARGET / "pom.xml", [Marker("g:owner")])],
+                "g:owner": [(OWNER / "pom.xml", [Marker("g:deeper")]), (TARGET / "pom.xml", [Marker("g:deeper")])],
+            }
+        )
         self.deps = DependencyModules(
-            send_folders=send,
-            covered_roots=lambda: self.covered,
+            send_folders=self._send,
+            covered_roots=lambda: [ROOT / "groupB"],
             reactor_root_for=lambda _d: ROOT,
             to_uri=lambda p: f"file://{p}",
-            budget=budget,
-            debounce=0.01,
-            index_builder=build,
+            send_refresh=self._refresh,
+            open_uris=lambda: list(self.open),
+            doc_digest=lambda u: self.digest.get(u),  # noqa: PLW0108 (self.digest is reassigned)
+            module_of=self._module_of,
+            notify=self.notified.append,
+            limits=limits or Limits(),
+            timing=timing,
+            index_builder=lambda _r: self.index,
         )
 
-    async def settle(self) -> None:
-        for _ in range(5):
-            await asyncio.sleep(0.03)
-        await _drain(self.deps)
+    @staticmethod
+    def _module_of(path: Path) -> Path | None:
+        for module in MODULES.values():
+            if path.is_relative_to(module):
+                return module
+        return None
+
+    @property
+    def imported(self) -> list[str]:
+        return [ga for batch in self.sent for ga in batch]
+
+    async def _send(self, added: list[dict[str, str]], removed: list[dict[str, str]]) -> None:
+        by_dir = {str(d): ga for ga, d in MODULES.items()}
+        batch = [by_dir[a["uri"].removeprefix("file://")] for a in added]
+        self.sent.append(batch)
+        for ga in batch:
+            for pom, markers in self.markers.get(ga, []):
+                self.deps.note_pom(pom, markers)
+
+    def diagnostics(self) -> list[dict[str, Any]]:
+        return CLEAN if self.needed <= set(self.imported) else DEMAND
+
+    async def _refresh(self, uri: str, on_response: Callable[[], None]) -> bool:
+        self.refreshed.append(uri)
+        self.inflight += 1
+        self.max_inflight = max(self.max_inflight, self.inflight)
+        try:
+            await asyncio.sleep(self.refresh_delay or 0.001)
+            if self.publish:
+                self.deps.note_publish(uri, self.diagnostics())
+            if self.on_refresh is not None:
+                self.on_refresh(uri)
+            if self.answer:
+                on_response()
+            return self.answer
+        finally:
+            self.inflight -= 1
+
+    def start(self, uri: str = MAIN_FILE, *, pom_markers: list[Marker] | None = None) -> None:
+        """jdtls imported the demand module: its pom's markers, then the file's first (stale) publish."""
+        self.deps.note_pom(TARGET / "pom.xml", pom_markers if pom_markers is not None else [Marker("g:mid")])
+        self.deps.note_publish(uri, DEMAND)
+
+    async def settle(self, timeout: float = 5.0) -> None:
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        await asyncio.sleep(0)
+        while self.deps.running:
+            assert loop.time() < deadline, "the round controller never stopped"
+            await asyncio.sleep(0.01)
 
 
-async def _drain(deps: DependencyModules) -> None:
-    """Wait until every background task of *deps* has finished (absence is then meaningful)."""
-    for _ in range(200):
-        running = [t for t in deps._tasks if not t.done()]
-        if not running:
-            return
-        await asyncio.gather(*running, return_exceptions=True)
-    raise AssertionError("dependency-module tasks never settled")
+class TestRounds:
+    async def test_parent_inherited_chain_stops_when_clean(self) -> None:
+        fake = _Fake()
+        fake.start()
+        await fake.settle()
+        # Round 1: mid (target's own edge); round 2: owner (inherited from mid's parent groupA).
+        # deeper is in the frontier and reported missing, but the file is clean: never imported.
+        assert fake.sent == [["g:mid"], ["g:owner"]]
+        assert fake.deps.last_stop == STOP_CLEAN
+        assert fake.deps.rounds == 2
+        assert len(fake.notified) == 1
+        assert "(clean)" in fake.notified[0]
+
+    async def test_clean_at_the_probe_imports_nothing(self) -> None:
+        fake = _Fake(needed=set())
+        fake.start()
+        await fake.settle()
+        assert fake.sent == []
+        assert fake.refreshed == [MAIN_FILE]
+        assert fake.deps.last_stop == STOP_CLEAN
+
+    async def test_frontier_union_and_carry_forward(self) -> None:
+        index = _index((Dependency("g:x"), Dependency("g:y")))
+        markers = [Marker("g:x"), Marker("g:y")]
+        fake = _Fake(index=index, needed={"g:x", "g:y"}, limits=Limits(per_round=1), markers={})
+        fake.start(pom_markers=markers)
+        await fake.settle()
+        # y was deferred by the per-round cap and carried into round 2.
+        assert fake.sent == [["g:x"], ["g:y"]]
+        assert fake.deps.last_stop == STOP_CLEAN
+
+    async def test_candidates_are_frontier_and_markers(self) -> None:
+        index = _index((Dependency("g:x"), Dependency("g:y")))
+        # deeper is reported missing too, but it is not in the frontier.
+        fake = _Fake(index=index, needed={"g:y"}, markers={})
+        fake.start(pom_markers=[Marker("g:y"), Marker("g:deeper")])
+        await fake.settle()
+        assert fake.sent == [["g:y"]]
+
+    async def test_order_is_declaration_order_with_hubs_last(self) -> None:
+        index = _index((Dependency("g:hub"), Dependency("g:y"), Dependency("g:x")))
+        index.fan_in = {"g:hub": 40}
+        fake = _Fake(index=index, needed={"g:x"}, markers={})
+        fake.start(pom_markers=[Marker("g:hub"), Marker("g:x"), Marker("g:y")])
+        await fake.settle()
+        assert fake.sent == [["g:y", "g:x", "g:hub"]]
+
+    async def test_test_jar_edges_only_for_test_files_and_test_jar_markers(self) -> None:
+        index = _index((Dependency("g:testlib", "test", test_jar=True),))
+        fake = _Fake(index=index, needed={"g:testlib"}, open_files=[TEST_FILE], markers={})
+        fake.start(TEST_FILE, pom_markers=[Marker("g:testlib", test_jar=True)])
+        await fake.settle()
+        assert fake.sent == [["g:testlib"]]
+
+        # A plain-jar marker of the same GA does not match the test-jar edge.
+        fake = _Fake(index=index, needed={"g:testlib"}, open_files=[TEST_FILE], markers={})
+        fake.start(TEST_FILE, pom_markers=[Marker("g:testlib")])
+        await fake.settle()
+        assert fake.sent == []
+        assert fake.deps.last_stop == STOP_NO_CANDIDATES_JAR
+
+        # A main-source file never follows test-scope edges.
+        fake = _Fake(index=index, needed={"g:testlib"}, markers={})
+        fake.start(pom_markers=[Marker("g:testlib", test_jar=True)])
+        await fake.settle()
+        assert fake.sent == []
+        assert fake.deps.last_stop == STOP_NO_CANDIDATES_NONE
 
 
-class TestDependencyModules:
-    async def test_batches_candidates_into_one_add(self) -> None:
-        h = _Harness()
-        h.deps.note_missing(IT / "pom.xml", ["com.example:common"])
-        h.deps.note_missing(IT / "pom.xml", ["com.example:util", "com.example:common"])
-        await h.settle()
-        assert len(h.sent) == 1
-        added, removed = h.sent[0]
-        assert {a["uri"] for a in added} == {f"file://{COMMON}", f"file://{UTIL}"}
-        assert removed == []
-        assert h.deps.used == 2
-        assert h.builds == 1  # single flight
+class TestStopReasons:
+    def test_reasons_are_a_fixed_enum(self) -> None:
+        assert set(STOP_REASONS) == {
+            "clean",
+            "no-candidates(none)",
+            "no-candidates(markers-pending)",
+            "no-candidates(owner-has-jar)",
+            "budget",
+            "rounds",
+            "wall-clock",
+            "jdtls-busy",
+            "no-fresh-diagnostics",
+            "disabled",
+        }
 
-    async def test_external_and_covered_artifacts_are_ignored(self) -> None:
-        h = _Harness()
-        h.deps.note_missing(IT / "pom.xml", ["org.external:lib", "com.example:it"])  # it: under groupB
-        await h.settle()
-        assert h.builds == 1  # positive control: the index was built and consulted
-        assert h.sent == []
-        assert h.deps.used == 0
+    async def test_no_candidates_none(self) -> None:
+        fake = _Fake(index=_index(()))
+        fake.start()
+        await fake.settle()
+        assert fake.deps.last_stop == STOP_NO_CANDIDATES_NONE
 
-    async def test_aggregators_are_never_imported(self, tmp_path: Path) -> None:
+    async def test_no_candidates_markers_pending(self) -> None:
+        fake = _Fake()
+        fake.deps.note_publish(MAIN_FILE, DEMAND)  # the demand module's pom never publishes
+        await fake.settle()
+        assert fake.sent == []
+        assert fake.deps.last_stop == STOP_NO_CANDIDATES_MARKERS
+
+    async def test_no_candidates_owner_has_jar(self) -> None:
+        fake = _Fake()
+        fake.start(pom_markers=[])  # the pom published, mid is not missing: a (stale) jar resolves it
+        await fake.settle()
+        assert fake.sent == []
+        assert fake.deps.last_stop == STOP_NO_CANDIDATES_JAR
+        assert "stale" in fake.notified[0]
+
+    async def test_markers_of_the_previous_round_are_awaited(self) -> None:
+        fake = _Fake(markers={})
+        fake.start()
+
+        def late_markers(_uri: str) -> None:
+            if fake.imported == ["g:mid"]:
+                loop = asyncio.get_running_loop()
+                loop.call_later(0.05, fake.deps.note_pom, MID / "pom.xml", [Marker("g:owner")])
+
+        fake.on_refresh = late_markers
+        await fake.settle()
+        assert fake.sent == [["g:mid"], ["g:owner"]]
+        assert fake.deps.last_stop == STOP_CLEAN
+
+    async def test_budget_then_later_demand_stops_at_once(self) -> None:
+        fake = _Fake(limits=Limits(budget=1), open_files=[MAIN_FILE, f"file://{X}/src/main/java/X.java"])
+        fake.digest = dict.fromkeys(fake.open, "d1")
+        fake.start()
+        await fake.settle()
+        assert fake.sent == [["g:mid"]]
+        assert fake.deps.last_stop == STOP_BUDGET
+        assert fake.deps.used == 1
+        refreshes = len(fake.refreshed)
+        fake.deps.note_publish(fake.open[1], DEMAND)  # a new module re-arms, but the budget is spent
+        await fake.settle()
+        assert fake.deps.last_stop == STOP_BUDGET
+        assert len(fake.refreshed) == refreshes
+        assert len(fake.notified) == 1  # a repeated session-limit stop is not re-announced
+
+    async def test_rounds(self) -> None:
+        fake = _Fake(limits=Limits(rounds=1))
+        fake.start()
+        await fake.settle()
+        assert fake.sent == [["g:mid"]]
+        assert fake.deps.last_stop == STOP_ROUNDS
+
+    async def test_wall_clock(self) -> None:
+        fake = _Fake(limits=Limits(wall_clock=0.0))
+        fake.start()
+        await fake.settle()
+        assert fake.sent == [["g:mid"]]
+        assert fake.deps.last_stop == STOP_WALL_CLOCK
+
+    async def test_wall_clock_excludes_refresh_time(self) -> None:
+        fake = _Fake(limits=Limits(wall_clock=0.15))
+        fake.refresh_delay = 0.2  # each refresh alone exceeds the wall clock
+        fake.start()
+        await fake.settle()
+        assert fake.sent == [["g:mid"], ["g:owner"]]
+        assert fake.deps.last_stop == STOP_CLEAN
+
+    async def test_busy_before_the_probe(self) -> None:
+        fake = _Fake(timing=Timing(idle_quiet=0.01, round_timeout=0.05, refresh_backoff=0.01, marker_wait=0.1))
+        fake.deps.idle.note_progress(_progress("build"))  # never completes
+        fake.start()
+        await fake.settle()
+        assert fake.refreshed == []
+        assert fake.deps.last_stop == STOP_BUSY
+
+    async def test_busy_after_an_import(self) -> None:
+        fake = _Fake(timing=Timing(idle_quiet=0.01, round_timeout=0.1, refresh_backoff=0.01, marker_wait=0.1))
+        original = fake._send
+
+        async def send_and_build(added: list[dict[str, str]], removed: list[dict[str, str]]) -> None:
+            await original(added, removed)
+            fake.deps.idle.note_progress(_progress("import"))  # the import never finishes building
+
+        fake.deps._send_folders = send_and_build
+        fake.start()
+        await fake.settle()
+        assert fake.sent == [["g:mid"]]
+        assert fake.refreshed == [MAIN_FILE]  # the probe only: no refresh into a busy jdtls
+        assert fake.deps.last_stop == STOP_BUSY
+
+    async def test_no_fresh_diagnostics_after_one_retry(self) -> None:
+        fake = _Fake()
+        fake.publish = False  # jdtls answers but never re-validates the file
+        fake.start()
+        await fake.settle()
+        assert fake.refreshed == [MAIN_FILE, MAIN_FILE]
+        assert fake.deps.last_stop == STOP_NO_FRESH
+
+    async def test_unanswered_refresh_is_retried_once(self) -> None:
+        fake = _Fake()
+        fake.answer = False  # e.g. the 20 s timeout
+        fake.start()
+        await fake.settle()
+        assert fake.refreshed == [MAIN_FILE, MAIN_FILE]
+        assert fake.deps.last_stop == STOP_NO_FRESH
+
+    async def test_retry_recovers(self) -> None:
+        fake = _Fake(needed=set())
+        calls = 0
+        original = fake._refresh
+
+        async def flaky(uri: str, on_response: Callable[[], None]) -> bool:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                return False
+            return await original(uri, on_response)
+
+        fake.deps._send_refresh = flaky
+        fake.start()
+        await fake.settle()
+        assert fake.deps.last_stop == STOP_CLEAN
+
+    async def test_disabled_does_nothing(self) -> None:
+        fake = _Fake(limits=Limits(budget=0))
+        fake.start()
+        await asyncio.sleep(0.05)
+        assert not fake.deps.running
+        assert fake.refreshed == []
+        assert fake.sent == []
+
+
+class TestFreshness:
+    async def test_stale_in_flight_publish_is_not_fresh(self) -> None:
+        fake = _Fake(needed=set())
+        fake.publish = False
+        fake.start()
+        # A publish that was already in flight arrives before the refresh is sent: it never
+        # fills the refresh window, so the round has no fresh diagnostics (one retry, then STOP).
+        fake.deps.note_publish(MAIN_FILE, DEMAND)
+        await fake.settle()
+        assert fake.deps.last_stop == STOP_NO_FRESH
+
+    async def test_publish_after_the_response_is_not_fresh(self) -> None:
+        fake = _Fake(needed=set())
+        fake.publish = False
+        original = fake._refresh
+
+        async def late(uri: str, on_response: Callable[[], None]) -> bool:
+            answered = await original(uri, on_response)
+            fake.deps.note_publish(uri, CLEAN)  # after the response was dispatched
+            return answered
+
+        fake.deps._send_refresh = late
+        fake.start()
+        await fake.settle()
+        assert fake.deps.last_stop == STOP_NO_FRESH
+
+    async def test_last_publish_in_the_window_decides(self) -> None:
+        fake = _Fake(needed={"g:mid"})
+
+        def extra(uri: str) -> None:
+            fake.deps.note_publish(uri, DEMAND if not fake.imported else CLEAN)
+
+        fake.on_refresh = extra
+        fake.start()
+        await fake.settle()
+        assert fake.sent == [["g:mid"]]
+        assert fake.deps.last_stop == STOP_CLEAN
+
+    async def test_uri_spelling_is_keyed(self) -> None:
+        fake = _Fake(needed=set())
+        fake.deps._uri_key = lambda u: u.replace("file:///", "file:/")
+        original = fake._refresh
+
+        async def echo_other_form(uri: str, on_response: Callable[[], None]) -> bool:
+            fake.publish = False
+            fake.deps.note_publish(uri.replace("file:///", "file:/"), CLEAN)  # jdtls's own spelling
+            return await original(uri, on_response)
+
+        fake.deps._send_refresh = echo_other_form
+        fake.start()
+        await fake.settle()
+        assert fake.deps.last_stop == STOP_CLEAN
+
+    async def test_edit_during_refresh_is_not_fresh(self) -> None:
+        fake = _Fake(needed=set())
+        edits = iter(["edited", "edited-again"])
+        fake.on_refresh = lambda uri: fake.digest.__setitem__(uri, next(edits))
+        fake.start()
+        await fake.settle()
+        # Both publishes describe content the document no longer has.
+        assert fake.refreshed == [MAIN_FILE, MAIN_FILE]
+        assert fake.deps.last_stop == STOP_NO_FRESH
+
+    async def test_retry_after_an_edit_recovers(self) -> None:
+        fake = _Fake(needed=set())
+        fake.on_refresh = lambda uri: fake.digest.__setitem__(uri, "edited")
+        fake.start()
+        await fake.settle()
+        assert fake.refreshed == [MAIN_FILE, MAIN_FILE]
+        assert fake.deps.last_stop == STOP_CLEAN
+
+    async def test_refresh_cap_per_round_and_one_in_flight(self) -> None:
+        files = [f"file://{TARGET}/src/main/java/F{i}.java" for i in range(5)]
+        fake = _Fake(needed=set(), open_files=files)
+        for uri in files:
+            fake.deps.note_publish(uri, DEMAND)
+        fake.deps.note_pom(TARGET / "pom.xml", [Marker("g:mid")])
+        await fake.settle()
+        assert fake.refreshed == files[::-1][:3]  # most recently opened first, at most 3
+        assert fake.max_inflight == 1
+
+    async def test_refresh_cap_per_session(self) -> None:
+        fake = _Fake(limits=Limits(refreshes_per_session=1))
+        fake.start()
+        await fake.settle()
+        assert fake.refreshed == [MAIN_FILE]
+        assert fake.deps.last_stop == STOP_NO_FRESH
+
+    async def test_closed_files_do_not_arm(self) -> None:
+        fake = _Fake(open_files=[])
+        fake.start()
+        await asyncio.sleep(0.05)
+        assert not fake.deps.running
+        assert fake.refreshed == []
+
+
+class TestRecord:
+    async def test_budget_comes_from_the_proxys_own_record(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        record = tmp_path / "abc.deps.json"
+        record.write_text(json.dumps({"schema": 1, "modules": [{"ga": f"g:{i}", "path": "/x"} for i in range(5)]}))
+        fake = _Fake()
+        with caplog.at_level(logging.INFO, logger="java_functional_lsp.dependency_modules"):
+            fake.deps.begin_session(record)
+        # jdtls 1.61 does not keep added folders across a restart: the old record is not counted.
+        assert fake.deps.used == 0
+        assert "does not keep them" in caplog.text
+        assert json.loads(record.read_text())["modules"] == []
+        fake.start()
+        await fake.settle()
+        saved = json.loads(record.read_text())["modules"]
+        assert [m["ga"] for m in saved] == ["g:mid", "g:owner"]
+        assert saved[0]["path"] == str(MID)
+        assert fake.deps.used == len(saved) == 2
+
+    def test_unreadable_record_is_ignored(self, tmp_path: Path) -> None:
+        record = tmp_path / "x.deps.json"
+        record.write_text("{not json")
+        fake = _Fake()
+        fake.deps.begin_session(record)
+        assert json.loads(record.read_text()) == {"schema": 1, "modules": []}
+        fake.deps.begin_session(None)
+
+    async def test_retired_folders_still_count(self) -> None:
+        fake = _Fake(limits=Limits(rounds=1))
+        fake.start()
+        await fake.settle()
+        assert fake.deps.take_covered_by(A) == [{"uri": f"file://{MID}", "name": "mid"}]
+        assert fake.deps.registry == {}
+        assert fake.deps.used == 1
+
+    async def test_reset_forgets_session(self) -> None:
+        fake = _Fake()
+        fake.start()
+        await fake.settle()
+        fake.deps.reset()
+        assert fake.deps.registry == {}
+        assert fake.deps.used == 0
+        assert fake.deps.rounds == 0
+        assert fake.deps.last_stop is None
+
+    async def test_summary_is_logged(self, caplog: pytest.LogCaptureFixture) -> None:
+        fake = _Fake()
+        fake.start()
+        await fake.settle()
+        with caplog.at_level(logging.INFO, logger="java_functional_lsp.dependency_modules"):
+            fake.deps.log_summary()
+        assert "rounds 2, imported 2/30" in caplog.text
+
+    async def test_round_log_names_the_imports(self, caplog: pytest.LogCaptureFixture) -> None:
+        fake = _Fake()
+        with caplog.at_level(logging.INFO, logger="java_functional_lsp.dependency_modules"):
+            fake.start()
+            await fake.settle()
+        rounds = [r.getMessage() for r in caplog.records if "dependency round" in r.getMessage()]
+        assert len(rounds) == 2
+        assert "importing 1 dependency module(s) (1/30 used): g:mid (groupA/mid)" in rounds[0]
+        assert "refresh errors" in rounds[0]
+        assert "refresh clean" in rounds[1]
+        assert any("stopped (clean)" in r.getMessage() for r in caplog.records)
+
+    async def test_index_failure_is_contained(self, caplog: pytest.LogCaptureFixture) -> None:
+        fake = _Fake()
+
+        def broken(_root: Path) -> ReactorIndex:
+            raise RuntimeError("boom")
+
+        fake.deps._index_builder = broken
+        with caplog.at_level(logging.WARNING, logger="java_functional_lsp.dependency_modules"):
+            fake.start()
+            await fake.settle()
+        assert "reactor index of repo failed" in caplog.text
+        assert fake.deps.last_stop == STOP_NO_CANDIDATES_NONE
+
+    def test_note_publish_without_loop_is_a_no_op(self) -> None:
+        fake = _Fake()
+        fake.start()
+        assert not fake.deps.running
+
+
+class TestAggregatorsAndSymlinks:
+    async def test_aggregators_are_never_candidates(self, tmp_path: Path) -> None:
         from java_functional_lsp.reactor import build_reactor_index
 
-        agg = "<project><groupId>g</groupId><artifactId>{a}</artifactId><modules>{m}</modules></project>"
+        agg = "<project><groupId>g</groupId><artifactId>{a}</artifactId>{d}<modules>{m}</modules></project>"
+        dep = "<dependencies><dependency><groupId>g</groupId><artifactId>{a}</artifactId></dependency></dependencies>"
         root = tmp_path / "root"
+        leaf_deps = dep.format(a="grp").replace("</dependencies>", "") + dep.format(a="leaf").replace(
+            "<dependencies>", ""
+        )
         for rel, text in {
-            "": agg.format(a="root", m="<module>grp</module>"),
-            "grp": agg.format(a="grp", m="<module>leaf</module>"),
+            "": agg.format(a="root", d="", m="<module>grp</module><module>app</module>"),
+            "grp": agg.format(a="grp", d="", m="<module>leaf</module>"),
             "grp/leaf": "<project><groupId>g</groupId><artifactId>leaf</artifactId></project>",
+            "app": f"<project><groupId>g</groupId><artifactId>app</artifactId>{leaf_deps}</project>",
         }.items():
             (root / rel).mkdir(parents=True, exist_ok=True)
             (root / rel / "pom.xml").write_text(text)
-        send = AsyncMock()
-        indexes: list[ReactorIndex] = []
-
-        def build(r: Path) -> ReactorIndex:
-            indexes.append(build_reactor_index(r))
-            return indexes[-1]
-
-        deps = DependencyModules(
-            send_folders=send,
-            covered_roots=list,
-            reactor_root_for=lambda _d: root,
-            to_uri=str,
-            debounce=0,
-            index_builder=build,
-        )
-        deps.note_missing(tmp_path / "other" / "pom.xml", ["g:root", "g:grp", "g:leaf"])
-        await _drain(deps)
-        assert [i.aggregators for i in indexes] == [{"g:root", "g:grp"}]
-        # Positive control: the leaf in the same batch was imported, the aggregators were not.
-        send.assert_awaited_once()
-        assert [a["name"] for a in send.await_args.args[0]] == ["leaf"]
-
-    async def test_already_added_is_not_re_added(self) -> None:
-        h = _Harness()
-        h.deps.note_missing(IT / "pom.xml", ["com.example:common"])
-        await h.settle()
-        h.deps.note_missing(IT / "pom.xml", ["com.example:common"])
-        await h.settle()
-        assert len(h.sent) == 1
-
-    async def test_disabled_does_nothing(self) -> None:
-        h = _Harness(budget=0)
-        h.deps.note_missing(IT / "pom.xml", ["com.example:common"])
-        await h.settle()
-        assert h.sent == []
-        assert h.builds == 0
-
-    async def test_budget_exhaustion_warns_with_unresolved_gas(self, caplog: pytest.LogCaptureFixture) -> None:
-        h = _Harness(budget=1)
-        with caplog.at_level(logging.WARNING, logger="java_functional_lsp.dependency_modules"):
-            h.deps.note_missing(IT / "pom.xml", ["com.example:common", "com.example:util"])
-            await h.settle()
-            h.deps.note_missing(IT / "pom.xml", ["com.example:util"])
-            await h.settle()
-        assert len(h.sent) == 1
-        assert len(h.sent[0][0]) == 1
-        warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
-        assert len(warnings) == 1  # the same GA is reported once
-        assert "com.example:util" in warnings[0]
-        assert ENV_BUDGET in warnings[0]
-
-    async def test_group_expansion_retires_covered_folders(self) -> None:
-        h = _Harness()
-        h.deps.note_missing(IT / "pom.xml", ["com.example:common"])
-        await h.settle()
-        removed = h.deps.take_covered_by(ROOT / "groupA")
-        assert removed == [{"uri": f"file://{COMMON}", "name": "common"}]
-        assert h.deps.registry == {}
-        # Never re-added, even if the covering folder is not reported as covered.
-        h.covered = []
-        h.deps.note_missing(IT / "pom.xml", ["com.example:common"])
-        await h.settle()
-        assert len(h.sent) == 1
-        assert h.deps.used == 1  # removal does not refund the budget
-
-    async def test_group_expansion_drops_pending_candidates(self) -> None:
-        h = _Harness()
-        h.deps.debounce = 0.2
-        h.deps.note_missing(IT / "pom.xml", ["com.example:common"])
-        await asyncio.sleep(0.05)  # indexed and pending, not flushed yet
-        assert h.deps.take_covered_by(ROOT / "groupA") == []
-        await h.settle()
-        assert h.sent == []
-
-    async def test_group_expanded_before_flush_skips_candidate(self) -> None:
-        h = _Harness()
-        h.deps.debounce = 0.2
-        h.deps.note_missing(IT / "pom.xml", ["com.example:common", "com.example:util"])
-        for _ in range(100):  # until both are queued, well before the debounce ends
-            if len(h.deps._pending) == 2:
-                break
-            await asyncio.sleep(0.005)
-        assert set(h.deps._pending) == {"com.example:common", "com.example:util"}
-        h.covered.append(COMMON)  # the group holding common was imported meanwhile
-        await h.settle()
-        # Positive control: the flush ran and sent util; only the covered candidate was skipped.
-        assert [[a["name"] for a in added] for added, _ in h.sent] == [["util"]]
-
-    async def test_candidate_queued_during_a_send_is_flushed(self) -> None:
-        release = asyncio.Event()
-        sent: list[list[str]] = []
-
-        async def slow_send(added: list[dict[str, str]], _removed: list[dict[str, str]]) -> None:
-            sent.append([a["name"] for a in added])
-            if len(sent) == 1:
-                await release.wait()  # e.g. stdin.drain() in the real proxy
-
-        deps = DependencyModules(
-            send_folders=slow_send,
-            covered_roots=list,
-            reactor_root_for=lambda _d: ROOT,
-            to_uri=str,
-            debounce=0.01,
-            index_builder=lambda _r: _index(),
-        )
-        deps.note_missing(IT / "pom.xml", ["com.example:common"])
-        for _ in range(100):
-            if sent:
-                break
-            await asyncio.sleep(0.005)
-        assert sent == [["common"]]
-        deps.note_missing(IT / "pom.xml", ["com.example:util"])  # while the first send is in flight
-        for _ in range(10):
-            await asyncio.sleep(0.01)
-        release.set()
-        await _drain(deps)
-        assert sent == [["common"], ["util"]]
-        assert deps._pending == {}
-        assert set(deps.registry) == {"com.example:common", "com.example:util"}
-
-    async def test_index_failure_is_contained(self, caplog: pytest.LogCaptureFixture) -> None:
-        def boom(_root: Path) -> ReactorIndex:
-            raise OSError("disk")
-
+        index = build_reactor_index(root)
+        assert index.aggregators == {"g:root", "g:grp"}
+        app = index.poms["g:app"]
         deps = DependencyModules(
             send_folders=AsyncMock(),
             covered_roots=list,
-            reactor_root_for=lambda _d: ROOT,
+            reactor_root_for=lambda _d: root,
             to_uri=str,
-            debounce=0,
-            index_builder=boom,
+            module_of=lambda _p: app,
+            open_uris=lambda: [f"file://{app}/src/A.java"],
+            index_builder=lambda _r: index,
         )
-        with caplog.at_level(logging.WARNING):
-            deps.note_missing(IT / "pom.xml", ["com.example:common"])
-            await asyncio.sleep(0.05)
-        assert "reactor index" in caplog.text
+        deps.note_pom(app / "pom.xml", [Marker("g:grp"), Marker("g:leaf")])
+        candidates, frontier, _ = await deps._candidates([f"file://{app}/src/A.java"])
+        assert [ga for ga, _ in candidates] == ["g:leaf"]
+        assert frontier == 1
 
-    async def test_reset_forgets_session(self) -> None:
-        h = _Harness()
-        h.deps.note_missing(IT / "pom.xml", ["com.example:common"])
-        await h.settle()
-        h.deps.reset()
-        assert h.deps.used == 0
-        assert h.deps.registry == {}
-        h.deps.note_missing(IT / "pom.xml", ["com.example:common"])
-        await h.settle()
-        assert len(h.sent) == 2
-        assert h.builds == 2
-
-    def test_note_missing_without_loop_is_a_no_op(self) -> None:
-        h = _Harness()
-        h.deps.note_missing(IT / "pom.xml", ["com.example:common"])
-        assert h.deps._tasks == set()
-        assert h.deps._pending == {}
-        assert h.deps.registry == {}
-        assert h.deps.used == 0
-        assert h.builds == 0
-        assert h.sent == []
-
-
-@pytest.mark.skipif(os.name == "nt", reason="symlinks")
-class TestSymlinkedRoot:
-    """Registry entries are resolved; folders the proxy imported may be spelled through a symlink."""
-
-    @pytest.fixture
-    def linked(self, tmp_path: Path) -> tuple[Path, Path]:
+    @pytest.mark.skipif(os.name == "nt", reason="symlinks")
+    async def test_symlinked_covered_root_is_not_a_candidate(self, tmp_path: Path) -> None:
         real = tmp_path / "real"
-        (real / "groupA" / "common").mkdir(parents=True)
-        (real / "groupB" / "it").mkdir(parents=True)
+        common = real / "groupA" / "common"
+        it = real / "groupB" / "it"
+        for d in (common, it):
+            d.mkdir(parents=True)
         link = tmp_path / "link"
         link.symlink_to(real, target_is_directory=True)
-        return real.resolve(), link
-
-    def _deps(self, real: Path, covered: list[Path], sent: list[list[str]]) -> DependencyModules:
-        async def send(added: list[dict[str, str]], _removed: list[dict[str, str]]) -> None:
-            sent.append([a["name"] for a in added])
-
-        return DependencyModules(
-            send_folders=send,
+        index = ReactorIndex(real, {"g:common": common, "g:it": it})
+        index.dependencies = {it: (Dependency("g:common"),)}
+        covered: list[Path] = []
+        deps = DependencyModules(
+            send_folders=AsyncMock(),
             covered_roots=lambda: covered,
             reactor_root_for=lambda _d: real,
             to_uri=str,
-            debounce=0,
-            index_builder=lambda _r: ReactorIndex(real, {"com.example:common": real / "groupA" / "common"}),
+            module_of=lambda _p: it,
+            index_builder=lambda _r: index,
         )
+        deps.note_pom(link / "groupB" / "it" / "pom.xml", [Marker("g:common")])
+        uri = f"file://{link}/groupB/it/src/A.java"
+        # Positive control: nothing covers it yet.
+        assert [ga for ga, _ in (await deps._candidates([uri]))[0]] == ["g:common"]
+        covered.append(link / "groupA" / "common")  # imported through the symlink
+        assert (await deps._candidates([uri]))[0] == []
 
-    def test_take_covered_by_matches_the_symlinked_spelling(self, linked: tuple[Path, Path]) -> None:
-        real, link = linked
-        deps = self._deps(real, [], [])
-        deps.registry["com.example:common"] = real / "groupA" / "common"
-        removed = deps.take_covered_by(link / "groupA")
-        assert [r["name"] for r in removed] == ["common"]
-        assert deps.registry == {}
-
-    async def test_symlinked_covered_root_prevents_import(self, linked: tuple[Path, Path]) -> None:
-        real, link = linked
-        sent: list[list[str]] = []
-        deps = self._deps(real, [link / "groupA"], sent)
-        deps.note_missing(link / "groupB" / "it" / "pom.xml", ["com.example:common"])
-        await _drain(deps)
-        assert sent == []
-        assert deps.registry == {}
-        # Positive control: with nothing covering it, the same report imports it.
-        deps2 = self._deps(real, [], sent)
-        deps2.note_missing(link / "groupB" / "it" / "pom.xml", ["com.example:common"])
-        await _drain(deps2)
-        assert sent == [["common"]]
+    @pytest.mark.skipif(os.name == "nt", reason="symlinks")
+    def test_take_covered_by_matches_the_symlinked_spelling(self, tmp_path: Path) -> None:
+        real = tmp_path / "real"
+        (real / "groupA" / "common").mkdir(parents=True)
+        link = tmp_path / "link"
+        link.symlink_to(real, target_is_directory=True)
+        deps = DependencyModules(AsyncMock(), list, lambda _d: real, str)
+        deps.registry["g:common"] = (real / "groupA" / "common").resolve()
+        assert [r["name"] for r in deps.take_covered_by(link / "groupA")] == ["common"]
 
 
-class TestClasspathRefresher:
-    async def test_refreshes_open_java_files_under_project_once(self) -> None:
-        sent: list[str] = []
-        opened = [
-            f"file://{IT}/src/test/java/A.java",
-            f"file://{IT}/src/test/java/B.java",
-            f"file://{IT}/pom.xml",
-            f"file://{COMMON}/src/main/java/C.java",
-        ]
-
-        async def refresh(uri: str) -> None:
-            sent.append(uri)
-
-        r = ClasspathRefresher(lambda: opened, refresh, debounce=0.02)
-        r.note_updated(IT)
-        r.note_updated(IT)  # debounced
-        await asyncio.sleep(0.1)
-        assert sent == opened[:2]
-
-    async def test_projects_are_debounced_separately(self) -> None:
-        sent: list[str] = []
-
-        async def refresh(uri: str) -> None:
-            sent.append(uri)
-
-        opened = [f"file://{IT}/A.java", f"file://{COMMON}/C.java"]
-        r = ClasspathRefresher(lambda: opened, refresh, debounce=0.02)
-        r.note_updated(IT)
-        r.note_updated(COMMON)
-        await asyncio.sleep(0.1)
-        assert sorted(sent) == sorted(opened)
-
-    async def test_open_uris_failure_is_contained(self) -> None:
-        def broken() -> list[str]:
-            raise RuntimeError("no workspace")
-
-        send = AsyncMock()
-        r = ClasspathRefresher(broken, send, debounce=0)
-        r.note_updated(IT)
-        await asyncio.sleep(0.02)
-        send.assert_not_called()
-
-    async def test_reset_cancels_pending(self) -> None:
-        send = AsyncMock()
-        r = ClasspathRefresher(lambda: [f"file://{IT}/A.java"], send, debounce=0.05)
-        r.note_updated(IT)
-        r.reset()
-        await asyncio.sleep(0.1)
-        send.assert_not_called()
-
-
-# --- proxy wiring ---------------------------------------------------------------------------
+# --- proxy wiring ----------------------------------------------------------------------------
 
 
 def _pom_diag(message: str, severity: int = 1) -> dict[str, Any]:
     return {"severity": severity, "message": message, "range": {}}
 
 
+def _publish(proxy: JdtlsProxy, uri: str, diagnostics: list[Any]) -> None:
+    proxy._handle_notification(
+        {"method": "textDocument/publishDiagnostics", "params": {"uri": uri, "diagnostics": diagnostics}}
+    )
+
+
 class TestProxyWiring:
-    def test_classpath_updated_event_triggers_refresh(self) -> None:
+    def test_every_pom_publish_feeds_markers(self) -> None:
         proxy = JdtlsProxy()
-        proxy._classpath_refresher = MagicMock()
+        uri = "file:///repo/groupB/it/pom.xml"
+        msgs = [
+            "Offline / Missing artifact com.example:common:jar:X-DEFAULT",
+            "Missing artifact com.example:base:jar:tests:X-DEFAULT",
+            "Non-resolvable parent POM",
+        ]
+        for _ in range(2):  # identical publishes still count as arrivals
+            _publish(proxy, uri, [_pom_diag(m) for m in msgs])
+        module = Path("/repo/groupB/it").resolve()
+        deps = proxy.dependency_modules
+        assert deps._pom_publishes[module] == 2
+        assert deps._markers[module] == {Marker("com.example:common"), Marker("com.example:base", test_jar=True)}
+        _publish(proxy, uri, [])
+        assert module not in deps._markers
+
+    def test_java_publish_reaches_the_controller(self) -> None:
+        proxy = JdtlsProxy()
+        seen: list[tuple[str, Any]] = []
+        proxy.dependency_modules.note_publish = lambda u, d: seen.append((u, d))  # type: ignore[method-assign]
+        _publish(proxy, "file:///repo/A.java", DEMAND)
+        _publish(proxy, "file:///repo/pom.xml", [])
+        assert seen == [("file:///repo/A.java", DEMAND)]
+
+    def test_progress_report_reaches_build_idle(self) -> None:
+        proxy = JdtlsProxy()
+        proxy._handle_notification({"method": "language/progressReport", "params": _progress("b")})
+        assert proxy.dependency_modules.idle.open_tasks == 1
+
+    def test_classpath_updated_no_longer_refreshes(self) -> None:
+        proxy = JdtlsProxy()
+        proxy.send_request = AsyncMock()  # type: ignore[method-assign]
         proxy._handle_notification(
             {"method": "language/eventNotification", "params": {"eventType": 100, "data": "file:/repo/groupB/it/"}}
         )
-        proxy._classpath_refresher.note_updated.assert_called_once_with(Path("/repo/groupB/it"))
+        proxy.send_request.assert_not_called()
 
-    @pytest.mark.parametrize("params", [{"eventType": 200, "data": ["file:/x/"]}, {"eventType": 100, "data": 3}, []])
-    def test_other_events_are_ignored(self, params: Any) -> None:
-        proxy = JdtlsProxy()
-        proxy._classpath_refresher = MagicMock()
-        proxy._handle_notification({"method": "language/eventNotification", "params": params})
-        proxy._classpath_refresher.note_updated.assert_not_called()
-
-    def test_missing_artifact_on_pom_queues_import_and_clearing_refreshes(self) -> None:
-        proxy = JdtlsProxy()
-        proxy.dependency_modules = MagicMock()
-        proxy._classpath_refresher = MagicMock()
-        uri = "file:///repo/groupB/it/pom.xml"
-        msg = "Offline / Missing artifact com.example:common:jar:X-DEFAULT"
-        proxy._handle_notification(
-            {"method": "textDocument/publishDiagnostics", "params": {"uri": uri, "diagnostics": [_pom_diag(msg)]}}
-        )
-        proxy.dependency_modules.note_missing.assert_called_once_with(
-            Path("/repo/groupB/it/pom.xml"), ["com.example:common"]
-        )
-        proxy._classpath_refresher.note_updated.assert_not_called()
-        proxy._handle_notification(
-            {"method": "textDocument/publishDiagnostics", "params": {"uri": uri, "diagnostics": []}}
-        )
-        proxy._classpath_refresher.note_updated.assert_called_once_with(Path("/repo/groupB/it"))
-
-    def test_other_pom_errors_do_not_trigger(self) -> None:
-        proxy = JdtlsProxy()
-        proxy.dependency_modules = MagicMock()
-        proxy._classpath_refresher = MagicMock()
-        uri = "file:///repo/it/pom.xml"
-        for diags in ([_pom_diag("Non-resolvable parent POM")], []):
-            proxy._handle_notification(
-                {"method": "textDocument/publishDiagnostics", "params": {"uri": uri, "diagnostics": diags}}
-            )
-        proxy.dependency_modules.note_missing.assert_not_called()
-        proxy._classpath_refresher.note_updated.assert_not_called()
-
-    async def test_refresh_sends_execute_command(self) -> None:
+    async def test_refresh_sends_execute_command_and_reports_the_answer(self) -> None:
         proxy = JdtlsProxy()
         proxy._available = True
-        proxy.send_request = AsyncMock(return_value=None)  # type: ignore[method-assign]
-        await proxy._refresh_file_diagnostics("file:///repo/A.java")
-        proxy.send_request.assert_awaited_once()
-        method, params = proxy.send_request.await_args.args
+        proxy._request = AsyncMock(return_value=(True, None))  # type: ignore[method-assign]
+        assert await proxy._refresh_file_diagnostics("file:///repo/A.java")
+        method, params = proxy._request.await_args.args
         assert method == "workspace/executeCommand"
         assert params == {
             "command": "java.project.refreshDiagnostics",
             "arguments": ["file:///repo/A.java", "thisFile", False],
         }
+        proxy._request = AsyncMock(return_value=(False, None))  # type: ignore[method-assign]
+        assert not await proxy._refresh_file_diagnostics("file:///repo/A.java")
 
     async def test_refresh_skipped_when_unavailable(self) -> None:
         proxy = JdtlsProxy()
-        proxy.send_request = AsyncMock()  # type: ignore[method-assign]
-        await proxy._refresh_file_diagnostics("file:///repo/A.java")
-        proxy.send_request.assert_not_called()
+        proxy._request = AsyncMock()  # type: ignore[method-assign]
+        assert not await proxy._refresh_file_diagnostics("file:///repo/A.java")
+        proxy._request.assert_not_called()
 
-    async def test_open_uris_callback_reaches_refresher(self) -> None:
-        proxy = JdtlsProxy(open_uris=lambda: ["file:///repo/it/A.java"])
-        assert proxy._classpath_refresher.open_files_under(Path("/repo/it")) == ["file:///repo/it/A.java"]
+    def test_callbacks_reach_the_controller(self) -> None:
+        notes: list[str] = []
+        proxy = JdtlsProxy(
+            open_uris=lambda: ["file:///repo/it/A.java"], doc_digest=lambda _u: "d", notify_client=notes.append
+        )
+        deps = proxy.dependency_modules
+        assert deps._open_list() == ["file:///repo/it/A.java"]
+        assert deps._doc_digest("x") == "d"
+        deps._notify("hi")
+        assert notes == ["hi"]
 
 
 @pytest.fixture
@@ -541,7 +971,6 @@ class TestProxyGroupDedupe:
         proxy._initial_module_uri = two_groups["it"].as_uri()
         proxy.modules.mark_added(two_groups["it"].as_uri())
         proxy.send_notification = AsyncMock()  # type: ignore[method-assign]
-        # A dependency folder inside groupB (e.g. added while the group expansion was pending).
         proxy.dependency_modules.registry["com.example:it2"] = (two_groups["root"] / "groupB" / "it2").resolve()
         proxy.dependency_modules.registry["com.example:common"] = two_groups["common"].resolve()
         await proxy.expand_full_workspace()
@@ -553,17 +982,11 @@ class TestProxyGroupDedupe:
         proxy = JdtlsProxy()
         proxy._available = True
         proxy.send_notification = AsyncMock()  # type: ignore[method-assign]
-        proxy.modules.mark_added(two_groups["it"].as_uri())
-        deps = proxy.dependency_modules
-        deps.debounce = 0
-        deps._index_builder = lambda _r: ReactorIndex(two_groups["root"], {"com.example:common": two_groups["common"]})
-        deps.note_missing(two_groups["it"] / "pom.xml", ["com.example:common"])
-        for _ in range(5):
-            await asyncio.sleep(0.02)
+        await proxy.dependency_modules._import([("com.example:common", two_groups["common"])])
         proxy.send_notification.assert_awaited_once()
         assert proxy._expanded_groups == set()
         assert two_groups["common"].as_uri() not in proxy.modules.uris()
-        assert "com.example:common" in deps.registry
+        assert "com.example:common" in proxy.dependency_modules.registry
 
     @pytest.mark.skipif(os.name == "nt", reason="symlinks")
     async def test_symlinked_client_root_still_retires_dependency_folders(
@@ -573,31 +996,13 @@ class TestProxyGroupDedupe:
         link.symlink_to(two_groups["root"], target_is_directory=True)
         proxy = JdtlsProxy()
         proxy._available = True
-        proxy._original_root_uri = link.as_uri()  # the client reaches the checkout through a symlink
+        proxy._original_root_uri = link.as_uri()
         proxy.send_notification = AsyncMock()  # type: ignore[method-assign]
         proxy.dependency_modules.registry["com.example:common"] = two_groups["common"].resolve()
-        await proxy.expand_full_workspace()  # no initial module: the root keeps the client's spelling
+        await proxy.expand_full_workspace()
         params = proxy.send_notification.await_args.args[1]
         assert [r["name"] for r in params["event"]["removed"]] == ["common"]
         assert proxy.dependency_modules.registry == {}
-
-    @pytest.mark.skipif(os.name == "nt", reason="symlinks")
-    async def test_symlinked_module_folder_counts_as_covered(self, two_groups: dict[str, Path], tmp_path: Path) -> None:
-        link = tmp_path / "link"
-        link.symlink_to(two_groups["root"], target_is_directory=True)
-        proxy = JdtlsProxy()
-        proxy._available = True
-        proxy.send_notification = AsyncMock()  # type: ignore[method-assign]
-        proxy.modules.mark_added((link / "groupA" / "common").as_uri())  # imported via the symlink
-        proxy.modules.mark_added((link / "groupB" / "it").as_uri())
-        deps = proxy.dependency_modules
-        deps.debounce = 0
-        common = two_groups["common"].resolve()
-        deps._index_builder = lambda _r: ReactorIndex(two_groups["root"].resolve(), {"com.example:common": common})
-        deps.note_missing(link / "groupB" / "it" / "pom.xml", ["com.example:common"])
-        await _drain(deps)
-        proxy.send_notification.assert_not_called()
-        assert deps.registry == {}
 
     async def test_stop_resets_dependency_state(self) -> None:
         proxy = JdtlsProxy()

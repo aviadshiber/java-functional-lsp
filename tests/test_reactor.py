@@ -281,3 +281,119 @@ class TestMissingArtifactParser:
             "Missing artifact a.b:x:test-jar:tests:1",
         )
         assert parse_missing_artifacts(messages) == ["a.b:x", "a.b:y"]
+
+
+# --- dependency edges (v0.14.1) ----------------------------------------------------------------
+
+
+def _deps_pom(artifact: str, parent: str | None, deps: str, *, modules: tuple[str, ...] = ()) -> str:
+    parent_xml = f"<parent><groupId>g</groupId><artifactId>{parent}</artifactId></parent>" if parent else ""
+    mods = "<modules>" + "".join(f"<module>{m}</module>" for m in modules) + "</modules>" if modules else ""
+    return f"<project{_NS}>{parent_xml}<groupId>g</groupId><artifactId>{artifact}</artifactId>{deps}{mods}</project>"
+
+
+def _dep(artifact: str, extra: str = "", group: str = "g") -> str:
+    return f"<dependency><groupId>{group}</groupId><artifactId>{artifact}</artifactId>{extra}</dependency>"
+
+
+@pytest.fixture
+def chain(tmp_path: Path) -> Path:
+    """root -> {grpA (declares owner, managed-only x) -> mid, grpB -> app, grpC -> {owner, deeper, x, tlib}}."""
+    root = tmp_path / "chain"
+    _write(root, "", _deps_pom("root", None, "", modules=("grpA", "grpB", "grpC")))
+    _write(
+        root,
+        "grpA",
+        _deps_pom(
+            "grpA",
+            "root",
+            f"<dependencies>{_dep('owner')}</dependencies>"
+            f"<dependencyManagement><dependencies>{_dep('x')}</dependencies></dependencyManagement>",
+            modules=("mid",),
+        ),
+    )
+    _write(root, "grpA/mid", _deps_pom("mid", "grpA", ""))
+    _write(root, "grpB", _deps_pom("grpB", "root", "", modules=("app",)))
+    app_deps = (
+        _dep("mid")
+        + _dep("x", "<scope>test</scope>")
+        + _dep("tlib", "<type>test-jar</type><scope>test</scope>")
+        + _dep("tlib", "<classifier>tests</classifier>")
+        + _dep("deeper", "<scope>runtime</scope>", group="${project.groupId}")
+        + _dep("owner", "<scope>import</scope>")
+        + _dep("junit", "<scope>test</scope>", group="org.junit")
+        + _dep("${weird}")
+    )
+    _write(root, "grpB/app", _deps_pom("app", "grpB", f"<dependencies>{app_deps}</dependencies>"))
+    _write(root, "grpC", _deps_pom("grpC", "root", "", modules=("owner", "deeper", "x", "tlib")))
+    _write(root, "grpC/owner", _deps_pom("owner", "grpC", f"<dependencies>{_dep('deeper')}</dependencies>"))
+    for leaf in ("deeper", "x", "tlib"):
+        _write(root, f"grpC/{leaf}", _deps_pom(leaf, "grpC", ""))
+    return root
+
+
+class TestEdges:
+    def test_parent_chain_is_inherited(self, chain: Path) -> None:
+        index = build_reactor_index(chain)
+        mid = index.poms["g:mid"]
+        assert index.parent_of[mid] == "g:grpA"
+        # mid declares nothing itself; owner comes from its parent grpA. dependencyManagement is ignored.
+        assert [d.ga for d in index.edges(mid)] == ["g:owner"]
+        owner = index.poms["g:owner"]
+        assert [d.ga for d in index.edges(owner)] == ["g:deeper"]
+
+    def test_scopes_placeholders_and_test_jars(self, chain: Path) -> None:
+        index = build_reactor_index(chain)
+        app = index.poms["g:app"]
+        # Main classpath: compile + runtime (the ${project.groupId} placeholder resolves); the
+        # import-scope, external and unparseable entries are dropped; tests classifier is a test-jar.
+        main = index.edges(app)
+        assert [(d.ga, d.scope, d.test_jar) for d in main] == [
+            ("g:mid", "compile", False),
+            ("g:tlib", "compile", True),
+            ("g:deeper", "runtime", False),
+        ]
+        with_tests = index.edges(app, test=True)
+        assert [(d.ga, d.scope, d.test_jar) for d in with_tests] == [
+            ("g:mid", "compile", False),
+            ("g:x", "test", False),
+            ("g:tlib", "test", True),
+            ("g:deeper", "runtime", False),
+        ]
+
+    def test_fan_in_counts_main_scope_declarations(self, chain: Path) -> None:
+        index = build_reactor_index(chain)
+        assert index.fan_in["g:deeper"] == 2  # app (runtime) and owner
+        assert "g:x" not in index.fan_in  # test scope / managed only
+        assert index.is_hub("g:deeper", 2)
+        assert not index.is_hub("g:deeper", 3)
+
+    def test_parent_cycle_and_unknown_parent_terminate(self, tmp_path: Path) -> None:
+        root = tmp_path / "cyc"
+        _write(root, "", _deps_pom("root", "b", "", modules=("a", "b")))
+        _write(root, "a", _deps_pom("a", "b", f"<dependencies>{_dep('b')}</dependencies>"))
+        _write(root, "b", _deps_pom("b", "a", f"<dependencies>{_dep('a')}</dependencies>"))
+        index = build_reactor_index(root)
+        a = index.poms["g:a"]
+        assert [d.ga for d in index.edges(a)] == ["g:b", "g:a"]
+        assert index.edges(tmp_path / "unknown") == []
+
+
+class TestMissingMarkers:
+    def test_type_and_classifier_are_kept(self) -> None:
+        from java_functional_lsp.reactor import Marker, parse_missing_markers
+
+        assert parse_missing_markers(
+            [
+                "Offline / Missing artifact com.example:common:jar:X-DEFAULT",
+                "Missing artifact com.example:base:jar:tests:X-DEFAULT",
+                "Missing artifact com.example:base:test-jar:X-DEFAULT",
+                "Missing artifact com.example:common:jar:X-DEFAULT",
+                "Missing artifact com.example:native:jar:linux-x86_64:1.0",
+                "Non-resolvable parent POM",
+            ]
+        ) == [
+            Marker("com.example:common"),
+            Marker("com.example:base", test_jar=True),
+            Marker("com.example:native"),
+        ]

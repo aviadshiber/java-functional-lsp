@@ -202,7 +202,7 @@ moving on. Fix any type errors or missing imports immediately.
 | Plugin not active | Run `claude plugin list` to verify, then `/reload-plugins` |
 | Diagnostics slow on first open | Normal — tree-sitter parses on first load, then incremental |
 | Java errors show up one tool call after the edit | Claude Code doesn't wait for LSP diagnostics after Edit/Write ([anthropics/claude-code#93321](https://github.com/anthropics/claude-code/issues/93321)). The plugin's hook waits up to 3s for them; if jdtls is slower (large projects), raise `JAVA_FUNCTIONAL_LSP_HOOK_WAIT` (max 4). See [Fresh jdtls diagnostics after edits](#fresh-jdtls-diagnostics-after-edits) |
-| False "X cannot be resolved" / "The hierarchy of the type X is inconsistent" on classes from another Maven group of the same repository | The server imports such modules automatically when m2e reports them missing. See [Dependencies on modules in other Maven groups](#dependencies-on-modules-in-other-maven-groups) for the log lines to check, the budget (`JAVA_FUNCTIONAL_LSP_DEPENDENCY_MODULES`) and the stale-install case |
+| False "X cannot be resolved" / "The hierarchy of the type X is inconsistent" on classes from another Maven group of the same repository | The server imports such modules automatically, only as far as the open file needs. See [Dependencies on modules in other Maven groups](#dependencies-on-modules-in-other-maven-groups) for the stop reasons, the log lines to check, the limits (`JAVA_FUNCTIONAL_LSP_DEPENDENCY_MODULES`, `JAVA_FUNCTIONAL_LSP_DEPENDENCY_ROUNDS`) and the stale-install case |
 
 ### Other Editors
 
@@ -310,39 +310,57 @@ To force a clean rebuild: `rm -rf ~/.cache/jdtls-data/`
 
 ### Dependencies on modules in other Maven groups
 
-To keep jdtls fast and within its heap, the server imports only the Maven *group* of the file you open (its tightest parent pom with `<modules>`), plus up to 5 more groups as you navigate. A module in that group can depend on a reactor module in *another* group. m2e then looks that dependency up in the local Maven repository at the reactor's version, often a `${revision}` default that is never installed. Every symbol from that module then shows as a false error: "cannot be resolved", "is undefined for the type", or "The hierarchy of the type X is inconsistent" ([#110](https://github.com/aviadshiber/java-functional-lsp/issues/110)). The server fixes this by importing the missing module itself.
+To keep jdtls fast and within its heap, the server imports only the Maven *group* of the file you open (its tightest parent pom with `<modules>`), plus up to 5 more groups as you navigate. A module in that group can depend on a reactor module in *another* group. m2e then looks that dependency up in the local Maven repository at the reactor's version, often a `${revision}` default that is never installed. Every symbol from that module then shows as a false error: "cannot be resolved", "is undefined for the type", or "The hierarchy of the type X is inconsistent" ([#110](https://github.com/aviadshiber/java-functional-lsp/issues/110)). The server fixes this by importing the missing modules itself, **only as far as the open file needs**. (v0.14.0 imported every module any pom reported missing. On a large monorepo that cascaded through the transitive closure to 60 modules, 3 GB of jdtls heap, and 30 s timeouts on every request.)
 
-How it works:
+How it works (v0.14.1):
 
-1. m2e reports the dependency as an error on the dependent's `pom.xml`: `Missing artifact com.example:common:jar:1.0` (prefixed with `Offline / ` when offline).
-2. The server looks the `groupId:artifactId` up in an index of the reactor. The index is built once per session and covers the modules reachable from the reactor root through `<modules>`, with all profiles included.
-3. If the artifact is a module of the repository and no imported folder covers it yet, the server adds the module's directory as a jdtls workspace folder. Additions are batched into one `didChangeWorkspaceFolders` per 500 ms. An added module that is missing its own in-repo dependencies reports them the same way, so the dependency closure is imported only as far as it is actually missing.
-4. jdtls fixes the dependent's classpath within a fraction of a second, but it does not re-check files that are already open. When jdtls reports that a project's classpath was updated, the server asks it to re-validate every open `.java` file of that project (`java.project.refreshDiagnostics`). Those results go through the [diagnostics hold](#fresh-jdtls-diagnostics-after-edits).
+1. **Demand.** An open `.java` file whose jdtls diagnostics hold #110-class errors (unresolved import or type, "undefined for the type", "hierarchy … inconsistent", "indirectly referenced from required .class files", "must override or implement a supertype method") starts the process for its module. Other open files, and files you never opened, never trigger an import.
+2. **Fresh diagnostics only.** jdtls does not re-check a file that is already open when its classpath changes, so its errors can be minutes old. The server waits until jdtls is **build-idle**: no open `language/progressReport` task (indexing / "Searching…" tasks are ignored) and no progress event for 10 s. It then sends `java.project.refreshDiagnostics` for up to 3 demand files, most recently opened first, one at a time. Only the publish that answers that refresh counts, and only if the document still has the same content.
+3. **Frontier.** The candidates come from the reactor index, which is built once per session from the modules reachable from the reactor root through `<modules>` (all profiles). They are the in-repo `<dependencies>` (compile, provided, runtime) of the demand module and of every module imported so far, including those inherited from in-repo parent poms. `dependencyManagement` is ignored. For a file under `src/test`, the demand module's test-scope and `test-jar` dependencies are included too.
+4. **Candidates = frontier ∩ m2e markers.** A frontier module is imported only if m2e reports it missing on some pom (`[Offline / ]Missing artifact g:a:type[:classifier]:version`). The marker is the proof that no installed jar resolves it. A `test-jar` edge only matches a `test-jar`/`tests` marker. Candidates keep their declaration order, and high fan-in "hub" modules go last.
+5. **One round.** Up to 8 candidates are added as **one** `didChangeWorkspaceFolders` event. The server waits for build-idle (at most 90 s) and refreshes the demand files again. If the fresh diagnostics are clean, it stops. If they are not, it runs the next round. Before deciding round k, it waits (at most 30 s) until the modules imported in round k−1 have published their own pom markers.
+6. **Stop.** Every stop is logged once and sent to the client once as a `window/logMessage`. Opening a file in a module that had no demand before starts the process again, unless a session limit (budget, rounds, wall clock) was reached.
 
 If you later open a file in a group that contains one of these modules, the group folder replaces the module folder in the same workspace change. That module folder is never re-added.
 
-Configuration:
+Configuration (the repository config can only **lower** a limit; the environment can raise it up to the hard maximum):
 
 | Setting | Values | Effect |
 |---------|--------|--------|
-| `JAVA_FUNCTIONAL_LSP_DEPENDENCY_MODULES` (environment) | `0`–`200` (default `60`) | Session budget of dependency-module folders; `0` disables the import |
-| `{"jdtls": {"dependencyModules": N}}` in `.java-functional-lsp.json` | same | Same budget; the environment variable wins |
+| `JAVA_FUNCTIONAL_LSP_DEPENDENCY_MODULES` (environment) | `0`–`200` (default `30`) | Session budget of dependency-module folders; `0` disables the import |
+| `{"jdtls": {"dependencyModules": N}}` in `.java-functional-lsp.json` | `0`–default | Lowers the budget (a higher value is ignored with a warning) |
+| `JAVA_FUNCTIONAL_LSP_DEPENDENCY_ROUNDS` (environment) | `0`–`20` (default `6`) | Rounds per session |
+| `{"jdtls": {"dependencyRounds": N}}` in `.java-functional-lsp.json` | `0`–default | Lowers the rounds |
+
+The remaining limits are fixed: 8 modules per round, a 5-minute import wall clock (counted from the round-1 import, excluding refresh time), 3 refreshes per round (20 per session), a 20 s refresh timeout with one retry, and a 90 s build-idle wait per round.
+
+Stop reasons (`jdtls: dependency-module import stopped (<reason>)`):
+
+| Reason | Meaning |
+|--------|---------|
+| `clean` | The refreshed demand files have no #110-class errors left |
+| `no-candidates(none)` | Nothing in the frontier: the errors are not caused by an unimported in-repo module |
+| `no-candidates(markers-pending)` | Frontier modules exist, but m2e has not reported them missing yet (30 s wait) |
+| `no-candidates(owner-has-jar)` | Frontier modules exist, m2e reports none of them missing: a jar in your local repository resolves them (see *stale installs* below) |
+| `budget` / `rounds` / `wall-clock` | A session limit was reached; later demand stops at once |
+| `jdtls-busy` | jdtls did not become build-idle within 90 s after an import |
+| `no-fresh-diagnostics` | jdtls did not answer the refresh, or did not re-publish the file, after one retry |
 
 Limits:
 
-- **Budget.** At most N module folders are added per session. A folder that a group later replaces still counts. When the budget runs out, the log shows a `WARNING` listing the modules left unresolved. Raise the budget, or open a file in those modules' group.
-- **Stale local installs are not detected.** If an old build of the sibling is installed at the same version in your local repository, m2e resolves the dependency from that jar and reports nothing. You then see the installed version's API, not the source. Run `mvn install` for that module again, or delete it from the local repository.
+- **Stale local installs are not detected.** If an old build of the sibling is installed at the same version in your local repository, m2e resolves the dependency from that jar and reports nothing. You then see the installed version's API, not the source, and the import stops with `no-candidates(owner-has-jar)`. Run `mvn install` for that module again, or delete it from the local repository (`~/.m2/repository/<group path>/<artifactId>/<version>`).
 - **Maven only.** Gradle projects are unchanged.
-- **Index bounds.** The index skips poms larger than 1 MB, poms with `<!DOCTYPE`/`<!ENTITY` declarations (in any encoding), symlinked poms, modules outside the reactor root, coordinates with characters other than letters, digits, `_`, `.` and `-` (such as `${revision}`), and any `groupId:artifactId` declared by two directories. It reads at most 5000 poms, for at most 10 s.
+- **Index bounds.** The index skips poms larger than 1 MB, poms with `<!DOCTYPE`/`<!ENTITY` declarations (in any encoding), symlinked poms, modules outside the reactor root, coordinates with characters other than letters, digits, `_`, `.` and `-` (such as `${revision}`; `${project.groupId}` and `${project.parent.groupId}` in a dependency are resolved), and any `groupId:artifactId` declared by two directories. It reads at most 5000 poms, for at most 10 s.
+- **Not persisted.** jdtls 1.61 does not keep folders added this way across a restart, so each session starts from zero. The server keeps its own record in `~/.cache/jdtls-data/<hash>.deps.json`, and the budget counts only this session's imports.
 
 Troubleshooting (the server log is its stderr, as captured by your LSP client):
 
-- `jdtls: pom.xml errors changed for <pom>: … Missing artifact g:a:…` means m2e could not resolve that dependency.
+- `jdtls: pom.xml errors changed for <pom>: … Missing artifact g:a:…` means m2e could not resolve that dependency. It is logged at INFO for modules with an open file, and at DEBUG for imported dependency modules.
 - `jdtls: reactor index of <root>: N modules from M poms` means the index was built. `(truncated)` means it hit a bound.
-- `jdtls: importing K dependency module(s) (used/budget): g:a (path), …` means those modules were added.
-- `jdtls: classpath of <project> updated, refreshing K open file(s)` means open files were re-checked.
+- `jdtls: dependency round k: frontier F, candidates C, deferred D, round took Ts, refresh clean|errors|failed, …; importing K dependency module(s) (used/budget): g:a (path), …` is logged once per round.
+- `jdtls: dependency-module import stopped (<reason>): …` gives the reason (table above). A session summary follows when jdtls stops.
 - If the errors stay and nothing was imported, the artifact is not a module of this reactor (check the `<modules>` path that should reach it), or it is a real external artifact missing from your repository.
-- m2e caches failed lookups: `*.lastUpdated` files in the local repository, and the jdtls workspace in `~/.cache/jdtls-data/`. If errors persist after the module is imported, clear the jdtls cache as described above.
+- m2e caches failed lookups in `*.lastUpdated` files in the local repository. The jdtls workspace of a module lives in `~/.cache/jdtls-data/<hash>/`, where `<hash>` is the directory named in the `jdtls subprocess started (pid=…, data=…)` log line. If errors persist after the module is imported, stop the editor, delete that directory (and its `<hash>.deps.json`), and reopen. v0.14.1 changed the workspace key, so workspaces bloated by v0.14.0 are not reused, and the LRU eviction removes them.
 
 ### Fresh jdtls diagnostics after edits
 

@@ -11,6 +11,7 @@ import os
 import platform
 import re
 import shutil
+import signal
 import subprocess
 import time
 from collections import deque
@@ -19,9 +20,16 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
-from .dependency_modules import ClasspathRefresher, DependencyModules, path_from_uri, resolve_budget
+from .dependency_modules import (
+    REFRESH_TIMEOUT_SEC,
+    DependencyModules,
+    Limits,
+    path_from_uri,
+    resolve_budget,
+    resolve_rounds,
+)
 from .merkle import _BUILD_FILES, ModuleSnapshot, TreeDiff
-from .reactor import find_reactor_root, parse_missing_artifacts
+from .reactor import find_reactor_root, parse_missing_markers
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +40,13 @@ DEFAULT_JVM_MAX_HEAP = "4g"
 _STDERR_LINE_MAX = 1000
 _MAX_EXPANDED_GROUPS: int = 5  # hard cap on concurrent Maven group workspace folders (prevents jdtls OOM)
 _WORKSPACE_CACHE_MAX_SIZE: int = 10  # default LRU cap — override via {"cache": {"maxWorkspaces": N}}
+#: Workspace-schema tag in the data-dir key. Bumped to ws2 in v0.14.1 so the workspaces v0.14.0
+#: bloated with up to 60 dependency projects are not reused (LRU eviction reclaims them).
+_WORKSPACE_SCHEMA = "ws2"
+#: The proxy's own record of the dependency modules it imported, beside the data dir.
+_DEPS_RECORD_SUFFIX = ".deps.json"
+#: stop(): shutdown request + exit, SIGTERM the JVM after this long, SIGKILL after twice as long.
+_STOP_GRACE_SEC = 1.0
 
 # Default jdtls initialization settings.  Sent via initializationOptions.settings
 # so they apply BEFORE the Maven import scan (didChangeConfiguration is too late).
@@ -348,8 +363,6 @@ async def read_message(reader: asyncio.StreamReader) -> dict[str, Any] | None:
 
 
 _WORKSPACE_DID_CHANGE_FOLDERS = "workspace/didChangeWorkspaceFolders"
-#: jdtls ``language/eventNotification`` eventType for "classpath of project <data> updated".
-_EVENT_CLASSPATH_UPDATED = 100
 _MAX_QUEUED_NOTIFICATIONS = 200
 _MODULE_READY_TIMEOUT = 30.0
 
@@ -684,6 +697,7 @@ def _evict_lru_workspaces(cache_root: Path, *, max_size: int = _WORKSPACE_CACHE_
     for stale in dirs[max_size:]:
         try:
             shutil.rmtree(stale)
+            (cache_root / f"{stale.name}{_DEPS_RECORD_SUFFIX}").unlink(missing_ok=True)
             logger.info("jdtls: evicted workspace cache %s (LRU)", stale.name)
         except OSError as e:
             logger.warning("jdtls: failed to evict workspace cache %s: %s", stale.name, e)
@@ -703,6 +717,11 @@ def _wipe_data_dir(data_dir: Path) -> None:
         )
     else:
         logger.info("jdtls: wiped data-dir %s after init timeout", _redact_path(str(data_dir)))
+
+
+def _data_dir_hash(source: str) -> str:
+    """12-hex data-dir key for a module/root URI, tagged with the workspace schema."""
+    return hashlib.sha256(f"{_WORKSPACE_SCHEMA}|{source}".encode()).hexdigest()[:12]
 
 
 def _compute_cache_marker() -> str:
@@ -822,8 +841,15 @@ def _build_effective_params(
     jdtls_settings = copy.deepcopy(_DEFAULT_JDTLS_SETTINGS)
     if config and "jdtls" in config and "settings" in config["jdtls"]:
         jdtls_settings = copy.deepcopy(config["jdtls"]["settings"])
-    init_opts = effective_params.setdefault("initializationOptions", {})
+    init_opts = effective_params.get("initializationOptions")
+    if not isinstance(init_opts, dict):
+        init_opts = effective_params["initializationOptions"] = {}
     init_opts["settings"] = jdtls_settings
+    # language/progressReport drives the build-idle detector of the dependency-module rounds.
+    extended = init_opts.get("extendedClientCapabilities")
+    extended = dict(extended) if isinstance(extended, dict) else {}
+    extended["progressReportProvider"] = True
+    init_opts["extendedClientCapabilities"] = extended
     logger.debug("jdtls: initializationOptions.settings = %s", jdtls_settings)
 
     return effective_params
@@ -967,12 +993,18 @@ class JdtlsProxy:
         uri_key: Callable[[str], str] = lambda uri: uri,
         on_stopped: Callable[[], None] | None = None,
         open_uris: Callable[[], Iterable[str]] | None = None,
+        doc_digest: Callable[[str], str | None] | None = None,
+        notify_client: Callable[[str], None] | None = None,
     ) -> None:
         self._process: asyncio.subprocess.Process | None = None
         self._reader_task: asyncio.Task[None] | None = None
         self._stderr_task: asyncio.Task[None] | None = None
         self._next_id: int = 1
         self._pending: dict[int, asyncio.Future[Any]] = {}
+        # Called synchronously when the response to that request id is dispatched (wire order).
+        self._response_hooks: dict[int, Callable[[], None]] = {}
+        self._stop_lock = asyncio.Lock()
+        self._open_uris: Callable[[], Iterable[str]] = open_uris or (lambda: ())
         # Keyed by uri_key(uri): jdtls may echo a URI in a different encoding than
         # the client sent, so lookups must go through the same canonical key.
         self._diagnostics_cache: dict[str, list[Any]] = {}
@@ -1016,10 +1048,12 @@ class JdtlsProxy:
             covered_roots=self._imported_folder_paths,
             reactor_root_for=_reactor_root_for,
             to_uri=_path_to_uri,
-        )
-        self._classpath_refresher = ClasspathRefresher(
-            open_uris=open_uris or (lambda: ()),
             send_refresh=self._refresh_file_diagnostics,
+            open_uris=self._open_uris,
+            uri_key=uri_key,
+            doc_digest=doc_digest or (lambda _uri: None),
+            module_of=_module_dir_of,
+            notify=notify_client or (lambda _msg: None),
         )
 
     @property
@@ -1045,8 +1079,8 @@ class JdtlsProxy:
         self._diagnostics_cache.clear()
         self._pom_errors.clear()
         self._log_forwarder.flush()
+        self.dependency_modules.log_summary()
         self.dependency_modules.reset()
-        self._classpath_refresher.reset()
         if cached:
             logger.info("jdtls stopped: cleared cached diagnostics for %d files", cached)
         if self._on_stopped:
@@ -1084,10 +1118,7 @@ class JdtlsProxy:
         # from concurrent coroutines during the executor yield below.
         self._initial_module_uri = module_root_uri
         self.modules.mark_added(effective_root_uri)
-        self.dependency_modules.reset()
-        self.dependency_modules.budget = resolve_budget(config)
-        if not self.dependency_modules.enabled:
-            logger.info("jdtls: importing missing in-repo dependency modules is disabled")
+        self._configure_dependency_modules(config)
 
         # All blocking startup I/O in a single executor call: cache version check
         # (may rmtree on upgrade), Lombok discovery, and jdtls env build.
@@ -1105,9 +1136,10 @@ class JdtlsProxy:
             logger.info("jdtls: using Lombok agent from %s", _redact_path(lombok_jar))
 
         hash_source = module_root_uri or original_root
-        data_hash = hashlib.sha256(hash_source.encode()).hexdigest()[:12]
+        data_hash = _data_dir_hash(hash_source)
         data_dir = cache_root / data_hash
         data_dir.mkdir(parents=True, exist_ok=True)
+        self.dependency_modules.begin_session(cache_root / f"{data_hash}{_DEPS_RECORD_SUFFIX}")
 
         effective_params = _build_effective_params(init_params, module_root_uri, original_root, config)
 
@@ -1160,6 +1192,12 @@ class JdtlsProxy:
         except (OSError, FileNotFoundError) as e:
             logger.error("Failed to start jdtls: %s", e)
             return False
+
+    def _configure_dependency_modules(self, config: Mapping[str, Any] | None) -> None:
+        self.dependency_modules.reset()
+        self.dependency_modules.limits = Limits(budget=resolve_budget(config), rounds=resolve_rounds(config))
+        if not self.dependency_modules.enabled:
+            logger.info("jdtls: importing missing in-repo dependency modules is disabled")
 
     async def ensure_started(
         self,
@@ -1405,40 +1443,78 @@ class JdtlsProxy:
         self._expanded_groups.add(root_uri)
 
     async def stop(self) -> None:
-        """Shutdown jdtls subprocess gracefully."""
-        self._mark_stopped()
-        self._log_forwarder.flush()
+        """Shut jdtls down within about 3 s. Idempotent (shutdown, exit, a signal, init timeout).
 
-        if self._reader_task and not self._reader_task.done():
-            self._reader_task.cancel()
-        if self._stderr_task and not self._stderr_task.done():
-            self._stderr_task.cancel()
+        The shutdown reply is read before the reader is cancelled. The JVM gets
+        ``_STOP_GRACE_SEC`` to exit after ``exit``, then SIGTERM, then SIGKILL.
+        """
+        async with self._stop_lock:
+            process = self._process
+            self._mark_stopped()
+            self._log_forwarder.flush()
 
-        for task in list(self._proxy_bg_tasks):
-            task.cancel()
-        self._proxy_bg_tasks.clear()
-        self._module_diff_results.clear()
-        self._pending_diff_tasks.clear()
+            for task in list(self._proxy_bg_tasks):
+                task.cancel()
+            self._proxy_bg_tasks.clear()
+            self._module_diff_results.clear()
+            self._pending_diff_tasks.clear()
 
-        if self._process and self._process.returncode is None:
+            if process is not None and process.returncode is None:
+                await self._terminate(process)
+
+            if self._reader_task and not self._reader_task.done():
+                self._reader_task.cancel()
+            if self._stderr_task and not self._stderr_task.done():
+                self._stderr_task.cancel()
+
+            # Cancel all pending requests
+            for future in self._pending.values():
+                if not future.done():
+                    future.cancel()
+            self._pending.clear()
+            self._response_hooks.clear()
+
+    async def _terminate(self, process: asyncio.subprocess.Process) -> None:
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + _STOP_GRACE_SEC
+        try:
+            await self.send_request("shutdown", None, timeout=_STOP_GRACE_SEC)
+            await self.send_notification("exit", None)
+            await asyncio.wait_for(process.wait(), timeout=max(deadline - loop.time(), 0.05))
+            return
+        except (asyncio.TimeoutError, OSError):
+            pass
+        for sig in (signal.SIGTERM, signal.SIGKILL):
             try:
-                await self.send_request("shutdown", None, timeout=5.0)
-                await self.send_notification("exit", None)
-                await asyncio.wait_for(self._process.wait(), timeout=5.0)
-            except (asyncio.TimeoutError, OSError):
-                self._process.kill()
-                await self._process.wait()
-
-        # Cancel all pending requests
-        for future in self._pending.values():
-            if not future.done():
-                future.cancel()
-        self._pending.clear()
+                process.send_signal(sig)
+            except (ProcessLookupError, OSError):
+                return
+            try:
+                await asyncio.wait_for(process.wait(), timeout=_STOP_GRACE_SEC)
+                logger.info("jdtls: stopped with %s", signal.Signals(sig).name)
+                return
+            except asyncio.TimeoutError:
+                continue
+        logger.warning("jdtls: pid %s did not exit after SIGKILL", process.pid)
 
     async def send_request(self, method: str, params: Any, timeout: float = REQUEST_TIMEOUT) -> Any | None:
         """Send a JSON-RPC request and wait for the response."""
+        _answered, result = await self._request(method, params, timeout)
+        return result
+
+    async def _request(
+        self,
+        method: str,
+        params: Any,
+        timeout: float = REQUEST_TIMEOUT,
+        on_response: Callable[[], None] | None = None,
+    ) -> tuple[bool, Any | None]:
+        """Send a request; (True, result) once jdtls answered it, (False, None) on error or timeout.
+
+        *on_response* runs synchronously when the response is dispatched, before any later message.
+        """
         if not self._process or self._process.stdin is None:
-            return None
+            return False, None
 
         request_id = self._next_id
         self._next_id += 1
@@ -1453,21 +1529,30 @@ class JdtlsProxy:
 
         future: asyncio.Future[Any] = asyncio.get_event_loop().create_future()
         self._pending[request_id] = future
+        if on_response is not None:
+            self._response_hooks[request_id] = on_response
 
         try:
             self._process.stdin.write(encode_message(msg))
             await self._process.stdin.drain()
             result = await asyncio.wait_for(future, timeout=timeout)
-            return result
         except asyncio.TimeoutError:
             logger.warning("jdtls request %s timed out after %.1fs", method, timeout)
-            self._pending.pop(request_id, None)
-            return None
+            return False, None
+        except asyncio.CancelledError:
+            if future.cancelled():  # stop() cancelled the pending request
+                return False, None
+            raise
         except (OSError, ConnectionError) as e:
             logger.error("jdtls communication error on %s: %s", method, e)
-            self._pending.pop(request_id, None)
             self._available = False
-            return None
+            return False, None
+        finally:
+            self._pending.pop(request_id, None)
+            self._response_hooks.pop(request_id, None)
+        if isinstance(result, _ErrorResponse):
+            return False, None
+        return True, result
 
     async def send_notification(self, method: str, params: Any) -> None:
         """Send a JSON-RPC notification (no response expected)."""
@@ -1538,11 +1623,17 @@ class JdtlsProxy:
         if "id" in msg and "method" not in msg:
             # Response to a request we sent
             request_id = msg["id"]
+            hook = self._response_hooks.pop(request_id, None) if isinstance(request_id, int) else None
+            if hook is not None:
+                try:
+                    hook()
+                except Exception:
+                    logger.debug("jdtls: response hook failed", exc_info=True)
             future = self._pending.pop(request_id, None)
             if future and not future.done():
                 if "error" in msg:
                     logger.warning("jdtls error response (id=%s): %s", request_id, msg["error"])
-                    future.set_result(None)
+                    future.set_result(_ErrorResponse())
                 else:
                     future.set_result(msg.get("result"))
         elif "method" in msg and "id" not in msg:
@@ -1576,6 +1667,10 @@ class JdtlsProxy:
                 self._on_diagnostics(uri, diagnostics)
             if isinstance(uri, str) and uri.endswith("/pom.xml"):
                 self._note_pom_diagnostics(uri, diagnostics)
+            elif isinstance(uri, str) and uri.endswith(".java"):
+                self.dependency_modules.note_publish(uri, diagnostics)
+        elif method == "language/progressReport":
+            self.dependency_modules.idle.note_progress(params)
         elif method == "window/logMessage" and isinstance(params, dict):
             msg_type = params.get("type")
             level = _LOG_MESSAGE_LEVELS.get(msg_type, logging.DEBUG) if isinstance(msg_type, int) else logging.DEBUG
@@ -1586,41 +1681,41 @@ class JdtlsProxy:
             level = logging.INFO if status_type == "Error" else logging.DEBUG
             kind = f"status:{status_type}" if status_type in _LANGUAGE_STATUS_TYPES else "status:other"
             self._log_forwarder.forward(level, kind, params.get("message", ""))
-        elif method == "language/eventNotification" and isinstance(params, dict):
-            if params.get("eventType") == _EVENT_CLASSPATH_UPDATED:
-                project = path_from_uri(params.get("data"))  # type: ignore[arg-type]
-                if project is not None:
-                    self._classpath_refresher.note_updated(project)
-        # Other notifications are silently ignored
+        # Other notifications (incl. language/eventNotification) are silently ignored: jdtls never
+        # re-publishes an open file after ClasspathUpdated; the dependency rounds refresh it.
 
     def _note_pom_diagnostics(self, uri: str, diagnostics: Any) -> None:
-        """Log a one-line summary whenever the Error diagnostics set of a pom.xml changes.
+        """Feed pom.xml markers to the dependency rounds; log a summary when the Error set changes.
 
         m2e reports import failures (e.g. ``Missing artifact g:a:t:v``) only as
         diagnostics on the module's pom.xml, which the server never publishes
         (it filters to ``.java``).  Logging them here makes the cause of false
-        "cannot be resolved" errors visible (#110).  Does not alter what is
-        published to the client.
+        "cannot be resolved" errors visible (#110): at INFO for a module with an open file,
+        at DEBUG for the rest (pom churn of imported dependency modules).  Does not alter
+        what is published to the client.
         """
         errors: tuple[str, ...] = ()
         if isinstance(diagnostics, list):
             errors = tuple(
                 str(d.get("message", ""))
-                for d in diagnostics
+                for d in diagnostics[:_MAX_POM_DIAGNOSTICS]
                 if isinstance(d, dict) and d.get("severity") == 1  # DiagnosticSeverity.Error
             )
+        pom = path_from_uri(uri)
+        if pom is not None:
+            self.dependency_modules.note_pom(pom, parse_missing_markers(errors))
         key = self._uri_key(uri)
         previous = self._pom_errors.get(key, ())
         if previous == errors:
             return
-        self._react_to_missing_artifacts(uri, previous, errors)
         if errors:
             self._pom_errors[key] = errors
         else:
             self._pom_errors.pop(key, None)
         shown = "; ".join(_sanitize_jdtls_log(m, _POM_DIAG_MSG_MAX_CHARS) for m in errors[:_POM_DIAG_SHOWN])
         more = f" (+{len(errors) - _POM_DIAG_SHOWN} more)" if len(errors) > _POM_DIAG_SHOWN else ""
-        logger.info(
+        logger.log(
+            logging.INFO if pom is not None and self._has_open_file_in(pom.parent) else logging.DEBUG,
             "jdtls: pom.xml errors changed for %s: %d error(s)%s%s",
             self._pom_display_path(uri),
             len(errors),
@@ -1641,16 +1736,17 @@ class JdtlsProxy:
                 pass
         return _sanitize_jdtls_log(_redact_path(path), _POM_DIAG_MSG_MAX_CHARS)
 
-    def _react_to_missing_artifacts(self, uri: str, previous: tuple[str, ...], errors: tuple[str, ...]) -> None:
-        """Import in-repo modules m2e reports missing; refresh open files once they resolve."""
-        pom = path_from_uri(uri)
-        if pom is None:
-            return
-        missing = parse_missing_artifacts(errors)
-        if missing:
-            self.dependency_modules.note_missing(pom, missing)
-        elif parse_missing_artifacts(previous):
-            self._classpath_refresher.note_updated(pom.parent)
+    def _has_open_file_in(self, module_dir: Path) -> bool:
+        """Whether a client-open file belongs to the module at *module_dir* (not a nested one)."""
+        try:
+            uris = list(self._open_uris())
+        except Exception:
+            return False
+        for open_uri in uris:
+            path = path_from_uri(open_uri) if isinstance(open_uri, str) else None
+            if path is not None and path.is_relative_to(module_dir) and _module_dir_of(path) == module_dir:
+                return True
+        return False
 
     def _imported_folder_paths(self) -> list[Path]:
         """Folders jdtls imported for groups/modules (the dependency registry is separate)."""
@@ -1668,18 +1764,35 @@ class JdtlsProxy:
             return
         await self.send_notification(_WORKSPACE_DID_CHANGE_FOLDERS, {"event": {"added": added, "removed": removed}})
 
-    async def _refresh_file_diagnostics(self, uri: str) -> None:
-        """jdtls does not republish diagnostics for open files after a classpath change; ask it to."""
+    async def _refresh_file_diagnostics(self, uri: str, on_response: Callable[[], None] | None = None) -> bool:
+        """jdtls does not republish diagnostics for open files after a classpath change; ask it to.
+
+        True once jdtls answered. *on_response* runs when the answer is dispatched: jdtls publishes
+        the file's diagnostics just before it answers.
+        """
         if not self._available:
-            return
-        await self.send_request(
+            return False
+        answered, _result = await self._request(
             "workspace/executeCommand",
             {"command": "java.project.refreshDiagnostics", "arguments": [uri, "thisFile", False]},
             timeout=_REFRESH_DIAGNOSTICS_TIMEOUT,
+            on_response=on_response,
         )
+        return answered
 
 
-_REFRESH_DIAGNOSTICS_TIMEOUT = 10.0
+_REFRESH_DIAGNOSTICS_TIMEOUT = REFRESH_TIMEOUT_SEC
+_MAX_POM_DIAGNOSTICS = 500
+
+
+class _ErrorResponse:
+    """Future result for a JSON-RPC error response (``send_request`` still returns None)."""
+
+
+def _module_dir_of(path: Path) -> Path | None:
+    """Nearest ancestor directory of *path* holding a module descriptor (the module root)."""
+    root = find_module_root(str(path))
+    return Path(root) if root else None
 
 
 def _path_to_uri(path: Path) -> str:
