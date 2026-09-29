@@ -283,6 +283,7 @@ class JavaFunctionalLspServer(LanguageServer):
             on_diagnostics=self._on_jdtls_diagnostics,
             uri_key=_normalize_uri,
             on_stopped=self._on_jdtls_stopped,
+            open_uris=self._open_document_uris,
         )
         self._user_suppress_patterns: list[re.Pattern[str]] = []
         self._skip_jdtls: bool = False
@@ -310,6 +311,13 @@ class JavaFunctionalLspServer(LanguageServer):
         # Module root per opened file (normalized key), resolved once: the lookup walks
         # the filesystem and didChange arrives per keystroke in IDEs.
         self._module_uris: dict[str, str | None] = {}
+
+    def _open_document_uris(self) -> list[str]:
+        """URIs the client currently has open (as the client sent them)."""
+        try:
+            return list(self.workspace.text_documents)
+        except Exception:  # workspace not set up yet (before initialize)
+            return []
 
     def _record_opened(self, uri: str) -> None:
         """Record *uri* as opened this session, evicting the oldest entry at cap.
