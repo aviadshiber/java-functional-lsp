@@ -75,7 +75,8 @@ async def test_cross_group_dependency_resolves(tmp_path: Path) -> None:
         await wait_log(session.log, "dependency-module import stopped", 60.0)
         assert imported_gas(session.log) == ["com.example:common"], log_tail(session.log)
         # The probe and the post-idle refresh both ran, and the round's refresh saw the clean set.
-        stop = next(line for line in session.log if "dependency-module import stopped" in line)
+        stop = next((line for line in session.log if "dependency-module import stopped" in line), None)
+        assert stop is not None, f"no dependency-module STOP line\n{log_tail(session.log)}"
         assert "(clean)" in stop
         assert int(stop.split("refreshes ")[1].split()[0].rstrip(";")) >= 2, stop
         assert any("dependency round 1" in line and "refresh clean" in line for line in session.log)
