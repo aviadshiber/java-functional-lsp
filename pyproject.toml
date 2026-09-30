@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "java-functional-lsp"
-version = "0.14.0"
+version = "0.14.1"
 description = "Java LSP server enforcing functional programming best practices — null safety, immutability, no exceptions"
 readme = "README.md"
 license = { text = "MIT" }
@@ -26,7 +26,7 @@ classifiers = [
     "Topic :: Software Development :: Quality Assurance",
 ]
 dependencies = [
-    "pygls>=1.3.0",
+    "pygls>=2.0",
     "tree-sitter>=0.23.0",
     "tree-sitter-java>=0.23.0",
 ]

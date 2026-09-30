@@ -14,8 +14,10 @@ import json
 import logging
 import os
 import re
+import signal
 import stat
 import sys
+import threading
 import time
 from collections import Counter, OrderedDict
 from collections.abc import Callable, Coroutine
@@ -284,6 +286,8 @@ class JavaFunctionalLspServer(LanguageServer):
             uri_key=_normalize_uri,
             on_stopped=self._on_jdtls_stopped,
             open_uris=self._open_document_uris,
+            doc_digest=self._document_digest,
+            notify_client=self._notify_client,
         )
         self._user_suppress_patterns: list[re.Pattern[str]] = []
         self._skip_jdtls: bool = False
@@ -318,6 +322,19 @@ class JavaFunctionalLspServer(LanguageServer):
             return list(self.workspace.text_documents)
         except Exception:  # workspace not set up yet (before initialize)
             return []
+
+    def _document_digest(self, uri: str) -> str | None:
+        """Content digest of the open document *uri* (any URI spelling), or None if it is not open."""
+        client_uri = self._session_opened_uris.get(_normalize_uri(uri)) or uri
+        doc = self.workspace.text_documents.get(client_uri)
+        return content_digest(doc.source.encode()) if doc is not None else None
+
+    def _notify_client(self, message: str) -> None:
+        """One-off status for the user (e.g. why the dependency-module import stopped)."""
+        try:
+            self.window_log_message(lsp.LogMessageParams(type=lsp.MessageType.Info, message=message))
+        except Exception:
+            logger.debug("window/logMessage failed", exc_info=True)
 
     def _record_opened(self, uri: str) -> None:
         """Record *uri* as opened this session, evicting the oldest entry at cap.
@@ -761,7 +778,89 @@ def on_initialize(params: lsp.InitializeParams) -> lsp.InitializeResult:
     # _register_jdtls_capabilities, after jdtls warm-up.
     HandlerWiring(server, _JDTLS_HANDLERS).wire_eager(negotiation.static)
 
+    if _process_mode:
+        _install_signal_handlers()
     return lsp.InitializeResult(capabilities=StaticCapabilityBuilder().build(negotiation.static))
+
+
+# --- Shutdown (#107, v0.14.1) ---
+#
+# pygls' built-in EXIT handler calls sys.exit, which then blocks forever in
+# thread_pool.shutdown(wait=True) on the _EternalStdinBuffer reader, and nothing stopped jdtls,
+# so its JVM outlived the server. SHUTDOWN and EXIT now stop jdtls (bounded), EXIT and
+# SIGTERM/SIGHUP end the process with os._exit. pygls 2.x runs these user handlers first and
+# awaits them.
+
+#: Set by main(): only a real server process installs signal handlers and calls os._exit.
+_process_mode = False
+#: proxy.stop() takes at most ~3 s (shutdown/exit, SIGTERM after 1 s, SIGKILL after 2 s).
+_STOP_TIMEOUT_SEC = 3.5
+#: After a signal the process exits within this long, whatever happens.
+_SIGNAL_WATCHDOG_SEC = 5.0
+_signals_received = 0
+
+
+def _hard_exit(code: int) -> None:
+    logging.shutdown()
+    os._exit(code)
+
+
+def _watchdog_exit(code: int) -> None:
+    """The signal watchdog's exit: no logging.shutdown(), which could block on a handler lock
+    held by a thread stuck writing to a full stderr pipe."""
+    os._exit(code)
+
+
+async def _stop_jdtls_bounded() -> None:
+    try:
+        await asyncio.wait_for(server._proxy.stop(), timeout=_STOP_TIMEOUT_SEC)
+    except asyncio.TimeoutError:
+        logger.warning("jdtls did not stop within %.1fs", _STOP_TIMEOUT_SEC)
+    except Exception:
+        logger.warning("jdtls stop failed", exc_info=True)
+
+
+@server.feature(lsp.SHUTDOWN)
+async def on_shutdown(_: Any) -> None:
+    """Stop jdtls before answering shutdown, so the client's exit finds nothing left to do."""
+    await _stop_jdtls_bounded()
+
+
+@server.feature(lsp.EXIT)
+async def on_exit(_: Any) -> None:
+    """Stop jdtls (bounded), then end the process without waiting on the stdin reader thread."""
+    await _stop_jdtls_bounded()
+    if _process_mode:
+        _hard_exit(0 if getattr(server.protocol, "_shutdown", False) else 1)
+
+
+def _install_signal_handlers() -> None:
+    """SIGTERM/SIGHUP stop jdtls, then exit. Registered from inside the running loop (POSIX only)."""
+    try:
+        loop = asyncio.get_running_loop()
+        for sig in (signal.SIGTERM, signal.SIGHUP):
+            loop.add_signal_handler(sig, _on_signal, sig)
+    except (RuntimeError, NotImplementedError, ValueError, AttributeError) as e:
+        logger.debug("signal handlers not installed: %s", e)
+
+
+def _on_signal(sig: signal.Signals) -> None:
+    global _signals_received
+    _signals_received += 1
+    code = 128 + int(sig)
+    if _signals_received > 1:
+        _watchdog_exit(code)  # a second signal: no more waiting
+        return
+    logger.info("received %s: stopping jdtls", sig.name)
+    watchdog = threading.Timer(_SIGNAL_WATCHDOG_SEC, _watchdog_exit, (code,))
+    watchdog.daemon = True
+    watchdog.start()
+    _fire_and_forget(_stop_and_exit(code))
+
+
+async def _stop_and_exit(code: int) -> None:
+    await _stop_jdtls_bounded()
+    _hard_exit(code)
 
 
 @server.feature(lsp.INITIALIZED)
@@ -1652,6 +1751,8 @@ def _log_level_from_env() -> int:
 
 def main() -> None:
     """Entry point for the LSP server."""
+    global _process_mode
+    _process_mode = True
     logging.basicConfig(level=logging.INFO, format="%(name)s %(levelname)s: %(message)s")
     # Only this package's loggers: root DEBUG would also enable pygls/jdtls payload logging.
     logging.getLogger("java_functional_lsp").setLevel(_log_level_from_env())

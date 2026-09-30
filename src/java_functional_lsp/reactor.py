@@ -2,9 +2,11 @@
 
 Pure functions, no jdtls. ``build_reactor_index`` maps ``groupId:artifactId`` to the
 module directory of every module reachable from a reactor root through ``<modules>``
-(all profiles unioned). The proxy uses it to turn m2e's pom.xml diagnostic
-``Missing artifact g:a:type:version`` into "import that in-repo module as a
-workspace folder".
+(all profiles unioned), and records each module's declared ``<dependencies>`` and its
+parent. ``ReactorIndex.edges`` turns those into the in-repo dependency edges of a module,
+including the ones it inherits from in-repo parent poms. The proxy intersects the edges
+with m2e's pom.xml diagnostic ``Missing artifact g:a:type[:classifier]:version`` to
+decide which in-repo modules to import as workspace folders.
 
 The poms come from the user's checkout, so parsing is defensive: files over
 ``MAX_POM_BYTES`` or containing a ``<!DOCTYPE``/``<!ENTITY`` declaration are
@@ -38,8 +40,33 @@ _FORBIDDEN_MARKUP = re.compile(rb"<!\s*(?:DOCTYPE|ENTITY)", re.IGNORECASE)
 _COORDINATE = r"[A-Za-z0-9_.\-]+"
 _COORDINATE_RE = re.compile(_COORDINATE)
 #: m2e: "[<prefix> / ]Missing artifact g:a:type[:classifier]:version". ``${revision}`` is
-#: already interpolated. Only groupId and artifactId are kept.
-_MISSING_ARTIFACT_RE = re.compile(rf"(?:^|/\s*)Missing artifact ({_COORDINATE}):({_COORDINATE}):\S+")
+#: already interpolated.
+_MISSING_ARTIFACT_RE = re.compile(rf"(?:^|/\s*)Missing artifact ({_COORDINATE}):({_COORDINATE}):(\S+)")
+#: Scopes whose dependencies are on a module's main classpath.
+MAIN_SCOPES = frozenset({"compile", "provided", "runtime", "system"})
+#: Bound on the in-repo parent chain walked for inherited dependencies.
+MAX_PARENT_DEPTH = 20
+#: Bound on the dependencies kept per pom (a hostile pom cannot grow the index unboundedly).
+MAX_DEPENDENCIES_PER_POM = 2000
+_OWN_GROUP_PLACEHOLDERS = frozenset({"${project.groupId}", "${pom.groupId}", "${groupId}"})
+_PARENT_GROUP_PLACEHOLDERS = frozenset({"${project.parent.groupId}", "${parent.groupId}"})
+
+
+@dataclass(frozen=True)
+class Dependency:
+    """One declared ``<dependency>``: its GA, scope, and whether it is a test-jar."""
+
+    ga: str
+    scope: str = "compile"
+    test_jar: bool = False
+
+
+@dataclass(frozen=True)
+class Marker:
+    """One m2e "Missing artifact" marker: the GA and whether it names a test-jar."""
+
+    ga: str
+    test_jar: bool = False
 
 
 class _ForbiddenDeclarationError(Exception):
@@ -81,9 +108,48 @@ class ReactorIndex:
     poms_read: int = 0
     #: True when the walk stopped early at the pom-count or time bound.
     truncated: bool = False
+    #: Module directory → its declared ``<dependencies>`` (``dependencyManagement`` ignored).
+    dependencies: dict[Path, tuple[Dependency, ...]] = field(default_factory=dict)
+    #: Module directory → the GA of its ``<parent>``.
+    parent_of: dict[Path, str] = field(default_factory=dict)
+    #: Unambiguous GA → directory of every indexed pom, aggregators included (parent lookups).
+    poms: dict[str, Path] = field(default_factory=dict)
+    #: GA → number of indexed modules declaring it on their main classpath (hub detection).
+    fan_in: dict[str, int] = field(default_factory=dict)
 
     def get(self, ga: str) -> Path | None:
         return self.modules.get(ga)
+
+    def edges(self, module_dir: Path, *, test: bool = False) -> list[Dependency]:
+        """In-repo-resolvable dependency edges of *module_dir*, in declaration order.
+
+        Main-classpath scopes of the module and of every in-repo parent pom (nearest first;
+        the chain is looked up by GA inside this index only, with a visited set and a depth
+        bound). With *test*, test-scope dependencies are included too. Deduplicated by
+        (GA, test-jar); GAs that are not importable modules of this index are dropped.
+        """
+        result: list[Dependency] = []
+        seen: set[tuple[str, bool]] = set()
+        current: Path | None = module_dir
+        visited: set[Path] = set()
+        depth = 0
+        while current is not None and current not in visited and depth <= MAX_PARENT_DEPTH:
+            visited.add(current)
+            for dep in self.dependencies.get(current, ()):
+                if dep.scope not in MAIN_SCOPES and not (test and dep.scope == "test"):
+                    continue
+                key = (dep.ga, dep.test_jar)
+                if key in seen or dep.ga not in self.modules:
+                    continue
+                seen.add(key)
+                result.append(dep)
+            parent_ga = self.parent_of.get(current)
+            current = self.poms.get(parent_ga) if parent_ga else None
+            depth += 1
+        return result
+
+    def is_hub(self, ga: str, threshold: int) -> bool:
+        return self.fan_in.get(ga, 0) >= threshold
 
 
 @dataclass(frozen=True)
@@ -91,6 +157,8 @@ class _Pom:
     group_id: str | None
     artifact_id: str | None
     modules: tuple[str, ...]
+    parent_ga: str | None = None
+    dependencies: tuple[Dependency, ...] = ()
 
 
 def _local(tag: object) -> str:
@@ -134,8 +202,37 @@ def _read_pom_bytes(pom: Path) -> bytes | None:
     return data
 
 
+def _coordinate(value: str | None) -> str | None:
+    return value if value and _COORDINATE_RE.fullmatch(value) else None
+
+
+def _parse_dependencies(
+    project: ET.Element, group_id: str | None, parent_group_id: str | None
+) -> tuple[Dependency, ...]:
+    """Project-level ``<dependencies>`` (not ``dependencyManagement``, not profiles)."""
+    result: list[Dependency] = []
+    for dep in _children(_child(project, "dependencies"), "dependency")[:MAX_DEPENDENCIES_PER_POM]:
+        raw_group = _text(_child(dep, "groupId"))
+        if raw_group in _OWN_GROUP_PLACEHOLDERS:
+            raw_group = group_id
+        elif raw_group in _PARENT_GROUP_PLACEHOLDERS:
+            raw_group = parent_group_id
+        g = _coordinate(raw_group)
+        a = _coordinate(_text(_child(dep, "artifactId")))
+        if g is None or a is None:
+            continue
+        scope = (_text(_child(dep, "scope")) or "compile").lower()
+        dep_type = _text(_child(dep, "type")) or "jar"
+        classifier = _text(_child(dep, "classifier"))
+        result.append(Dependency(f"{g}:{a}", scope, dep_type == "test-jar" or classifier == "tests"))
+    return tuple(result)
+
+
 def parse_pom(pom: Path) -> _Pom | None:
-    """Parse the coordinates and ``<modules>`` (all profiles) of *pom*; None if rejected or invalid."""
+    """Parse the coordinates, parent, ``<dependencies>`` and ``<modules>`` (all profiles) of *pom*.
+
+    None if rejected or invalid.
+    """
     data = _read_pom_bytes(pom)
     if data is None:
         return None
@@ -146,8 +243,12 @@ def parse_pom(pom: Path) -> _Pom | None:
     if _local(project.tag) != "project":
         return None
     parent = _child(project, "parent")
-    group_id = _text(_child(project, "groupId")) or _text(_child(parent, "groupId") if parent is not None else None)
+    parent_group = _text(_child(parent, "groupId")) if parent is not None else None
+    parent_artifact = _text(_child(parent, "artifactId")) if parent is not None else None
+    group_id = _text(_child(project, "groupId")) or parent_group
     artifact_id = _text(_child(project, "artifactId"))
+    pg, pa = _coordinate(parent_group), _coordinate(parent_artifact)
+    parent_ga = f"{pg}:{pa}" if pg and pa else None
     module_lists = [_child(project, "modules")]
     for profile in _children(_child(project, "profiles"), "profile"):
         module_lists.append(_child(profile, "modules"))
@@ -157,7 +258,7 @@ def parse_pom(pom: Path) -> _Pom | None:
             value = _text(m)
             if value and value not in modules:
                 modules.append(value)
-    return _Pom(group_id, artifact_id, tuple(modules))
+    return _Pom(group_id, artifact_id, tuple(modules), parent_ga, _parse_dependencies(project, group_id, parent_group))
 
 
 def _module_pom(base: Path, entry: str) -> Path:
@@ -180,6 +281,8 @@ def _contained_dir(pom: Path, real_root: Path) -> Path | None:
 def _resolve_found(index: ReactorIndex, found: dict[str, set[Path]]) -> None:
     """Keep GAs declared by exactly one non-aggregator directory; log the ambiguous ones once."""
     for ga, dirs in found.items():
+        if len(dirs) == 1:
+            index.poms[ga] = next(iter(dirs))
         if ga in index.aggregators:
             continue
         if len(dirs) == 1:
@@ -238,6 +341,12 @@ def build_reactor_index(
             found.setdefault(f"{g}:{a}", set()).add(module_dir)
             if parsed.modules:
                 index.aggregators.add(f"{g}:{a}")
+        if parsed.dependencies:
+            index.dependencies[module_dir] = parsed.dependencies
+            for dep in {d.ga for d in parsed.dependencies if d.scope in MAIN_SCOPES}:
+                index.fan_in[dep] = index.fan_in.get(dep, 0) + 1
+        if parsed.parent_ga:
+            index.parent_of[module_dir] = parsed.parent_ga
         for entry in parsed.modules:
             if "${" in entry:
                 continue
@@ -259,13 +368,32 @@ def find_reactor_root(module_dir: Path, boundary: Path | None = None) -> Path:
     return top
 
 
+def parse_missing_markers(messages: tuple[str, ...] | list[str]) -> list[Marker]:
+    """Every m2e "Missing artifact" message as a ``Marker``, in order, deduped.
+
+    ``g:a:type:version`` or ``g:a:type:classifier:version``; a ``test-jar`` type or a
+    ``tests`` classifier marks a test-jar.
+    """
+    result: list[Marker] = []
+    for message in messages:
+        match = _MISSING_ARTIFACT_RE.search(message)
+        if not match:
+            continue
+        # "<type>:<version>" or "<type>:<classifier>:<version>"; tolerate a truncated message
+        # ("g:a:jar"): a pom diagnostic must never raise inside the jdtls reader loop.
+        parts = match.group(3).split(":")
+        dep_type = parts[0]
+        classifier = parts[1] if len(parts) > 2 else None  # noqa: PLR2004 (type:classifier:version)
+        marker = Marker(f"{match.group(1)}:{match.group(2)}", dep_type == "test-jar" or classifier == "tests")
+        if marker not in result:
+            result.append(marker)
+    return result
+
+
 def parse_missing_artifacts(messages: tuple[str, ...] | list[str]) -> list[str]:
     """Return the ``groupId:artifactId`` of every m2e "Missing artifact" message, in order, deduped."""
     result: list[str] = []
-    for message in messages:
-        match = _MISSING_ARTIFACT_RE.search(message)
-        if match:
-            ga = f"{match.group(1)}:{match.group(2)}"
-            if ga not in result:
-                result.append(ga)
+    for marker in parse_missing_markers(messages):
+        if marker.ga not in result:
+            result.append(marker.ga)
     return result
