@@ -555,10 +555,11 @@ class TestHoldWiring:
 
     async def test_custom_first_publish_failure_does_not_strand_file(self, live: MagicMock) -> None:
         server._hold_mode = _HOLD_CUSTOM_FIRST
-        with patch.object(srv_mod, "_run_analysis", side_effect=RuntimeError("boom")):
+        with patch.object(srv_mod, "_run_analysis", side_effect=RuntimeError("boom")) as failing:
             await _edit()
-            await _past_debounce()
-        assert not srv_mod._freshness.is_pending(URI)
+            # Poll, not a fixed sleep: on a slow CI runner the debounced analysis can run
+            # after a 30 ms sleep, i.e. after the patch is gone.
+            await _until(lambda: failing.called and not srv_mod._freshness.is_pending(URI))
         _jdtls_publishes([])
         assert live.call_count == 1
 
