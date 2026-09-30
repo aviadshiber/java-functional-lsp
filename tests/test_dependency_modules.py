@@ -604,6 +604,22 @@ class TestStopReasons:
         assert fake.deps.last_stop == STOP_BUSY
         assert len(fake.notified) == 1
 
+    async def test_busy_beyond_one_round_timeout_resumes_when_idle_returns(self) -> None:
+        """A build that outlasts one round timeout is not a dead end (v0.14.2): the busy wait
+        retries and the phase resumes once BuildIdle next reports idle, instead of stopping and
+        un-arming the module at the first timeout. Only Timing fields that exist on v0.14.1
+        (round_timeout/idle_quiet/refresh_backoff/marker_wait) are set here, so this test also
+        serves as the fail-before reproduction against the pre-fix code."""
+        fake = _Fake(timing=Timing(idle_quiet=0.01, round_timeout=0.05, refresh_backoff=0.01, marker_wait=0.1))
+        fake.deps.idle.note_progress(_progress("build"))  # busy past this round's timeout
+        loop = asyncio.get_running_loop()
+        # Completes well after one round_timeout (0.05s) but well within any busy budget.
+        loop.call_later(0.18, fake.deps.idle.note_progress, _progress("build", complete=True))
+        fake.start()
+        await fake.settle()
+        assert fake.sent == [["g:mid"], ["g:owner"]]
+        assert fake.deps.last_stop == STOP_CLEAN
+
     async def test_no_fresh_at_the_probe_re_arms(self) -> None:
         fake = _Fake()
         fake.publish = False
@@ -985,7 +1001,8 @@ class TestRecord:
             await fake.settle()
         rounds = [r.getMessage() for r in caplog.records if "dependency round" in r.getMessage()]
         assert len(rounds) == 2
-        assert "importing 1 dependency module(s) (1/30 used): g:mid (groupA/mid)" in rounds[0]
+        assert "imported 1 dependency module(s) (1/30 used): g:mid (groupA/mid)" in rounds[0]
+        assert rounds[0].index("imported") < rounds[0].index("build idle") < rounds[0].index("refresh")
         assert "refresh errors" in rounds[0]
         assert "refresh clean" in rounds[1]
         assert any("stopped (clean)" in r.getMessage() for r in caplog.records)

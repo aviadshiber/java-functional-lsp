@@ -312,7 +312,7 @@ async def _collect(stream: asyncio.StreamReader | None, lines: list[str]) -> Non
         lines.append(line.decode(errors="replace").rstrip())
 
 
-_IMPORT_LINE_RE = re.compile(r"importing \d+ dependency module\(s\) \([^)]*\): (.*)$")
+_IMPORT_LINE_RE = re.compile(r"imported \d+ dependency module\(s\) \([^)]*\): (.*?) -> build idle")
 _GA_RE = re.compile(r"(com\.example:[A-Za-z0-9_.\-]+)")
 _JDTLS_PID_RE = re.compile(r"jdtls subprocess started \(pid=(\d+)")
 
