@@ -799,25 +799,35 @@ class DependencyModules:
             self._roots[module_dir] = root
         return root
 
-    async def _wait_idle(self, since: float | None) -> bool:
+    async def _wait_idle(self, since: float | None) -> str | None:
         """Wait for build-idle, retrying within a busy budget so a build that outlasts one round
         timeout is not a dead end (#DEV-v0.14.2, large module groups on products).
 
         Each attempt waits up to ``round_timeout`` for :meth:`BuildIdle.wait`. Between attempts
-        this re-checks the session's existing limits (budget/rounds/wall-clock), so a long busy
-        build still cannot outlive them. Only once the busy budget (``timing.busy_wait_budget``)
-        or the retry count is exhausted does this return False, i.e. a final ``jdtls-busy``.
+        this re-checks the session's existing limits (budget/rounds/wall-clock): if one has
+        already been reached, that is latched onto ``self._session.terminal`` (mirroring
+        :meth:`_select`) and returned immediately, so the caller reports and stops on the real
+        reason instead of a generic busy timeout, and later demand for the same module short-
+        circuits via the ``terminal`` check at the top of :meth:`_process` rather than retrying
+        forever. Only once the busy budget (``timing.busy_wait_budget``) or the retry count is
+        exhausted does this give up on idle itself, returning the final ``jdtls-busy``. Returns
+        ``None`` when idle was reached.
         """
         deadline = self._clock() + self.timing.busy_wait_budget
         attempt = 0
         while True:
             if await self.idle.wait(since, self.timing.round_timeout):
-                return True
+                return None
             attempt += 1
+            # A terminal session limit outranks an ordinary busy timeout, even on what would
+            # otherwise be the final attempt: it must latch and report the real reason (not a
+            # retryable jdtls-busy) so a re-arm does not busy-wait through the same limit again.
+            limit = self._limit_reason()
+            if limit is not None:
+                self._session.terminal = limit
+                return limit
             if attempt >= self.timing.busy_wait_retries or self._clock() >= deadline:
-                return False
-            if self._limit_reason() is not None:
-                return False
+                return STOP_BUSY
             logger.info(
                 "jdtls: still busy after %.0fs, waiting for build-idle (attempt %d/%d, up to %.0fs more)",
                 attempt * self.timing.round_timeout,
@@ -831,8 +841,9 @@ class DependencyModules:
         if self._session.terminal is not None:
             return self._session.terminal
         armed_at = self._clock()
-        if not await self._wait_idle(None):
-            return STOP_BUSY
+        idle_stop = await self._wait_idle(None)
+        if idle_stop is not None:
+            return idle_stop
         fresh = await self._refresh(self._demand_files(new_modules))
         if fresh is None:
             return self._session.terminal or STOP_NO_FRESH
@@ -884,9 +895,10 @@ class DependencyModules:
         def log(refresh: str, files: list[str]) -> None:
             self._log_round(files, frontier, candidates, batch, index, self._clock() - sent_at, refresh)
 
-        if not await self._wait_idle(sent_at):
-            log("skipped (busy)", demand)
-            return STOP_BUSY
+        idle_stop = await self._wait_idle(sent_at)
+        if idle_stop is not None:
+            log(f"skipped ({idle_stop})", demand)
+            return idle_stop
         # The files with demand in this round (already most recent first), still open: an
         # unsolicited publish in between never decides the round.
         open_keys = self._open_keys()

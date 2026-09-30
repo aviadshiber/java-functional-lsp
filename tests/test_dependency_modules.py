@@ -620,6 +620,102 @@ class TestStopReasons:
         assert fake.sent == [["g:mid"], ["g:owner"]]
         assert fake.deps.last_stop == STOP_CLEAN
 
+    async def test_busy_wait_budget_cuts_the_retry_loop_short(self) -> None:
+        """The busy_wait_budget deadline can end the busy-retry loop before busy_wait_retries
+        would (PR #117 review). Without the deadline check, the loop would only give up after
+        busy_wait_retries attempts -- 100 * 0.05s = 5s here -- well past settle()'s timeout, so
+        this test fails loudly (a timeout AssertionError, not a wrong-value assertion) if that
+        check is deleted."""
+        fake = _Fake(
+            timing=Timing(
+                idle_quiet=0.01,
+                round_timeout=0.05,
+                refresh_backoff=0.01,
+                marker_wait=0.1,
+                busy_wait_retries=100,
+                busy_wait_budget=0.12,
+            )
+        )
+        fake.deps.idle.note_progress(_progress("build"))  # never completes
+        fake.start()
+        await fake.settle(timeout=1.0)
+        assert fake.deps.last_stop == STOP_BUSY
+
+    async def test_session_limit_cuts_a_busy_retry_short(self) -> None:
+        """A session limit (wall-clock here) reached mid busy-retry stops `_wait_idle` at once
+        via `_limit_reason`, latching the real reason onto `_session.terminal` (mirroring
+        `_select`) instead of returning a bare busy timeout (PR #117 review). Before the fix,
+        `_wait_idle` returned `False` for this case exactly like an ordinary busy timeout, so the
+        caller always reported `STOP_BUSY`; since that is retryable, `_run` un-armed the module
+        and the next demand publish re-entered the same limited session and busy-waited again,
+        repeating indefinitely instead of stopping for good."""
+        extra = f"file://{X}/src/main/java/X.java"
+        fake = _Fake(
+            timing=Timing(
+                idle_quiet=0.01,
+                round_timeout=0.05,
+                refresh_backoff=0.01,
+                marker_wait=0.1,
+                busy_wait_retries=100,
+                busy_wait_budget=10.0,
+            ),
+            limits=Limits(wall_clock=0.02),
+            open_files=[MAIN_FILE, extra],
+        )
+        original = fake._send
+
+        async def send_and_build(added: list[dict[str, str]], removed: list[dict[str, str]]) -> None:
+            await original(added, removed)
+            fake.deps.idle.note_progress(_progress("import"))  # the import never finishes building
+
+        fake.deps._send_folders = send_and_build
+        fake.start()
+        await fake.settle(timeout=1.0)
+        assert fake.deps.last_stop == STOP_WALL_CLOCK
+        assert fake.deps._session.terminal == STOP_WALL_CLOCK
+        refreshed = len(fake.refreshed)
+        sent = len(fake.sent)
+        # A *different*, not-yet-armed module demands next: the latched session limit must stop
+        # it at once (README: "A session limit was reached; later demand stops at once"), not
+        # re-enter the busy-retry loop for another round of the same limited session.
+        fake.deps.note_publish(extra, DEMAND)
+        await fake.settle()
+        assert fake.deps.last_stop == STOP_WALL_CLOCK
+        assert len(fake.refreshed) == refreshed
+        assert len(fake.sent) == sent  # short-circuited via `terminal`: no retry storm
+
+    async def test_session_limit_on_the_final_busy_attempt_still_latches(self) -> None:
+        """A session limit reached on exactly the *last* busy-retry attempt (busy_wait_retries=1
+        here) must still latch the real reason onto `_session.terminal`, not fall through to a
+        retryable `STOP_BUSY` because the retry count is also exhausted on that same attempt.
+        The limit check must outrank the exhaustion check: checking exhaustion first would return
+        `jdtls-busy` on the final attempt even though the session was already over its limit, which
+        is the same "later demand re-enters and busy-waits forever" bug as
+        ``test_session_limit_cuts_a_busy_retry_short``, just triggered by the retry count instead
+        of the busy budget racing the limit."""
+        fake = _Fake(
+            timing=Timing(
+                idle_quiet=0.01,
+                round_timeout=0.05,
+                refresh_backoff=0.01,
+                marker_wait=0.1,
+                busy_wait_retries=1,
+                busy_wait_budget=10.0,
+            ),
+            limits=Limits(wall_clock=0.02),
+        )
+        original = fake._send
+
+        async def send_and_build(added: list[dict[str, str]], removed: list[dict[str, str]]) -> None:
+            await original(added, removed)
+            fake.deps.idle.note_progress(_progress("import"))  # the import never finishes building
+
+        fake.deps._send_folders = send_and_build
+        fake.start()
+        await fake.settle(timeout=1.0)
+        assert fake.deps.last_stop == STOP_WALL_CLOCK
+        assert fake.deps._session.terminal == STOP_WALL_CLOCK
+
     async def test_no_fresh_at_the_probe_re_arms(self) -> None:
         fake = _Fake()
         fake.publish = False
