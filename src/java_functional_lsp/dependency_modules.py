@@ -26,8 +26,10 @@ while an open file has **fresh demand**:
   ``per_round`` per round, sent as **one** didChangeWorkspaceFolders event.
 * **STOP** (fixed reasons, logged and sent once to the client): ``clean``,
   ``no-candidates(none|markers-pending|owner-has-jar)``, ``budget``, ``rounds``,
-  ``wall-clock``, ``jdtls-busy``, ``no-fresh-diagnostics``. Opening a file in a module that
-  has not had demand before re-arms it, unless a session limit is exhausted.
+  ``wall-clock``, ``refresh-cap``, ``jdtls-busy``, ``no-fresh-diagnostics``. Opening a file
+  in a module that has not had demand before re-arms it, unless a session limit is
+  exhausted. A phase that stops ``jdtls-busy`` / ``no-fresh-diagnostics`` before importing
+  anything un-arms its modules, so their next demand publish tries again.
 
 Everything is asyncio-only (no locks). Side effects are callables, and every wait is a
 constructor parameter, so the state machine is unit-testable without jdtls.
@@ -39,6 +41,7 @@ import asyncio
 import json
 import logging
 import os
+import tempfile
 import time
 from collections.abc import Awaitable, Callable, Coroutine, Iterable, Mapping
 from dataclasses import dataclass, field
@@ -61,7 +64,9 @@ MAX_ROUNDS = 20
 PER_ROUND = 8
 WALL_CLOCK_SEC = 300.0
 REFRESHES_PER_ROUND = 3
-REFRESHES_PER_SESSION = 20
+#: Refreshes per session, per allowed round (the probe counts as one), retries included: the
+#: default cap is ``REFRESHES_PER_ROUND * (rounds + 1) * 2``, so the rounds limit fires first.
+REFRESH_RETRY_FACTOR = 2
 IDLE_QUIET_SEC = 10.0
 ROUND_TIMEOUT_SEC = 90.0
 REFRESH_TIMEOUT_SEC = 20.0
@@ -86,7 +91,7 @@ STOP_ROUNDS = "rounds"
 STOP_WALL_CLOCK = "wall-clock"
 STOP_BUSY = "jdtls-busy"
 STOP_NO_FRESH = "no-fresh-diagnostics"
-STOP_DISABLED = "disabled"
+STOP_REFRESHES = "refresh-cap"
 STOP_REASONS = (
     STOP_CLEAN,
     STOP_NO_CANDIDATES_NONE,
@@ -97,10 +102,12 @@ STOP_REASONS = (
     STOP_WALL_CLOCK,
     STOP_BUSY,
     STOP_NO_FRESH,
-    STOP_DISABLED,
+    STOP_REFRESHES,
 )
 #: Session limits: once hit, later demand stops at once with the same reason.
-_TERMINAL = frozenset({STOP_BUDGET, STOP_ROUNDS, STOP_WALL_CLOCK})
+_TERMINAL = frozenset({STOP_BUDGET, STOP_ROUNDS, STOP_WALL_CLOCK, STOP_REFRESHES})
+#: Stops before any import that un-arm the phase's modules (the next demand tries again).
+_RETRYABLE = frozenset({STOP_BUSY, STOP_NO_FRESH})
 _WARN_STOPS = frozenset({STOP_BUSY, STOP_NO_FRESH})
 _STOP_HINTS = {
     STOP_NO_CANDIDATES_JAR: "an installed jar may be stale; see the README (troubleshooting)",
@@ -108,6 +115,7 @@ _STOP_HINTS = {
     STOP_ROUNDS: f"raise {ENV_ROUNDS} (max {MAX_ROUNDS})",
     STOP_BUSY: "jdtls stayed busy; errors may clear later",
     STOP_NO_FRESH: "jdtls did not re-validate the open file",
+    STOP_REFRESHES: "the session's diagnostics-refresh cap is spent; restart the server to try again",
 }
 
 # --- Demand classification (#110-class errors) -------------------------------------------
@@ -176,7 +184,8 @@ def _env_knob(env_name: str, default: int, hard_max: int, raw: str) -> int:
 def _config_knob(config_key: str, env_name: str, default: int, raw: object) -> int:
     value = _parse_int(raw)
     if value is None:
-        logger.warning("jdtls: invalid jdtls.%s %r, using default %d", config_key, raw, default)
+        # Repository-controlled: cap what reaches the log.
+        logger.warning("jdtls: invalid jdtls.%s %s, using default %d", config_key, repr(raw)[:80], default)
         return default
     if value > default:
         logger.warning(
@@ -290,6 +299,9 @@ class BuildIdle:
     idle. One timer: every relevant event re-arms the same ``call_later`` handle.
     """
 
+    #: Bound on open progress ids (the oldest is dropped; any open id keeps jdtls busy).
+    MAX_OPEN = 256
+
     def __init__(self, quiet: float = IDLE_QUIET_SEC, clock: Callable[[], float] = time.monotonic) -> None:
         self.quiet = quiet
         self._clock = clock
@@ -316,6 +328,8 @@ class BuildIdle:
         if complete:
             self._open.pop(task_id, None)
         else:
+            if task_id not in self._open and len(self._open) >= self.MAX_OPEN:
+                self._open.pop(next(iter(self._open)))
             self._open[task_id] = str(params.get("task"))[:100]
         self._arm()
 
@@ -380,8 +394,15 @@ class Limits:
     per_round: int = PER_ROUND
     wall_clock: float = WALL_CLOCK_SEC
     refreshes_per_round: int = REFRESHES_PER_ROUND
-    refreshes_per_session: int = REFRESHES_PER_SESSION
+    #: None: ``refreshes_per_round * (rounds + 1) * REFRESH_RETRY_FACTOR``.
+    refreshes_per_session: int | None = None
     hub_fan_in: int = HUB_FAN_IN
+
+    @property
+    def refresh_cap(self) -> int:
+        if self.refreshes_per_session is not None:
+            return self.refreshes_per_session
+        return self.refreshes_per_round * (self.rounds + 1) * REFRESH_RETRY_FACTOR
 
 
 @dataclass
@@ -407,6 +428,8 @@ class _Session:
     #: The current phase: when its round-1 import was sent, and refresh time since then.
     phase_start: float | None = None
     phase_refresh: float = 0.0
+    #: Time spent in refreshes, whole session (reported; not import time).
+    refresh_time: float = 0.0
     terminal: str | None = None
     last_stop: str | None = None
     stops: int = 0
@@ -567,7 +590,9 @@ class DependencyModules:
             return
         self._armed.add(module)
         self._pending_modules.append(module)
-        self._kick()
+        if not self._kick():  # nothing scheduled (no running loop): do not keep it armed
+            self._armed.discard(module)
+            self._pending_modules.remove(module)
 
     # --- helpers ---
 
@@ -596,17 +621,16 @@ class DependencyModules:
         task.add_done_callback(self._tasks.discard)
         return task
 
-    def _kick(self) -> None:
+    def _kick(self) -> bool:
+        """Make sure a runner will pick up ``_pending_modules``; False when none can be scheduled."""
         if self.running:
-            return
+            return True
         self._runner = self._spawn(self._run())
+        return self._runner is not None
 
     async def _index_for(self, module_dir: Path) -> ReactorIndex | None:
         """Reactor index for *module_dir*, built once per reactor root (single flight)."""
-        root = self._roots.get(module_dir)
-        if root is None:
-            root = self._reactor_root_for(module_dir)
-            self._roots[module_dir] = root
+        root = self._root_of(module_dir)
         task = self._indexes.get(root)
         if task is None:
             task = asyncio.get_running_loop().create_task(self._build_index(root))
@@ -638,12 +662,24 @@ class DependencyModules:
     def _save_record(self) -> None:
         if self._record_path is None:
             return
+        tmp: str | None = None
         try:
-            tmp = self._record_path.with_name(self._record_path.name + ".tmp")
-            tmp.write_text(json.dumps({"schema": 1, "modules": self._session.record}))
+            # A fresh, exclusively created temp file (never a predictable, followable name).
+            with tempfile.NamedTemporaryFile(
+                "w", dir=self._record_path.parent, prefix=self._record_path.name + ".", suffix=".tmp", delete=False
+            ) as f:
+                tmp = f.name
+                f.write(json.dumps({"schema": 1, "modules": self._session.record}))
             os.replace(tmp, self._record_path)
+            tmp = None
         except OSError as e:
             logger.debug("jdtls: could not write the dependency-module record: %s", e)
+        finally:
+            if tmp is not None:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
 
     def _demand_files(self, modules: Iterable[Path] | None) -> list[str]:
         """Open files with (latest) demand, most recently opened first, at most the per-round cap."""
@@ -667,7 +703,8 @@ class DependencyModules:
 
     async def _refresh(self, uris: list[str]) -> dict[str, tuple[str, bool]] | None:
         """Refresh *uris* one at a time. uri_key → (uri, fresh demand), or None when jdtls did not
-        re-validate a file (after one retry) or the session's refresh cap is reached."""
+        re-validate a file (after one retry) or the session's refresh cap is reached (then the
+        session is terminal: ``STOP_REFRESHES``)."""
         result: dict[str, tuple[str, bool]] = {}
         if self._send_refresh is None:
             return None
@@ -682,8 +719,9 @@ class DependencyModules:
         assert self._send_refresh is not None
         key = self._uri_key(uri)
         for attempt in range(2):
-            if self._session.refreshes >= self.limits.refreshes_per_session:
-                logger.info("jdtls: dependency refresh cap (%d per session) reached", self.limits.refreshes_per_session)
+            if self._session.refreshes >= self.limits.refresh_cap:
+                logger.info("jdtls: dependency refresh cap (%d per session) reached", self.limits.refresh_cap)
+                self._session.terminal = STOP_REFRESHES
                 return None
             self._session.refreshes += 1
             self._window[key] = None
@@ -700,8 +738,10 @@ class DependencyModules:
             finally:
                 self._window.pop(key, None)
                 self._window_uri.pop(key, None)
+                took = self._clock() - started
+                self._session.refresh_time += took
                 if self._session.phase_start is not None:
-                    self._session.phase_refresh += self._clock() - started
+                    self._session.phase_refresh += took
             seen = self._closed.pop(key, None)
             if answered and seen is not None and seen.digest is not None and seen.digest == self._safe_digest(uri):
                 self._latest[key] = seen.demand
@@ -714,21 +754,46 @@ class DependencyModules:
     # --- the round loop ---
 
     async def _run(self) -> None:
+        # A module armed while a phase runs is only queued (the runner exists): this loop
+        # gives it its own phase after the current one.
+        while self._pending_modules:
+            new = self._take_phase()
+            try:
+                reason = await self._process(new)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.warning("jdtls: dependency-module import failed", exc_info=True)
+                self._close_phase()
+                self._armed.difference_update(new)  # the next demand publish tries again
+                continue
+            imported = self._session.phase_start is not None
+            self._close_phase()
+            if reason in _RETRYABLE and not imported:
+                self._armed.difference_update(new)
+            self._stop(reason)
+
+    def _take_phase(self) -> list[Path]:
+        """The pending modules of one reactor root (the first pending one's); the rest stay queued."""
+        first = self._pending_modules[0]
         try:
-            while self._pending_modules:
-                new, self._pending_modules = self._pending_modules, []
-                try:
-                    reason = await self._process(new)
-                finally:
-                    self._close_phase()
-                self._stop(reason)
-        except asyncio.CancelledError:
-            raise
+            root = self._root_of(first)
+            phase = [m for m in self._pending_modules if self._root_of(m) == root]
         except Exception:
-            logger.warning("jdtls: dependency-module import failed", exc_info=True)
+            logger.debug("jdtls: reactor root lookup failed", exc_info=True)
+            phase = [first]
+        self._pending_modules = [m for m in self._pending_modules if m not in phase]
+        return phase
+
+    def _root_of(self, module_dir: Path) -> Path:
+        root = self._roots.get(module_dir)
+        if root is None:
+            root = self._reactor_root_for(module_dir)
+            self._roots[module_dir] = root
+        return root
 
     async def _process(self, new_modules: list[Path]) -> str:
-        """Probe the newly armed modules, then run rounds until a STOP reason."""
+        """Probe the newly armed modules (one reactor root), then run rounds until a STOP reason."""
         if self._session.terminal is not None:
             return self._session.terminal
         armed_at = self._clock()
@@ -736,7 +801,7 @@ class DependencyModules:
             return STOP_BUSY
         fresh = await self._refresh(self._demand_files(new_modules))
         if fresh is None:
-            return STOP_NO_FRESH
+            return self._session.terminal or STOP_NO_FRESH
         demand = [uri for uri, d in fresh.values() if d]
         waiting: dict[Path, int] = dict.fromkeys(new_modules, 0)
         wait_start = armed_at
@@ -795,7 +860,7 @@ class DependencyModules:
         fresh = await self._refresh(files)
         if fresh is None:
             log("failed", demand)
-            return STOP_NO_FRESH
+            return self._session.terminal or STOP_NO_FRESH
         still = [uri for uri, d in fresh.values() if d]
         log("errors" if still else "clean", still)
         return still, waiting, sent_at
@@ -805,7 +870,7 @@ class DependencyModules:
             return STOP_BUDGET
         if self._session.rounds >= self.limits.rounds:
             return STOP_ROUNDS
-        # The wall clock starts at the session's first import.
+        # Import time summed over phases (round-1 import to STOP, minus refreshes); see _import_time.
         if self._session.rounds and self._import_time() >= self.limits.wall_clock:
             return STOP_WALL_CLOCK
         return None
@@ -837,6 +902,7 @@ class DependencyModules:
                 demand_modules[module] = demand_modules.get(module, False) or _is_test_source(path)
         if not demand_modules:
             return [], 0, None
+        # One phase is one reactor root (_take_phase), so the first module's index covers all.
         index = await self._index_for(next(iter(demand_modules)))
         if index is None:
             return [], 0, None
@@ -916,14 +982,15 @@ class DependencyModules:
 
     def _stop(self, reason: str) -> None:
         session = self._session
-        repeated = reason == session.last_stop and reason in _TERMINAL
+        # A repeated session limit, or the same jdtls-busy / no-fresh warning again: log at DEBUG only.
+        repeated = reason == session.last_stop and (reason in _TERMINAL or reason in _WARN_STOPS)
         session.last_stop = reason
         session.stops += 1
         import_sec = self._import_time()
         text = (
             f"dependency-module import stopped ({reason}): rounds {session.rounds}/{self.limits.rounds}, "
             f"imported {self.used}/{self.limits.budget}, import time {import_sec:.0f}s, "
-            f"refreshes {session.refreshes}"
+            f"refreshes {session.refreshes} ({session.refresh_time:.0f}s)"
         )
         hint = _STOP_HINTS.get(reason)
         if hint:
@@ -942,11 +1009,12 @@ class DependencyModules:
         if not session.rounds and not session.stops:
             return
         logger.info(
-            "jdtls: dependency-module session: rounds %d, imported %d/%d, refreshes %d, stops %d, last stop %s",
+            "jdtls: dependency-module session: rounds %d, imported %d/%d, refreshes %d (%.1fs), stops %d, last stop %s",
             session.rounds,
             self.used,
             self.limits.budget,
             session.refreshes,
+            session.refresh_time,
             session.stops,
             session.last_stop or "-",
         )

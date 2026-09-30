@@ -397,3 +397,13 @@ class TestMissingMarkers:
             Marker("com.example:base", test_jar=True),
             Marker("com.example:native"),
         ]
+
+    def test_truncated_coordinates_never_raise(self) -> None:
+        from java_functional_lsp.reactor import Marker, parse_missing_markers
+
+        # One token after g:a: (no version) used to raise "not enough values to unpack"
+        # inside the jdtls reader loop.
+        assert parse_missing_markers(["Missing artifact g:a:jar", "Missing artifact g:t:test-jar"]) == [
+            Marker("g:a"),
+            Marker("g:t", test_jar=True),
+        ]

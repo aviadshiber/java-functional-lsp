@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import logging
+import os
 import signal
 import sys
 import time
@@ -45,8 +47,11 @@ while True:
     msg = read()
     if msg is None or msg.get("method") == "exit":
         sys.exit(0)
-    if msg.get("method") == "shutdown":
-        body = json.dumps({"jsonrpc": "2.0", "id": msg["id"], "result": None}).encode()
+    if msg.get("method") in ("shutdown", "error/please"):
+        reply = {"jsonrpc": "2.0", "id": msg["id"], "result": None}
+        if msg["method"] == "error/please":
+            reply = {"jsonrpc": "2.0", "id": msg["id"], "error": {"code": -32603, "message": "nope"}}
+        body = json.dumps(reply).encode()
         sys.stdout.buffer.write(b"Content-Length: %d\r\n\r\n" % len(body) + body)
         sys.stdout.buffer.flush()
 """
@@ -109,6 +114,7 @@ class TestServerShutdown:
     def _exits(self, monkeypatch: pytest.MonkeyPatch) -> list[int]:
         codes: list[int] = []
         monkeypatch.setattr(server_mod, "_hard_exit", codes.append)
+        monkeypatch.setattr(server_mod, "_watchdog_exit", codes.append)
         self.codes = codes
         return codes
 
@@ -155,12 +161,14 @@ class TestServerShutdown:
 
     async def test_first_signal_stops_then_exits_second_exits_at_once(self, monkeypatch: pytest.MonkeyPatch) -> None:
         timers: list[tuple[float, Any]] = []
+        timers_fns: list[Any] = []
 
         class FakeTimer:
             daemon = False
 
             def __init__(self, interval: float, fn: Any, args: tuple[Any, ...]) -> None:
                 timers.append((interval, args))
+                timers_fns.append(fn)
 
             def start(self) -> None:
                 pass
@@ -171,6 +179,7 @@ class TestServerShutdown:
         monkeypatch.setattr(server_mod.server._proxy, "stop", stop)
         server_mod._on_signal(signal.SIGTERM)
         assert timers == [(server_mod._SIGNAL_WATCHDOG_SEC, (143,))]  # the hard 5 s watchdog
+        assert timers_fns == [server_mod._watchdog_exit]  # never logging.shutdown() from the watchdog
         await asyncio.sleep(0.05)
         stop.assert_awaited_once()
         assert self.codes == [143]
@@ -247,7 +256,117 @@ class TestProxyPlumbing:
         try:
             assert await proxy._request("shutdown", None, timeout=5.0) == (True, None)
             assert await proxy._request("other/unanswered", None, timeout=0.2) == (False, None)
+            # A JSON-RPC error response: not answered, and send_request still returns None.
+            assert await proxy._request("error/please", None, timeout=5.0) == (False, None)
+            assert await proxy.send_request("error/please", None, timeout=5.0) is None
             assert proxy._pending == {}
         finally:
             await proxy.stop()
         assert proc.returncode is not None
+
+    async def test_refresh_is_not_answered_by_an_error(self) -> None:
+        proxy, _proc = await _proxy_with(_FAKE_JDTLS)
+        try:
+
+            async def error_request(method: str, params: Any, timeout: float = 0, on_response: Any = None) -> Any:
+                return await JdtlsProxy._request(proxy, "error/please", params, timeout, on_response)
+
+            proxy._request = error_request  # type: ignore[method-assign]
+            assert await proxy._refresh_file_diagnostics("file:///x/A.java") is False
+        finally:
+            await proxy.stop()
+
+    @pytest.mark.timeout(20)
+    async def test_request_pending_during_stop_is_not_answered(self) -> None:
+        proxy, _proc = await _proxy_with(_FAKE_JDTLS)
+        pending = asyncio.create_task(proxy._request("other/unanswered", None, timeout=30.0))
+        await asyncio.sleep(0.1)
+        await proxy.stop()
+        assert await asyncio.wait_for(pending, timeout=5.0) == (False, None)
+
+    def test_odd_pom_diagnostic_never_breaks_the_reader(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        proxy = JdtlsProxy()
+
+        def boom(*_a: Any) -> None:
+            raise RuntimeError("boom")
+
+        monkeypatch.setattr(proxy.dependency_modules, "note_pom", boom)
+        monkeypatch.setattr(proxy.dependency_modules, "note_publish", boom)
+        monkeypatch.setattr(proxy.dependency_modules.idle, "note_progress", boom)
+        err = {"severity": 1, "message": "Missing artifact g:a:jar"}
+        for uri in ("file:///r/pom.xml", "file:///r/A.java"):
+            proxy._handle_notification(
+                {"method": "textDocument/publishDiagnostics", "params": {"uri": uri, "diagnostics": [err]}}
+            )
+        proxy._handle_notification({"method": "language/progressReport", "params": {"id": "x"}})
+
+
+def _frame(msg: dict[str, Any]) -> bytes:
+    body = json.dumps(msg).encode()
+    return b"Content-Length: %d\r\n\r\n" % len(body) + body
+
+
+async def _read_frame(stdout: asyncio.StreamReader) -> dict[str, Any]:
+    length = 0
+    while True:
+        line = (await stdout.readline()).strip()
+        if not line:
+            break
+        name, _, value = line.decode().partition(":")
+        if name.strip().lower() == "content-length":
+            length = int(value)
+    parsed: dict[str, Any] = json.loads(await stdout.readexactly(length))
+    return parsed
+
+
+class TestServerProcessExit:
+    """A real ``python -m java_functional_lsp`` process (jdtls off): pygls 2.x awaits the user
+    SHUTDOWN/EXIT handlers, and EXIT ends the process without hanging on the stdin reader."""
+
+    async def _server(self) -> asyncio.subprocess.Process:
+        env = {**os.environ, "JAVA_FUNCTIONAL_LSP_JDTLS": "off"}
+        proc = await asyncio.create_subprocess_exec(
+            sys.executable,
+            "-m",
+            "java_functional_lsp",
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+            env=env,
+        )
+        assert proc.stdin is not None
+        assert proc.stdout is not None
+        init = {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"processId": None, "capabilities": {}}}
+        proc.stdin.write(_frame(init))
+        await proc.stdin.drain()
+        while (await asyncio.wait_for(_read_frame(proc.stdout), timeout=15.0)).get("id") != 1:
+            pass
+        proc.stdin.write(_frame({"jsonrpc": "2.0", "method": "initialized", "params": {}}))
+        return proc
+
+    async def _exit(self, proc: asyncio.subprocess.Process) -> int:
+        assert proc.stdin is not None
+        proc.stdin.write(_frame({"jsonrpc": "2.0", "method": "exit"}))
+        await proc.stdin.drain()
+        try:
+            return await asyncio.wait_for(proc.wait(), timeout=10.0)
+        finally:
+            if proc.returncode is None:
+                proc.kill()
+                await proc.wait()
+
+    @pytest.mark.timeout(40)
+    async def test_shutdown_then_exit_exits_0(self) -> None:
+        proc = await self._server()
+        assert proc.stdin is not None
+        assert proc.stdout is not None
+        proc.stdin.write(_frame({"jsonrpc": "2.0", "id": 2, "method": "shutdown"}))
+        await proc.stdin.drain()
+        while (await asyncio.wait_for(_read_frame(proc.stdout), timeout=15.0)).get("id") != 2:
+            pass
+        assert await self._exit(proc) == 0
+
+    @pytest.mark.timeout(40)
+    async def test_exit_without_shutdown_exits_1(self) -> None:
+        proc = await self._server()
+        assert await self._exit(proc) == 1

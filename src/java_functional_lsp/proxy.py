@@ -1665,12 +1665,19 @@ class JdtlsProxy:
             self._diagnostics_cache[self._uri_key(uri)] = diagnostics
             if self._on_diagnostics:
                 self._on_diagnostics(uri, diagnostics)
-            if isinstance(uri, str) and uri.endswith("/pom.xml"):
-                self._note_pom_diagnostics(uri, diagnostics)
-            elif isinstance(uri, str) and uri.endswith(".java"):
-                self.dependency_modules.note_publish(uri, diagnostics)
+            # The dependency-module bookkeeping must never tear down the reader loop.
+            try:
+                if isinstance(uri, str) and uri.endswith("/pom.xml"):
+                    self._note_pom_diagnostics(uri, diagnostics)
+                elif isinstance(uri, str) and uri.endswith(".java"):
+                    self.dependency_modules.note_publish(uri, diagnostics)
+            except Exception:
+                logger.warning("jdtls: dependency-module bookkeeping failed for a publish", exc_info=True)
         elif method == "language/progressReport":
-            self.dependency_modules.idle.note_progress(params)
+            try:
+                self.dependency_modules.idle.note_progress(params)
+            except Exception:
+                logger.warning("jdtls: build-idle bookkeeping failed", exc_info=True)
         elif method == "window/logMessage" and isinstance(params, dict):
             msg_type = params.get("type")
             level = _LOG_MESSAGE_LEVELS.get(msg_type, logging.DEBUG) if isinstance(msg_type, int) else logging.DEBUG

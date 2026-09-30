@@ -379,9 +379,11 @@ def parse_missing_markers(messages: tuple[str, ...] | list[str]) -> list[Marker]
         match = _MISSING_ARTIFACT_RE.search(message)
         if not match:
             continue
-        # "<type>:<version>" or "<type>:<classifier>:<version>"
-        dep_type, *middle, _version = match.group(3).split(":")
-        classifier = middle[0] if middle else None
+        # "<type>:<version>" or "<type>:<classifier>:<version>"; tolerate a truncated message
+        # ("g:a:jar"): a pom diagnostic must never raise inside the jdtls reader loop.
+        parts = match.group(3).split(":")
+        dep_type = parts[0]
+        classifier = parts[1] if len(parts) > 2 else None  # noqa: PLR2004 (type:classifier:version)
         marker = Marker(f"{match.group(1)}:{match.group(2)}", dep_type == "test-jar" or classifier == "tests")
         if marker not in result:
             result.append(marker)

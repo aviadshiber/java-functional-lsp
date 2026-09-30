@@ -12,6 +12,7 @@ import asyncio
 import json
 import logging
 import os
+import time
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -34,6 +35,7 @@ from java_functional_lsp.dependency_modules import (
     STOP_NO_CANDIDATES_NONE,
     STOP_NO_FRESH,
     STOP_REASONS,
+    STOP_REFRESHES,
     STOP_ROUNDS,
     STOP_WALL_CLOCK,
     BuildIdle,
@@ -53,6 +55,12 @@ from java_functional_lsp.reactor import Dependency, Marker, ReactorIndex
 
 
 class TestKnobs:
+    def test_repo_config_value_is_truncated_in_the_log(self, caplog: pytest.LogCaptureFixture) -> None:
+        with caplog.at_level(logging.WARNING, logger="java_functional_lsp.dependency_modules"):
+            assert resolve_budget({"jdtls": {"dependencyModules": "x" * 10_000}}, {}) == DEFAULT_BUDGET
+        assert "invalid jdtls.dependencyModules" in caplog.text
+        assert len(caplog.records[0].getMessage()) < 200
+
     def test_defaults(self) -> None:
         assert resolve_budget({}, {}) == DEFAULT_BUDGET == 30
         assert resolve_rounds({}, {}) == DEFAULT_ROUNDS == 6
@@ -198,17 +206,19 @@ class TestBuildIdle:
     async def test_since_extends_the_window(self) -> None:
         idle = BuildIdle(quiet=0.05)
         await idle.wait(None, timeout=1.0)
-        loop = asyncio.get_running_loop()
-        since = time_now = loop.time()
-        del time_now
         assert idle.is_idle()
-        import time as _time
+        since = time.monotonic()
+        assert not idle.is_idle(since)  # idle, but not for *quiet* seconds after *since*
+        assert await idle.wait(since, timeout=1.0)
+        assert time.monotonic() - since >= 0.05
 
-        assert not idle.is_idle(_time.monotonic())
-        started = loop.time()
-        assert await idle.wait(_time.monotonic(), timeout=1.0)
-        assert loop.time() - started >= 0.04
-        assert since
+    def test_open_ids_are_bounded(self) -> None:
+        idle = BuildIdle(quiet=10.0)
+        for i in range(BuildIdle.MAX_OPEN + 50):
+            idle.note_progress(_progress(str(i)))
+        assert idle.open_tasks == BuildIdle.MAX_OPEN
+        assert "0" not in idle._open  # the oldest were dropped
+        assert not idle.is_idle()
 
     async def test_single_timer(self) -> None:
         idle = BuildIdle(quiet=10.0)
@@ -454,7 +464,7 @@ class TestStopReasons:
             "wall-clock",
             "jdtls-busy",
             "no-fresh-diagnostics",
-            "disabled",
+            "refresh-cap",
         }
 
     async def test_no_candidates_none(self) -> None:
@@ -507,6 +517,28 @@ class TestStopReasons:
         assert len(fake.refreshed) == refreshes
         assert len(fake.notified) == 1  # a repeated session-limit stop is not re-announced
 
+    async def test_budget_cuts_a_round_short(self) -> None:
+        index = _index((Dependency("g:x"), Dependency("g:y"), Dependency("g:hub")))
+        extra = f"file://{OWNER}/src/main/java/O.java"
+        fake = _Fake(
+            index=index,
+            needed={"g:x", "g:y", "g:hub"},
+            limits=Limits(budget=2, per_round=8),
+            open_files=[MAIN_FILE, extra],
+            markers={},
+        )
+        fake.digest = dict.fromkeys(fake.open, "d1")
+        fake.start(pom_markers=[Marker("g:x"), Marker("g:y"), Marker("g:hub")])
+        await fake.settle()
+        assert fake.sent == [["g:x", "g:y"]]  # 3 candidates, only 2 left in the budget
+        assert fake.deps.used == fake.deps.budget == 2
+        assert fake.deps.last_stop == STOP_BUDGET
+        refreshes = len(fake.refreshed)
+        fake.deps.note_publish(extra, DEMAND)
+        await fake.settle()
+        assert fake.deps.last_stop == STOP_BUDGET
+        assert len(fake.refreshed) == refreshes
+
     async def test_rounds(self) -> None:
         fake = _Fake(limits=Limits(rounds=1))
         fake.start()
@@ -555,6 +587,35 @@ class TestStopReasons:
         await fake.settle()
         assert fake.refreshed == []
         assert fake.deps.last_stop == STOP_BUSY
+        # Nothing was imported: the module is un-armed, so its next demand publish tries again.
+        assert fake.deps._armed == set()
+        fake.deps.idle.note_progress(_progress("build", complete=True))
+        fake.deps.note_publish(MAIN_FILE, DEMAND)
+        await fake.settle()
+        assert fake.sent == [["g:mid"], ["g:owner"]]
+        assert fake.deps.last_stop == STOP_CLEAN
+
+    async def test_repeated_busy_is_announced_once(self) -> None:
+        fake = _Fake(timing=Timing(idle_quiet=0.01, round_timeout=0.03, refresh_backoff=0.01, marker_wait=0.1))
+        fake.deps.idle.note_progress(_progress("build"))  # never completes
+        for _ in range(3):
+            fake.start()
+            await fake.settle()
+        assert fake.deps.last_stop == STOP_BUSY
+        assert len(fake.notified) == 1
+
+    async def test_no_fresh_at_the_probe_re_arms(self) -> None:
+        fake = _Fake()
+        fake.publish = False
+        fake.start()
+        await fake.settle()
+        assert fake.deps.last_stop == STOP_NO_FRESH
+        assert fake.deps._armed == set()
+        fake.publish = True
+        fake.start()
+        await fake.settle()
+        assert fake.sent == [["g:mid"], ["g:owner"]]
+        assert fake.deps.last_stop == STOP_CLEAN
 
     async def test_busy_after_an_import(self) -> None:
         fake = _Fake(timing=Timing(idle_quiet=0.01, round_timeout=0.1, refresh_backoff=0.01, marker_wait=0.1))
@@ -603,6 +664,101 @@ class TestStopReasons:
         fake.start()
         await fake.settle()
         assert fake.deps.last_stop == STOP_CLEAN
+
+    async def test_demand_during_a_phase_gets_its_own_phase(self, caplog: pytest.LogCaptureFixture) -> None:
+        other = f"file://{X}/src/main/java/X.java"
+        index = _index()
+        index.dependencies[X] = (Dependency("g:y"),)
+        fake = _Fake(index=index, needed={"g:mid"}, open_files=[MAIN_FILE, other], markers={})
+        fake.digest = dict.fromkeys(fake.open, "d1")
+
+        def second_file_demands(uri: str) -> None:
+            if uri == MAIN_FILE and fake.imported == ["g:mid"] and not fake.deps._pending_modules:
+                assert fake.deps.running  # round 1 is in flight: X is only queued
+                fake.deps.note_pom(X / "pom.xml", [Marker("g:y")])
+                fake.deps.note_publish(other, DEMAND)
+
+        fake.on_refresh = second_file_demands
+        with caplog.at_level(logging.INFO, logger="java_functional_lsp.dependency_modules"):
+            fake.start()
+            await fake.settle()
+        # X had its own phase after phase 1 stopped: its probe refresh (clean here).
+        assert fake.refreshed == [MAIN_FILE, MAIN_FILE, other]
+        assert fake.sent == [["g:mid"]]
+        stops = [r.getMessage() for r in caplog.records if "import stopped" in r.getMessage()]
+        assert len(stops) == 2
+
+    async def test_extra_quiet_window_catches_a_late_marker(self) -> None:
+        timing = Timing(idle_quiet=0.2, round_timeout=2.0, refresh_backoff=0.01, marker_wait=0.05)
+        fake = _Fake(needed={"g:mid"}, timing=timing, markers={})
+        fake.start(pom_markers=[])  # the pom published, but no marker yet
+
+        def late_marker(_uri: str) -> None:
+            if not fake.imported:  # the probe: m2e reports mid missing within the extra window
+                loop = asyncio.get_running_loop()
+                loop.call_later(0.1, fake.deps.note_pom, TARGET / "pom.xml", [Marker("g:mid")])
+
+        fake.on_refresh = late_marker
+        await fake.settle()
+        assert fake.sent == [["g:mid"]]
+        assert fake.deps.last_stop == STOP_CLEAN
+
+    async def test_failing_phase_is_contained_and_re_arms(self, caplog: pytest.LogCaptureFixture) -> None:
+        fake = _Fake(needed={"g:mid"})
+        original = fake._send
+        fail = True
+
+        async def broken_send(added: list[dict[str, str]], removed: list[dict[str, str]]) -> None:
+            if fail:
+                raise RuntimeError("boom")
+            await original(added, removed)
+
+        fake.deps._send_folders = broken_send
+        with caplog.at_level(logging.WARNING, logger="java_functional_lsp.dependency_modules"):
+            fake.start()
+            await fake.settle()
+        assert not fake.deps.running
+        assert "dependency-module import failed" in caplog.text
+        assert fake.deps._armed == set()  # the same module's next demand tries again
+        fail = False
+        fake.deps.registry.clear()
+        fake.deps._session.record.clear()
+        fake.start()
+        await fake.settle()
+        assert fake.sent == [["g:mid"]]
+        assert fake.deps.last_stop == STOP_CLEAN
+
+    async def test_failing_phase_keeps_the_queue(self) -> None:
+        other = f"file://{X}/src/main/java/X.java"
+        index = _index(())
+        index.dependencies[X] = (Dependency("g:y"),)
+        fake = _Fake(index=index, needed={"g:y"}, open_files=[MAIN_FILE, other], markers={})
+        fake.digest = dict.fromkeys(fake.open, "d1")
+        original = fake._refresh
+
+        async def refresh(uri: str, on_response: Callable[[], None]) -> bool:
+            if uri == MAIN_FILE:
+                fake.deps.note_pom(X / "pom.xml", [Marker("g:y")])
+                fake.deps.note_publish(other, DEMAND)  # queued while the first phase runs
+                raise RuntimeError("boom")
+            return await original(uri, on_response)
+
+        fake.deps._send_refresh = refresh
+        fake.start()
+        await fake.settle()
+        assert fake.sent == [["g:y"]]  # the queued module still got its phase
+        assert fake.deps.last_stop == STOP_CLEAN
+
+    async def test_one_phase_is_one_reactor_root(self) -> None:
+        other_root = Path("/other")
+        roots = {X: other_root}
+        fake = _Fake()
+        fake.deps._reactor_root_for = lambda d: roots.get(d, ROOT)
+        fake.deps._pending_modules = [TARGET, X, MID]
+        assert fake.deps._take_phase() == [TARGET, MID]
+        assert fake.deps._pending_modules == [X]
+        assert fake.deps._take_phase() == [X]
+        assert fake.deps._pending_modules == []
 
     async def test_disabled_does_nothing(self) -> None:
         fake = _Fake(limits=Limits(budget=0))
@@ -725,11 +881,27 @@ class TestFreshness:
         assert fake.max_inflight == 1
 
     async def test_refresh_cap_per_session(self) -> None:
-        fake = _Fake(limits=Limits(refreshes_per_session=1))
+        other = f"file://{X}/src/main/java/X.java"
+        fake = _Fake(limits=Limits(refreshes_per_session=1), open_files=[MAIN_FILE, other])
+        fake.digest = dict.fromkeys(fake.open, "d1")
         fake.start()
         await fake.settle()
         assert fake.refreshed == [MAIN_FILE]
-        assert fake.deps.last_stop == STOP_NO_FRESH
+        # A session limit, not "jdtls did not re-validate the file".
+        assert fake.deps.last_stop == STOP_REFRESHES
+        assert "refresh cap" in fake.notified[0] or "refresh-cap" in fake.notified[0]
+        fake.deps.note_publish(other, DEMAND)  # a new module: stops at once, not re-announced
+        await fake.settle()
+        assert fake.deps.last_stop == STOP_REFRESHES
+        assert fake.refreshed == [MAIN_FILE]
+        assert len(fake.notified) == 1
+
+    def test_default_refresh_cap_lets_the_rounds_limit_fire_first(self) -> None:
+        limits = Limits()
+        # The probe plus every round, each with 3 files and one retry.
+        assert limits.refresh_cap == 3 * (DEFAULT_ROUNDS + 1) * 2
+        assert Limits(rounds=20).refresh_cap == 3 * 21 * 2
+        assert Limits(refreshes_per_session=5).refresh_cap == 5
 
     async def test_closed_files_do_not_arm(self) -> None:
         fake = _Fake(open_files=[])
@@ -758,6 +930,17 @@ class TestRecord:
         assert [m["ga"] for m in saved] == ["g:mid", "g:owner"]
         assert saved[0]["path"] == str(MID)
         assert fake.deps.used == len(saved) == 2
+
+    def test_record_write_leaves_no_temp_file_and_ignores_a_planted_name(self, tmp_path: Path) -> None:
+        record = tmp_path / "abc.deps.json"
+        victim = tmp_path / "victim"
+        victim.write_text("keep")
+        (tmp_path / "abc.deps.json.tmp").symlink_to(victim)  # v0.14.1's predictable temp name
+        fake = _Fake()
+        fake.deps.begin_session(record)
+        assert json.loads(record.read_text()) == {"schema": 1, "modules": []}
+        assert victim.read_text() == "keep"
+        assert sorted(p.name for p in tmp_path.iterdir()) == ["abc.deps.json", "abc.deps.json.tmp", "victim"]
 
     def test_unreadable_record_is_ignored(self, tmp_path: Path) -> None:
         record = tmp_path / "x.deps.json"
@@ -791,7 +974,9 @@ class TestRecord:
         await fake.settle()
         with caplog.at_level(logging.INFO, logger="java_functional_lsp.dependency_modules"):
             fake.deps.log_summary()
-        assert "rounds 2, imported 2/30" in caplog.text
+        assert "rounds 2, imported 2/30, refreshes 3 (" in caplog.text
+        assert "s), stops 1" in caplog.text
+        assert "refreshes 3 (" in fake.notified[0]  # the refresh time is on the STOP line too
 
     async def test_round_log_names_the_imports(self, caplog: pytest.LogCaptureFixture) -> None:
         fake = _Fake()
@@ -822,6 +1007,9 @@ class TestRecord:
         fake = _Fake()
         fake.start()
         assert not fake.deps.running
+        # Nothing was scheduled, so the module is not kept armed (a later publish can arm it).
+        assert fake.deps._armed == set()
+        assert fake.deps._pending_modules == []
 
 
 class TestAggregatorsAndSymlinks:

@@ -319,7 +319,7 @@ How it works (v0.14.1):
 3. **Frontier.** The candidates come from the reactor index, which is built once per session from the modules reachable from the reactor root through `<modules>` (all profiles). They are the in-repo `<dependencies>` (compile, provided, runtime) of the demand module and of every module imported so far, including those inherited from in-repo parent poms. `dependencyManagement` is ignored. For a file under `src/test`, the demand module's test-scope and `test-jar` dependencies are included too.
 4. **Candidates = frontier ∩ m2e markers.** A frontier module is imported only if m2e reports it missing on some pom (`[Offline / ]Missing artifact g:a:type[:classifier]:version`). The marker is the proof that no installed jar resolves it. A `test-jar` edge only matches a `test-jar`/`tests` marker. Candidates keep their declaration order, and high fan-in "hub" modules go last.
 5. **One round.** Up to 8 candidates are added as **one** `didChangeWorkspaceFolders` event. The server waits for build-idle (at most 90 s) and refreshes the demand files again. If the fresh diagnostics are clean, it stops. If they are not, it runs the next round. Before deciding round k, it waits (at most 30 s) until the modules imported in round k−1 have published their own pom markers.
-6. **Stop.** Every stop is logged once and sent to the client once as a `window/logMessage`. Opening a file in a module that had no demand before starts the process again, unless a session limit (budget, rounds, wall clock) was reached.
+6. **Stop.** Every stop is logged once and sent to the client once as a `window/logMessage`. Opening a file in a module that had no demand before starts the process again, unless a session limit (budget, rounds, wall clock, refresh cap) was reached. A stop of `jdtls-busy` or `no-fresh-diagnostics` before anything was imported lets the same module try again on its next demand; the same warning twice in a row is logged at DEBUG and not sent again.
 
 If you later open a file in a group that contains one of these modules, the group folder replaces the module folder in the same workspace change. That module folder is never re-added.
 
@@ -332,7 +332,7 @@ Configuration (the repository config can only **lower** a limit; the environment
 | `JAVA_FUNCTIONAL_LSP_DEPENDENCY_ROUNDS` (environment) | `0`–`20` (default `6`) | Rounds per session |
 | `{"jdtls": {"dependencyRounds": N}}` in `.java-functional-lsp.json` | `0`–default | Lowers the rounds |
 
-The remaining limits are fixed: 8 modules per round, a 5-minute import wall clock per session (counted only while imports run: from a round-1 import to its stop, excluding refresh time and the idle time between sessions of demand), 3 refreshes per round (20 per session), a 20 s refresh timeout with one retry, and a 90 s build-idle wait per round.
+The remaining limits are fixed: 8 modules per round, a 5-minute import wall clock per session (counted only while imports run: from a round-1 import to its stop, excluding refresh time and the idle time between sessions of demand), 3 refreshes per round (a session cap of 3 × (rounds + 1) × 2, i.e. 42 with the default 6 rounds, so the rounds limit fires first), a 20 s refresh timeout with one retry, and a 90 s build-idle wait per round.
 
 Stop reasons (`jdtls: dependency-module import stopped (<reason>)`):
 
@@ -342,8 +342,8 @@ Stop reasons (`jdtls: dependency-module import stopped (<reason>)`):
 | `no-candidates(none)` | Nothing in the frontier: the errors are not caused by an unimported in-repo module |
 | `no-candidates(markers-pending)` | Frontier modules exist, but m2e has not reported them missing yet (30 s wait) |
 | `no-candidates(owner-has-jar)` | Frontier modules exist, m2e reports none of them missing: a jar in your local repository resolves them (see *stale installs* below) |
-| `budget` / `rounds` / `wall-clock` | A session limit was reached; later demand stops at once |
-| `jdtls-busy` | jdtls did not become build-idle within 90 s after an import |
+| `budget` / `rounds` / `wall-clock` / `refresh-cap` | A session limit was reached; later demand stops at once |
+| `jdtls-busy` | jdtls did not become build-idle within 90 s (before the first refresh, or after an import) |
 | `no-fresh-diagnostics` | jdtls did not answer the refresh, or did not re-publish the file, after one retry |
 
 Limits:

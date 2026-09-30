@@ -805,6 +805,12 @@ def _hard_exit(code: int) -> None:
     os._exit(code)
 
 
+def _watchdog_exit(code: int) -> None:
+    """The signal watchdog's exit: no logging.shutdown(), which could block on a handler lock
+    held by a thread stuck writing to a full stderr pipe."""
+    os._exit(code)
+
+
 async def _stop_jdtls_bounded() -> None:
     try:
         await asyncio.wait_for(server._proxy.stop(), timeout=_STOP_TIMEOUT_SEC)
@@ -843,10 +849,10 @@ def _on_signal(sig: signal.Signals) -> None:
     _signals_received += 1
     code = 128 + int(sig)
     if _signals_received > 1:
-        _hard_exit(code)  # a second signal: no more waiting
+        _watchdog_exit(code)  # a second signal: no more waiting
         return
     logger.info("received %s: stopping jdtls", sig.name)
-    watchdog = threading.Timer(_SIGNAL_WATCHDOG_SEC, _hard_exit, (code,))
+    watchdog = threading.Timer(_SIGNAL_WATCHDOG_SEC, _watchdog_exit, (code,))
     watchdog.daemon = True
     watchdog.start()
     _fire_and_forget(_stop_and_exit(code))
