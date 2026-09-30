@@ -69,6 +69,11 @@ REFRESHES_PER_ROUND = 3
 REFRESH_RETRY_FACTOR = 2
 IDLE_QUIET_SEC = 10.0
 ROUND_TIMEOUT_SEC = 90.0
+#: A busy jdtls-busy wait is retried (still waiting for build-idle) instead of stopping at once:
+#: a 95-module/127-project group build routinely outlasts one 90 s round timeout (measured on
+#: the products monorepo, v0.14.1 gate). Bounded so a build that never goes idle still stops.
+BUSY_WAIT_BUDGET_SEC = 600.0
+BUSY_WAIT_RETRIES = 6
 REFRESH_TIMEOUT_SEC = 20.0
 REFRESH_BACKOFF_SEC = 5.0
 MARKER_WAIT_SEC = 30.0
@@ -409,6 +414,8 @@ class Limits:
 class Timing:
     idle_quiet: float = IDLE_QUIET_SEC
     round_timeout: float = ROUND_TIMEOUT_SEC
+    busy_wait_budget: float = BUSY_WAIT_BUDGET_SEC
+    busy_wait_retries: int = BUSY_WAIT_RETRIES
     refresh_backoff: float = REFRESH_BACKOFF_SEC
     marker_wait: float = MARKER_WAIT_SEC
 
@@ -792,13 +799,51 @@ class DependencyModules:
             self._roots[module_dir] = root
         return root
 
+    async def _wait_idle(self, since: float | None) -> str | None:
+        """Wait for build-idle, retrying within a busy budget so a build that outlasts one round
+        timeout is not a dead end (#DEV-v0.14.2, large module groups on products).
+
+        Each attempt waits up to ``round_timeout`` for :meth:`BuildIdle.wait`. Between attempts
+        this re-checks the session's existing limits (budget/rounds/wall-clock): if one has
+        already been reached, that is latched onto ``self._session.terminal`` (mirroring
+        :meth:`_select`) and returned immediately, so the caller reports and stops on the real
+        reason instead of a generic busy timeout, and later demand for the same module short-
+        circuits via the ``terminal`` check at the top of :meth:`_process` rather than retrying
+        forever. Only once the busy budget (``timing.busy_wait_budget``) or the retry count is
+        exhausted does this give up on idle itself, returning the final ``jdtls-busy``. Returns
+        ``None`` when idle was reached.
+        """
+        deadline = self._clock() + self.timing.busy_wait_budget
+        attempt = 0
+        while True:
+            if await self.idle.wait(since, self.timing.round_timeout):
+                return None
+            attempt += 1
+            # A terminal session limit outranks an ordinary busy timeout, even on what would
+            # otherwise be the final attempt: it must latch and report the real reason (not a
+            # retryable jdtls-busy) so a re-arm does not busy-wait through the same limit again.
+            limit = self._limit_reason()
+            if limit is not None:
+                self._session.terminal = limit
+                return limit
+            if attempt >= self.timing.busy_wait_retries or self._clock() >= deadline:
+                return STOP_BUSY
+            logger.info(
+                "jdtls: still busy after %.0fs, waiting for build-idle (attempt %d/%d, up to %.0fs more)",
+                attempt * self.timing.round_timeout,
+                attempt,
+                self.timing.busy_wait_retries,
+                max(deadline - self._clock(), 0.0),
+            )
+
     async def _process(self, new_modules: list[Path]) -> str:
         """Probe the newly armed modules (one reactor root), then run rounds until a STOP reason."""
         if self._session.terminal is not None:
             return self._session.terminal
         armed_at = self._clock()
-        if not await self.idle.wait(None, self.timing.round_timeout):
-            return STOP_BUSY
+        idle_stop = await self._wait_idle(None)
+        if idle_stop is not None:
+            return idle_stop
         fresh = await self._refresh(self._demand_files(new_modules))
         if fresh is None:
             return self._session.terminal or STOP_NO_FRESH
@@ -850,9 +895,10 @@ class DependencyModules:
         def log(refresh: str, files: list[str]) -> None:
             self._log_round(files, frontier, candidates, batch, index, self._clock() - sent_at, refresh)
 
-        if not await self.idle.wait(sent_at, self.timing.round_timeout):
-            log("skipped (busy)", demand)
-            return STOP_BUSY
+        idle_stop = await self._wait_idle(sent_at)
+        if idle_stop is not None:
+            log(f"skipped ({idle_stop})", demand)
+            return idle_stop
         # The files with demand in this round (already most recent first), still open: an
         # unsolicited publish in between never decides the round.
         open_keys = self._open_keys()
@@ -951,19 +997,19 @@ class DependencyModules:
         root = index.root if index is not None else Path("/")
         shown = ", ".join(f"{ga} ({_display(target, root)})" for ga, target in batch)
         logger.info(
-            "jdtls: dependency round %d: frontier %d, candidates %d, deferred %d, round took %.1fs, refresh %s, "
-            "demand left %d file(s); importing %d dependency module(s) (%d/%d used): %s",
+            "jdtls: dependency round %d: imported %d dependency module(s) (%d/%d used): %s -> build idle "
+            "(round took %.1fs) -> refresh %s, demand left %d file(s) (frontier %d, candidates %d, deferred %d)",
             self._session.rounds,
-            frontier,
-            len(candidates),
-            len(candidates) - len(batch),
-            elapsed,
-            refresh,
-            len(demand),
             len(batch),
             self.used,
             self.limits.budget,
             shown,
+            elapsed,
+            refresh,
+            len(demand),
+            frontier,
+            len(candidates),
+            len(candidates) - len(batch),
         )
 
     def _import_time(self) -> float:
