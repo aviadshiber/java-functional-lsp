@@ -45,8 +45,21 @@ _WORKSPACE_CACHE_MAX_SIZE: int = 10  # default LRU cap — override via {"cache"
 _WORKSPACE_SCHEMA = "ws2"
 #: The proxy's own record of the dependency modules it imported, beside the data dir.
 _DEPS_RECORD_SUFFIX = ".deps.json"
-#: stop(): shutdown request + exit, SIGTERM the JVM after this long, SIGKILL after twice as long.
+#: stop(): shutdown request timeout, and the SIGTERM/SIGKILL wait after each signal.
 _STOP_GRACE_SEC = 1.0
+#: After the `exit` notification, wait this long for the JVM to exit **on its own** before
+#: SIGTERM. Eclipse's ResourcesPlugin.getWorkspace().save() (its SaveManager) runs on exit and
+#: writes the workspace .snap; SIGTERM mid-save can leave a torn .snap, which the *next* start
+#: reports as "The workspace exited with unsaved changes in the previous session; refreshing
+#: workspace to recover changes" (jdtls then falls back to jdt.ls-java-project for files under
+#: an affected project). This is more likely mid-import, when the save has more to persist.
+#: Separate from ``_STOP_GRACE_SEC`` (which also bounds the shutdown *request* reply) so a slow
+#: shutdown reply cannot eat into the JVM's own exit budget. Not yet measured against a real
+#: jdtls mid-import exit (#DEV-v0.14.2 item 2, deferred): chosen as a multiple of the cooperative
+#: case (<1s, see test_shutdown.py) that keeps the total stop bound (shutdown reply + this +
+#: SIGTERM wait + SIGKILL wait) at a few seconds, worst case, which client shutdown paths
+#: (including Claude Code's) tolerate for a graceful child-process exit.
+_EXIT_GRACE_SEC = 3.0
 
 # Default jdtls initialization settings.  Sent via initializationOptions.settings
 # so they apply BEFORE the Maven import scan (didChangeConfiguration is too late).
@@ -1443,10 +1456,12 @@ class JdtlsProxy:
         self._expanded_groups.add(root_uri)
 
     async def stop(self) -> None:
-        """Shut jdtls down within about 3 s. Idempotent (shutdown, exit, a signal, init timeout).
+        """Shut jdtls down within about 6 s worst case (cooperative case: well under 1 s).
+        Idempotent (shutdown, exit, a signal, init timeout).
 
         The shutdown reply is read before the reader is cancelled. The JVM gets
-        ``_STOP_GRACE_SEC`` to exit after ``exit``, then SIGTERM, then SIGKILL.
+        ``_EXIT_GRACE_SEC`` to save and exit on its own after ``exit``, then SIGTERM
+        (``_STOP_GRACE_SEC``), then SIGKILL (``_STOP_GRACE_SEC``).
         """
         async with self._stop_lock:
             process = self._process
@@ -1475,12 +1490,12 @@ class JdtlsProxy:
             self._response_hooks.clear()
 
     async def _terminate(self, process: asyncio.subprocess.Process) -> None:
-        loop = asyncio.get_running_loop()
-        deadline = loop.time() + _STOP_GRACE_SEC
         try:
             await self.send_request("shutdown", None, timeout=_STOP_GRACE_SEC)
             await self.send_notification("exit", None)
-            await asyncio.wait_for(process.wait(), timeout=max(deadline - loop.time(), 0.05))
+            # A dedicated budget for the JVM to save and exit on its own (see _EXIT_GRACE_SEC):
+            # never shortened by time the shutdown reply already took.
+            await asyncio.wait_for(process.wait(), timeout=_EXIT_GRACE_SEC)
             return
         except (asyncio.TimeoutError, OSError):
             pass

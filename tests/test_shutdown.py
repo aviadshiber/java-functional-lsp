@@ -57,6 +57,33 @@ while True:
 """
 _DEAF = "import time; time.sleep(60)"
 _STUBBORN = "import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(60)"
+_SLOW_TO_SAVE = r"""
+import json, sys, time
+def read():
+    headers = {}
+    while True:
+        line = sys.stdin.buffer.readline()
+        if not line:
+            return None
+        line = line.strip()
+        if not line:
+            break
+        k, _, v = line.decode().partition(":")
+        headers[k.strip().lower()] = v.strip()
+    return json.loads(sys.stdin.buffer.read(int(headers["content-length"])))
+while True:
+    msg = read()
+    if msg is None:
+        sys.exit(0)
+    if msg.get("method") == "exit":
+        time.sleep(1.5)  # simulates the Eclipse SaveManager still writing the workspace .snap
+        sys.exit(0)
+    if msg.get("method") == "shutdown":
+        reply = {"jsonrpc": "2.0", "id": msg["id"], "result": None}
+        body = json.dumps(reply).encode()
+        sys.stdout.buffer.write(b"Content-Length: %d\r\n\r\n" % len(body) + body)
+        sys.stdout.buffer.flush()
+"""
 
 
 async def _proxy_with(script: str) -> tuple[JdtlsProxy, asyncio.subprocess.Process]:
@@ -89,17 +116,32 @@ class TestBoundedStop:
         proxy, proc = await _proxy_with(_DEAF)
         started = time.monotonic()
         await proxy.stop()
-        assert time.monotonic() - started < 3.5
+        # _STOP_GRACE_SEC (shutdown reply) + _EXIT_GRACE_SEC (natural-exit wait) + slack.
+        assert time.monotonic() - started < 5.5
         assert proc.returncode == -signal.SIGTERM
 
     @pytest.mark.timeout(20)
-    async def test_stubborn_jdtls_gets_sigkill_within_three_seconds(self) -> None:
+    async def test_stubborn_jdtls_gets_sigkill(self) -> None:
         proxy, proc = await _proxy_with(_STUBBORN)
         started = time.monotonic()
         await proxy.stop()
         elapsed = time.monotonic() - started
         assert proc.returncode == -signal.SIGKILL
-        assert 1.5 < elapsed < 3.5
+        # _STOP_GRACE_SEC + _EXIT_GRACE_SEC + _STOP_GRACE_SEC (SIGTERM wait), then SIGKILL.
+        assert 4.5 < elapsed < 6.5
+
+    @pytest.mark.timeout(20)
+    async def test_jdtls_slow_to_save_still_exits_on_its_own(self, caplog: pytest.LogCaptureFixture) -> None:
+        """A jdtls that takes longer than _STOP_GRACE_SEC (but less than _EXIT_GRACE_SEC) to
+        save and exit after ``exit`` is not SIGTERMed mid-save (v0.14.2, item 2)."""
+        proxy, proc = await _proxy_with(_SLOW_TO_SAVE)
+        started = time.monotonic()
+        with caplog.at_level(logging.INFO, logger="java_functional_lsp.proxy"):
+            await proxy.stop()
+        elapsed = time.monotonic() - started
+        assert proc.returncode == 0  # exited on its own, not killed by a signal
+        assert "SIGTERM" not in caplog.text
+        assert 1.5 <= elapsed < 3.0
 
     @pytest.mark.timeout(20)
     async def test_stop_is_idempotent(self) -> None:
@@ -299,6 +341,54 @@ class TestProxyPlumbing:
                 {"method": "textDocument/publishDiagnostics", "params": {"uri": uri, "diagnostics": [err]}}
             )
         proxy._handle_notification({"method": "language/progressReport", "params": {"id": "x"}})
+
+    def test_note_publish_raising_does_not_break_the_next_publish(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A publishDiagnostics that makes ``note_publish`` raise is caught and logged; the
+        cache still updates, and the *next* publish is handled normally (v0.14.2, item 3)."""
+        proxy = JdtlsProxy()
+
+        def boom(*_a: Any) -> None:
+            raise RuntimeError("boom")
+
+        monkeypatch.setattr(proxy.dependency_modules, "note_publish", boom)
+        err = {"severity": 1, "message": "Base cannot be resolved to a type"}
+        with caplog.at_level(logging.WARNING, logger="java_functional_lsp.proxy"):
+            proxy._handle_notification(
+                {
+                    "method": "textDocument/publishDiagnostics",
+                    "params": {"uri": "file:///r/A.java", "diagnostics": [err]},
+                }
+            )
+        assert proxy._diagnostics_cache[proxy._uri_key("file:///r/A.java")] == [err]
+        assert "dependency-module bookkeeping failed" in caplog.text
+
+        monkeypatch.undo()  # note_publish behaves normally again
+        second = [{"severity": 1, "message": "second"}]
+        proxy._handle_notification(
+            {"method": "textDocument/publishDiagnostics", "params": {"uri": "file:///r/B.java", "diagnostics": second}}
+        )
+        assert proxy._diagnostics_cache[proxy._uri_key("file:///r/B.java")] == second
+
+    def test_note_progress_raising_does_not_break_the_next_progress(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Same guard for ``idle.note_progress``: a raising progress report is caught and logged,
+        and the next progress report still updates ``BuildIdle`` (v0.14.2, item 3)."""
+        proxy = JdtlsProxy()
+
+        def boom(*_a: Any) -> None:
+            raise RuntimeError("boom")
+
+        monkeypatch.setattr(proxy.dependency_modules.idle, "note_progress", boom)
+        with caplog.at_level(logging.WARNING, logger="java_functional_lsp.proxy"):
+            proxy._handle_notification({"method": "language/progressReport", "params": {"id": "x", "task": "build"}})
+        assert "build-idle bookkeeping failed" in caplog.text
+
+        monkeypatch.undo()  # idle.note_progress behaves normally again
+        proxy._handle_notification({"method": "language/progressReport", "params": {"id": "y", "task": "build"}})
+        assert proxy.dependency_modules.idle.open_tasks == 1
 
 
 def _frame(msg: dict[str, Any]) -> bytes:
